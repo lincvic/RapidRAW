@@ -174,12 +174,16 @@ struct LoadMetadataResult {
 struct CameraDefaults {
     crop: Option<Crop>,
     aspect_ratio: Option<f64>,
+    canvas_width: Option<u32>,
+    canvas_height: Option<u32>,
 }
 ```
 
-The serialized field name is `cameraDefaults`. The frontend awaits `load_metadata` before `load_image`, initializes adjustments and history from this response once, and does not depend on completion of pixel decoding. Backend thumbnail and export paths call the same metadata-only helper when they need effective defaults. No new persistent metadata cache is required for the first implementation.
+The serialized field name is `cameraDefaults`; its fields use camel case. The canvas dimensions are the oriented full default-cropped canvas and are present whenever `crop` is present. They let consumers scale full-resolution camera coordinates onto a reduced RAW development without inferring scale from the filename or crop rectangle. The frontend awaits `load_metadata` before `load_image`, initializes adjustments and history from this response once, and does not depend on completion of pixel decoding. Backend thumbnail and export paths call the same metadata-only helper when they need effective defaults. No new persistent metadata cache is required for the first implementation.
 
 The later `load_image` response includes the authoritative source kind. The frontend records whether `crop` and `aspectRatio` were injected from `cameraDefaults`, as distinct from values read from a sidecar. It also retains the adjustment baseline that current loading behavior would have produced without camera defaults. If RAW decoding used an embedded preview, then before marking the image ready it atomically restores both injected fields from that no-camera-default baseline and replaces the initial history snapshot with the restored state. Undo therefore cannot restore an invalid RAW-space crop. Reconciliation never modifies either field when it came from a persisted sidecar adjustment object. Backend render paths suppress camera defaults for that load.
+
+This metadata-first state machine also applies when the frontend preview cache contains an editor entry. Cached pixels and adjustment state may be shown provisionally, but `load_metadata` completes before the authoritative `load_image` reconciliation, and the selected image is not treated as ready for rendering or saving until both results agree on the effective baseline.
 
 ### Orientation-Aware Camera Defaults
 
@@ -197,6 +201,8 @@ Camera framing is a default, not a destructive sensor crop.
 - An explicit `crop: null` reveals the full default-cropped sensor image.
 - A saved user crop replaces the camera crop.
 
+The frontend tracks the persisted adjustment value, the effective in-memory baseline, and whether an explicit user action has made the adjustment state dirty. Injecting or reconciling camera defaults is initialization, not a user edit: it must not schedule sidecar auto-save, multi-selection auto-sync, or an edited badge. While the effective state still equals its initialized baseline, the persistence value remains the original sidecar value, including `null`. On the first explicit user adjustment, RapidRAW persists the complete effective adjustment object; at that point the camera crop becomes ordinary saved user state and preserves the rendered appearance. A whole-image Reset Adjustments operation that restores sidecar adjustments to `null` re-establishes a fresh camera-default baseline without immediately saving it back.
+
 The camera crop becomes a regular editable crop after initialization. Reset Crop sets `crop` to `null` and sets `aspectRatio` to the oriented full-canvas width divided by height. This reveals the full image and prevents crop controls from immediately reconstructing the camera ratio.
 
 The Tauri metadata response carries camera defaults separately from persisted `ImageMetadata`, so ephemeral decoder metadata is not accidentally serialized as a new sidecar field. The response can preserve the existing top-level metadata shape for current callers while adding a `cameraDefaults` field.
@@ -212,6 +218,8 @@ Create one backend helper that combines persisted adjustments, camera defaults, 
 - Export-size estimation.
 
 Current-editor rendering uses the initialized frontend adjustment state. Backend render paths use the same helper so an unopened RAF is framed the same way as an opened RAF.
+
+The helper also receives the actual developed image dimensions after RapidRAW has applied the same built-in EXIF orientation used to create `cameraDefaults`. Both dimension pairs therefore share the displayed, oriented coordinate space. When the dimensions differ from `cameraDefaults.canvasWidth` and `cameraDefaults.canvasHeight`, it scales `crop.x` and `crop.width` by `developed_width / canvas_width`, and scales `crop.y` and `crop.height` by `developed_height / canvas_height`, before rendering. This covers fast demosaic output used by thumbnails and export estimates, including orientations that swap the axes. Zero canvas dimensions or a scaled rectangle outside the developed image suppress the camera crop rather than failing the render.
 
 The edited/unmodified badge continues to be calculated from persisted user adjustments, not the ephemeral effective defaults.
 
@@ -231,6 +239,7 @@ RAF render metadata is advisory. Failure to parse it must never turn a decodable
 - Invalid zoom rectangle: ignore zoom and continue with the base canvas.
 - Invalid aspect ratio: ignore the ratio while retaining a valid zoom crop.
 - Out-of-bounds final crop: reject the camera crop and render the full canvas.
+- Legacy Fuji rotated-sensor modes whose decoded output does not use the default-cropped coordinate system: suppress camera crop metadata while retaining valid exposure metadata.
 - Embedded-JPEG fallback: apply neither RAW exposure compensation nor RAW-space camera crop. Return current fallback framing and atomically restore both provisionally injected crop fields as defined in Metadata Transport.
 - Non-Fuji and non-RAW images: no behavioral change.
 
@@ -253,6 +262,12 @@ Parser and crop tests use synthetic values and do not require private images.
 - Apply all eight EXIF orientation transforms to a camera crop.
 - Merge camera defaults only when adjustments are null.
 - Preserve saved crops, empty adjustment objects, and explicit null crops.
+- Keep camera-default initialization clean and unsaved until an explicit user edit.
+- Persist the complete effective state after the first user edit and re-establish defaults after Reset Adjustments.
+- Scale camera crops from their oriented canvas onto reduced developed-image dimensions.
+- Scale a rotated reduced-resolution RAW in the oriented coordinate space without swapping axes twice.
+- Keep cached effective adjustments distinct from the persisted sidecar value and block saving until metadata and authoritative source kind reconcile.
+- On an embedded-preview cache hit, retain the cached source kind, restore both injected crop fields, replace history atomically, and preserve all persisted sidecar fields.
 - Apply the expected linear gain for 0, +1, +2, and +3 EV.
 - Skip intrinsic gain for non-RAW and embedded-preview fallback paths.
 - Include camera crop in geometry/cache keys and invalidate legacy thumbnails.

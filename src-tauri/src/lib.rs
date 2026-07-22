@@ -13,6 +13,7 @@ mod android_integration;
 mod app_settings;
 mod app_state;
 mod cache_utils;
+mod camera_defaults;
 mod culling;
 mod denoising;
 mod exif_processing;

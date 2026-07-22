@@ -71,7 +71,7 @@ impl Default for ImageMetadata {
     }
 }
 
-#[derive(Serialize, Deserialize, Debug, Clone, Copy)]
+#[derive(Serialize, Deserialize, Debug, Clone, Copy, PartialEq)]
 pub struct Crop {
     pub x: f64,
     pub y: f64,

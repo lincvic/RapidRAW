@@ -87,9 +87,49 @@ pub fn load_and_composite(
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<DynamicImage> {
-    let base_image =
-        load_base_image_from_bytes(base_image, path, use_fast_raw_dev, settings, cancel_token)?;
-    composite_patches_on_image(&base_image, adjustments)
+    Ok(load_and_composite_with_metadata(
+        base_image,
+        path,
+        adjustments,
+        use_fast_raw_dev,
+        settings,
+        cancel_token,
+    )?
+    .image)
+}
+
+pub fn load_and_composite_with_metadata(
+    base_image: &[u8],
+    path: &str,
+    adjustments: &Value,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<LoadedBaseImage> {
+    load_and_composite_with_metadata_using(
+        || {
+            load_base_image_with_metadata_from_bytes(
+                base_image,
+                path,
+                use_fast_raw_dev,
+                settings,
+                cancel_token,
+            )
+        },
+        adjustments,
+    )
+}
+
+pub(crate) fn load_and_composite_with_metadata_using<F>(
+    load: F,
+    adjustments: &Value,
+) -> Result<LoadedBaseImage>
+where
+    F: FnOnce() -> Result<LoadedBaseImage>,
+{
+    let mut loaded = load()?;
+    loaded.image = composite_patches_on_image(&loaded.image, adjustments)?;
+    Ok(loaded)
 }
 
 pub fn load_base_image_from_bytes(
@@ -1045,6 +1085,7 @@ mod tests {
     use crate::camera_defaults::ImageSourceKind;
     use image::{ImageBuffer, Rgb, Rgba};
     use rawler::formats::tiff::SRational;
+    use serde_json::json;
 
     fn rgb_pixel_image() -> DynamicImage {
         DynamicImage::ImageRgb32F(ImageBuffer::from_pixel(1, 1, Rgb([0.25, 0.5, 1.0])))
@@ -1052,6 +1093,24 @@ mod tests {
 
     fn rgba_pixel_image() -> DynamicImage {
         DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba([0.25, 0.5, 1.0, 0.75])))
+    }
+
+    #[test]
+    fn metadata_aware_composite_preserves_source_kind() {
+        let _production_boundary = load_and_composite_with_metadata;
+        let loaded = load_and_composite_with_metadata_using(
+            || {
+                Ok(LoadedBaseImage {
+                    image: DynamicImage::new_rgb8(2, 3),
+                    source_kind: ImageSourceKind::EmbeddedPreview,
+                })
+            },
+            &json!({}),
+        )
+        .unwrap();
+
+        assert_eq!(loaded.source_kind, ImageSourceKind::EmbeddedPreview);
+        assert_eq!(loaded.image.dimensions(), (2, 3));
     }
 
     #[test]

@@ -29,23 +29,29 @@ pub(crate) struct OrientedCameraCrop {
     pub(crate) rect: Rect,
 }
 
+fn camera_crop_edges(canvas: Dim2, rect: Rect) -> Option<(usize, usize)> {
+    if canvas.w == 0 || canvas.h == 0 || rect.d.w == 0 || rect.d.h == 0 {
+        return None;
+    }
+
+    let right = rect.p.x.checked_add(rect.d.w)?;
+    let bottom = rect.p.y.checked_add(rect.d.h)?;
+    if right > canvas.w || bottom > canvas.h {
+        return None;
+    }
+
+    Some((right, bottom))
+}
+
 pub(crate) fn orient_camera_crop(
     canvas: Dim2,
     rect: Rect,
     orientation: Orientation,
 ) -> Option<OrientedCameraCrop> {
-    if canvas.w == 0 || canvas.h == 0 || rect.d.w == 0 || rect.d.h == 0 {
-        return None;
-    }
-
     let x = rect.p.x;
     let y = rect.p.y;
     let size = rect.d;
-    let right = x.checked_add(size.w)?;
-    let bottom = y.checked_add(size.h)?;
-    if right > canvas.w || bottom > canvas.h {
-        return None;
-    }
+    let (right, bottom) = camera_crop_edges(canvas, rect)?;
 
     let (canvas, rect) = match orientation {
         Orientation::Normal | Orientation::Unknown => (canvas, rect),
@@ -81,6 +87,10 @@ pub(crate) fn orient_camera_crop(
 
 impl CameraDefaults {
     pub(crate) fn from_oriented(oriented: OrientedCameraCrop) -> Self {
+        if camera_crop_edges(oriented.canvas, oriented.rect).is_none() {
+            return Self::default();
+        }
+
         let Ok(canvas_width) = u32::try_from(oriented.canvas.w) else {
             return Self::default();
         };
@@ -328,6 +338,54 @@ mod tests {
     }
 
     #[test]
+    fn from_oriented_rejects_zero_sized_rectangles() {
+        let invalid = [
+            OrientedCameraCrop {
+                canvas: Dim2::new(10, 6),
+                rect: Rect::new(Point::new(2, 1), Dim2::new(0, 2)),
+            },
+            OrientedCameraCrop {
+                canvas: Dim2::new(10, 6),
+                rect: Rect::new(Point::new(2, 1), Dim2::new(3, 0)),
+            },
+        ];
+
+        assert_eq!(
+            invalid.map(CameraDefaults::from_oriented),
+            [CameraDefaults::default(), CameraDefaults::default()]
+        );
+    }
+
+    #[test]
+    fn from_oriented_rejects_checked_add_overflow() {
+        let defaults = CameraDefaults::from_oriented(OrientedCameraCrop {
+            canvas: Dim2::new(10, 6),
+            rect: Rect::new(Point::new(usize::MAX, 1), Dim2::new(1, 2)),
+        });
+
+        assert_eq!(defaults, CameraDefaults::default());
+    }
+
+    #[test]
+    fn from_oriented_rejects_out_of_bounds_rectangles() {
+        let invalid = [
+            OrientedCameraCrop {
+                canvas: Dim2::new(10, 6),
+                rect: Rect::new(Point::new(8, 1), Dim2::new(3, 2)),
+            },
+            OrientedCameraCrop {
+                canvas: Dim2::new(10, 6),
+                rect: Rect::new(Point::new(2, 5), Dim2::new(3, 2)),
+            },
+        ];
+
+        assert_eq!(
+            invalid.map(CameraDefaults::from_oriented),
+            [CameraDefaults::default(), CameraDefaults::default()]
+        );
+    }
+
+    #[test]
     fn raw_metadata_crop_uses_exif_orientation() {
         let mut metadata = RawMetadata::default();
         metadata.exif.orientation = Some(6);
@@ -343,6 +401,26 @@ mod tests {
                 aspect_ratio: Some(2.0 / 3.0),
                 canvas_width: Some(6),
                 canvas_height: Some(10),
+            }
+        );
+    }
+
+    #[test]
+    fn raw_metadata_crop_without_exif_orientation_uses_normal_geometry() {
+        let mut metadata = RawMetadata::default();
+        metadata.exif.orientation = None;
+        metadata.render_metadata.camera_crop = Some(RawCameraCrop {
+            canvas: Dim2::new(10, 6),
+            rect: Rect::new(Point::new(2, 1), Dim2::new(3, 2)),
+        });
+
+        assert_eq!(
+            camera_defaults_from_raw(&metadata),
+            CameraDefaults {
+                crop: Some(crop(2.0, 1.0, 3.0, 2.0)),
+                aspect_ratio: Some(3.0 / 2.0),
+                canvas_width: Some(10),
+                canvas_height: Some(6),
             }
         );
     }

@@ -510,6 +510,7 @@ fn lookup_thumbnail_manifest(
         serde_json::from_slice(&fs::read(&manifest_path).ok()?).ok()?;
     if manifest.schema_version != THUMBNAIL_MANIFEST_SCHEMA_VERSION
         || !thumbnail_fingerprint_is_reusable(&manifest.fingerprint, expected_identity)
+        || !thumbnail_digest_is_valid(&manifest.fingerprint.effective_adjustments_digest)
         || !thumbnail_digest_is_valid(&manifest.jpeg_digest)
         || manifest.jpeg_byte_len > THUMBNAIL_JPEG_MAX_BYTES
     {
@@ -5490,6 +5491,64 @@ mod tests {
         let missing_jpeg = thumbnail_test_manifest(&fingerprint, &jpeg);
         fs::write(&manifest_path, serde_json::to_vec(&missing_jpeg).unwrap()).unwrap();
         assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
+    }
+
+    #[test]
+    fn thumbnail_manifest_lookup_rejects_malformed_effective_adjustments_digest() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let mut fingerprint = thumbnail_test_fingerprint(&key);
+        fingerprint.effective_adjustments_digest = "not-a-digest".to_string();
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let manifest = thumbnail_test_manifest(&fingerprint, &jpeg);
+        let jpeg_filename =
+            thumbnail_jpeg_filename(&manifest.fingerprint, &manifest.jpeg_digest).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
+
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(temp.path().join(jpeg_filename), jpeg).unwrap();
+
+        assert_eq!(lookup_thumbnail_manifest(temp.path(), &identity), None);
+    }
+
+    #[test]
+    fn thumbnail_manifest_lookup_rejects_oversized_manifest() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let manifest = thumbnail_test_manifest(&fingerprint, &jpeg);
+        let jpeg_filename =
+            thumbnail_jpeg_filename(&manifest.fingerprint, &manifest.jpeg_digest).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
+        let mut manifest_bytes = serde_json::to_vec(&manifest).unwrap();
+        manifest_bytes.resize(THUMBNAIL_MANIFEST_MAX_BYTES as usize + 1, b' ');
+
+        fs::write(&manifest_path, manifest_bytes).unwrap();
+        fs::write(temp.path().join(jpeg_filename), jpeg).unwrap();
+
+        assert_eq!(lookup_thumbnail_manifest(temp.path(), &identity), None);
+    }
+
+    #[test]
+    fn thumbnail_manifest_lookup_rejects_mismatched_jpeg_length() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let mut manifest = thumbnail_test_manifest(&fingerprint, &jpeg);
+        manifest.jpeg_byte_len += 1;
+        let jpeg_filename =
+            thumbnail_jpeg_filename(&manifest.fingerprint, &manifest.jpeg_digest).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
+
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(temp.path().join(jpeg_filename), jpeg).unwrap();
+
+        assert_eq!(lookup_thumbnail_manifest(temp.path(), &identity), None);
     }
 
     #[test]

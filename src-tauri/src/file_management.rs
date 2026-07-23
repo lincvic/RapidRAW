@@ -8,7 +8,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::Arc;
+use std::sync::{Arc, LazyLock};
 use std::thread;
 
 use anyhow::Result;
@@ -20,6 +20,7 @@ use regex::Regex;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tauri::{AppHandle, Emitter, Manager};
+use tokio::sync::Semaphore;
 use uuid::Uuid;
 use walkdir::WalkDir;
 
@@ -29,7 +30,7 @@ use crate::PendingMetadata;
 use crate::android_integration::*;
 use crate::app_settings::*;
 use crate::cache_utils::calculate_geometry_hash;
-use crate::camera_defaults::{LoadMetadataResult, metadata_result_for_path};
+use crate::camera_defaults::{CameraDefaults, LoadMetadataResult, metadata_result_for_path};
 use crate::exif_processing;
 use crate::formats::{is_raw_file, is_supported_image_file};
 use crate::gpu_processing;
@@ -2648,8 +2649,57 @@ pub fn set_rating_for_paths(
     Ok(())
 }
 
+const RAW_METADATA_EXTRACTION_LIMIT: usize = 2;
+static RAW_METADATA_EXTRACTION_SEMAPHORE: LazyLock<Arc<Semaphore>> =
+    LazyLock::new(|| Arc::new(Semaphore::new(RAW_METADATA_EXTRACTION_LIMIT)));
+
+async fn metadata_result_for_path_blocking_with<F>(
+    metadata: ImageMetadata,
+    source_path: PathBuf,
+    semaphore: Arc<Semaphore>,
+    extractor: F,
+) -> LoadMetadataResult
+where
+    F: FnOnce(ImageMetadata, &Path) -> LoadMetadataResult + Send + 'static,
+{
+    if !is_raw_file(&source_path) {
+        return extractor(metadata, &source_path);
+    }
+
+    let fallback_metadata = metadata.clone();
+    let permit = match semaphore.acquire_owned().await {
+        Ok(permit) => permit,
+        Err(error) => {
+            log::error!("Failed to acquire RAW metadata extraction permit: {error}");
+            return LoadMetadataResult {
+                metadata: fallback_metadata,
+                camera_defaults: CameraDefaults::default(),
+            };
+        }
+    };
+
+    match tokio::task::spawn_blocking(move || {
+        let _permit = permit;
+        extractor(metadata, &source_path)
+    })
+    .await
+    {
+        Ok(result) => result,
+        Err(error) => {
+            log::error!("RAW metadata extraction task failed: {error}");
+            LoadMetadataResult {
+                metadata: fallback_metadata,
+                camera_defaults: CameraDefaults::default(),
+            }
+        }
+    }
+}
+
 #[tauri::command]
-pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<LoadMetadataResult, String> {
+pub async fn load_metadata(
+    path: String,
+    app_handle: AppHandle,
+) -> Result<LoadMetadataResult, String> {
     let settings = load_settings(app_handle).unwrap_or_default();
     let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
 
@@ -2663,7 +2713,13 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<LoadMetadata
         let _ = fs::write(&sidecar_path, json);
     }
 
-    Ok(metadata_result_for_path(metadata, &source_path))
+    Ok(metadata_result_for_path_blocking_with(
+        metadata,
+        source_path,
+        Arc::clone(&RAW_METADATA_EXTRACTION_SEMAPHORE),
+        metadata_result_for_path,
+    )
+    .await)
 }
 
 fn get_presets_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {
@@ -3809,5 +3865,157 @@ pub fn sync_metadata_to_xmp(source_path: &Path, metadata: &ImageMetadata, create
         }
 
         let _ = fs::write(&xmp_file, content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera_defaults::CameraDefaults;
+    use serde_json::json;
+    use std::{
+        collections::HashMap,
+        sync::{
+            Arc,
+            atomic::{AtomicUsize, Ordering},
+        },
+        time::Duration,
+    };
+    use tokio::sync::Semaphore;
+
+    #[tokio::test]
+    async fn non_raw_metadata_bypasses_raw_gate_and_runs_inline() {
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: json!({ "preserve": true }),
+            tags: Some(vec!["keep-me".into()]),
+            exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+        };
+        let expected = serde_json::to_value(&metadata).unwrap();
+        let semaphore = Arc::new(Semaphore::new(2));
+        semaphore.close();
+        let calling_thread = std::thread::current().id();
+        let (thread_sender, thread_receiver) = std::sync::mpsc::channel();
+
+        let result = metadata_result_for_path_blocking_with(
+            metadata,
+            PathBuf::from("image.jpg"),
+            semaphore,
+            move |metadata, source_path| {
+                assert_eq!(source_path, Path::new("image.jpg"));
+                thread_sender.send(std::thread::current().id()).unwrap();
+                LoadMetadataResult {
+                    metadata,
+                    camera_defaults: CameraDefaults {
+                        canvas_width: Some(321),
+                        ..CameraDefaults::default()
+                    },
+                }
+            },
+        )
+        .await;
+
+        assert_eq!(serde_json::to_value(result.metadata).unwrap(), expected);
+        assert_eq!(result.camera_defaults.canvas_width, Some(321));
+        assert_eq!(thread_receiver.try_recv().unwrap(), calling_thread);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 4)]
+    async fn raw_metadata_extraction_is_bounded_and_preserves_metadata() {
+        let semaphore = Arc::new(Semaphore::new(2));
+        let active = Arc::new(AtomicUsize::new(0));
+        let max_active = Arc::new(AtomicUsize::new(0));
+        let mut expected = Vec::new();
+        let mut tasks = Vec::new();
+
+        for rating in 0_u8..6 {
+            let metadata = ImageMetadata {
+                version: 7,
+                rating,
+                adjustments: json!({ "slot": rating }),
+                tags: Some(vec![format!("tag-{rating}")]),
+                exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+            };
+            expected.push(serde_json::to_value(&metadata).unwrap());
+
+            let active = Arc::clone(&active);
+            let max_active = Arc::clone(&max_active);
+            let semaphore = Arc::clone(&semaphore);
+            tasks.push(tokio::spawn(metadata_result_for_path_blocking_with(
+                metadata,
+                PathBuf::from(format!("missing-{rating}.RAF")),
+                semaphore,
+                move |metadata, _| {
+                    let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                    max_active.fetch_max(current, Ordering::SeqCst);
+                    std::thread::sleep(Duration::from_millis(40));
+                    active.fetch_sub(1, Ordering::SeqCst);
+                    LoadMetadataResult {
+                        metadata,
+                        camera_defaults: CameraDefaults::default(),
+                    }
+                },
+            )));
+        }
+
+        let mut actual = Vec::new();
+        for task in tasks {
+            actual.push(serde_json::to_value(task.await.unwrap().metadata).unwrap());
+        }
+        actual.sort_by_key(|value| value["rating"].as_u64());
+
+        assert_eq!(actual, expected);
+        let observed_max = max_active.load(Ordering::SeqCst);
+        assert!(observed_max >= 1);
+        assert!(observed_max <= 2);
+    }
+
+    #[tokio::test]
+    async fn raw_metadata_join_failure_preserves_metadata_and_empty_defaults() {
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: json!({ "preserve": true }),
+            tags: Some(vec!["keep-me".into()]),
+            exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+        };
+        let expected = serde_json::to_value(&metadata).unwrap();
+
+        let result = metadata_result_for_path_blocking_with(
+            metadata,
+            PathBuf::from("missing.RAF"),
+            Arc::new(Semaphore::new(2)),
+            |_, _| panic!("synthetic extractor panic"),
+        )
+        .await;
+
+        assert_eq!(serde_json::to_value(result.metadata).unwrap(), expected);
+        assert_eq!(result.camera_defaults, CameraDefaults::default());
+    }
+
+    #[tokio::test]
+    async fn raw_metadata_acquire_failure_preserves_metadata_and_empty_defaults() {
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: Value::Null,
+            tags: Some(vec!["keep-me".into()]),
+            exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+        };
+        let expected = serde_json::to_value(&metadata).unwrap();
+        let semaphore = Arc::new(Semaphore::new(2));
+        semaphore.close();
+
+        let result = metadata_result_for_path_blocking_with(
+            metadata,
+            PathBuf::from("missing.RAF"),
+            semaphore,
+            |_, _| panic!("a closed semaphore must not run the extractor"),
+        )
+        .await;
+
+        assert_eq!(serde_json::to_value(result.metadata).unwrap(), expected);
+        assert_eq!(result.camera_defaults, CameraDefaults::default());
     }
 }

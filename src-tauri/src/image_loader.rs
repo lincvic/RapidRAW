@@ -1,6 +1,7 @@
 use crate::Cursor;
 use crate::app_settings::{AppSettings, load_settings};
 use crate::app_state::{AppState, LoadedImage};
+use crate::cache_utils::DecodedImageCacheEntry;
 use crate::camera_defaults::ImageSourceKind;
 use crate::exif_processing;
 use crate::file_management::{parse_virtual_path, read_file_mapped};
@@ -36,6 +37,7 @@ pub struct LoadImageResult {
     pub metadata: ImageMetadata,
     pub exif: HashMap<String, String>,
     pub is_raw: bool,
+    pub source_kind: ImageSourceKind,
 }
 
 #[derive(Clone)]
@@ -865,6 +867,32 @@ pub fn is_image_cached(path: String, state: tauri::State<'_, AppState>) -> bool 
         .is_some()
 }
 
+fn select_cached_or_decoded(
+    cached: Option<DecodedImageCacheEntry>,
+    decode: impl FnOnce() -> Result<DecodedImageCacheEntry, String>,
+) -> Result<DecodedImageCacheEntry, String> {
+    match cached {
+        Some(entry) => Ok(entry),
+        None => decode(),
+    }
+}
+
+fn load_image_result_from_entry(
+    metadata: ImageMetadata,
+    entry: DecodedImageCacheEntry,
+    is_raw: bool,
+) -> LoadImageResult {
+    let (width, height) = entry.image.dimensions();
+    LoadImageResult {
+        width,
+        height,
+        metadata,
+        exif: entry.exif,
+        is_raw,
+        source_kind: entry.source_kind,
+    }
+}
+
 #[tauri::command]
 pub async fn load_image(
     path: String,
@@ -906,79 +934,88 @@ pub async fn load_image(
         .unwrap()
         .get(&source_path_str);
 
-    let (pristine_arc, exif_data) = if let Some((cached_img, cached_exif)) = cached_data {
-        (cached_img, cached_exif)
-    } else {
-        if crate::file_management::is_cloud_placeholder(&source_path) {
-            return Err(format!(
-                "'{}' is stored in iCloud and hasn't been downloaded yet. Download it in Finder, then try again.",
-                source_path_str
-            ));
+    let entry = match cached_data {
+        Some(cached) => {
+            select_cached_or_decoded(Some(cached), || unreachable!("a cache hit must not decode"))?
         }
-
-        let (pristine_img, exif_data_loaded) = tokio::task::spawn_blocking(move || {
-            if generation_tracker.load(Ordering::SeqCst) != my_generation {
-                return Err("Load cancelled".to_string());
+        None => {
+            if crate::file_management::is_cloud_placeholder(&source_path) {
+                return Err(format!(
+                    "'{}' is stored in iCloud and hasn't been downloaded yet. Download it in Finder, then try again.",
+                    source_path_str
+                ));
             }
 
-            let result: Result<(DynamicImage, HashMap<String, String>), String> =
-                (|| match read_file_mapped(Path::new(&path_clone)) {
-                    Ok(mmap) => {
-                        if generation_tracker.load(Ordering::SeqCst) != my_generation {
-                            return Err("Load cancelled".to_string());
-                        }
-
-                        let img = load_base_image_from_bytes(
-                            &mmap,
-                            &path_clone,
-                            false,
-                            &settings,
-                            cancel_token.clone(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                        let exif = exif_processing::read_exif_data(&path_clone, &mmap);
-                        Ok((img, exif))
+            let decoded_entry = tokio::task::spawn_blocking(move || {
+                select_cached_or_decoded(None, || {
+                    if generation_tracker.load(Ordering::SeqCst) != my_generation {
+                        return Err("Load cancelled".to_string());
                     }
-                    Err(e) => {
-                        log::warn!(
-                            "Failed to memory-map file '{}': {}. Falling back to standard read.",
-                            path_clone,
-                            e
-                        );
-                        let bytes = fs::read(&path_clone).map_err(|io_err| {
-                            format!("Fallback read failed for {}: {}", path_clone, io_err)
-                        })?;
 
-                        if generation_tracker.load(Ordering::SeqCst) != my_generation {
-                            return Err("Load cancelled".to_string());
+                    match read_file_mapped(Path::new(&path_clone)) {
+                        Ok(mmap) => {
+                            if generation_tracker.load(Ordering::SeqCst) != my_generation {
+                                return Err("Load cancelled".to_string());
+                            }
+
+                            let loaded = load_base_image_with_metadata_from_bytes(
+                                &mmap,
+                                &path_clone,
+                                false,
+                                &settings,
+                                cancel_token.clone(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                            let exif = exif_processing::read_exif_data(&path_clone, &mmap);
+                            Ok(DecodedImageCacheEntry {
+                                image: Arc::new(loaded.image),
+                                exif,
+                                source_kind: loaded.source_kind,
+                            })
                         }
+                        Err(e) => {
+                            log::warn!(
+                                "Failed to memory-map file '{}': {}. Falling back to standard read.",
+                                path_clone,
+                                e
+                            );
+                            let bytes = fs::read(&path_clone).map_err(|io_err| {
+                                format!("Fallback read failed for {}: {}", path_clone, io_err)
+                            })?;
 
-                        let img = load_base_image_from_bytes(
-                            &bytes,
-                            &path_clone,
-                            false,
-                            &settings,
-                            cancel_token.clone(),
-                        )
-                        .map_err(|e| e.to_string())?;
-                        let exif = exif_processing::read_exif_data(&path_clone, &bytes);
-                        Ok((img, exif))
+                            if generation_tracker.load(Ordering::SeqCst) != my_generation {
+                                return Err("Load cancelled".to_string());
+                            }
+
+                            let loaded = load_base_image_with_metadata_from_bytes(
+                                &bytes,
+                                &path_clone,
+                                false,
+                                &settings,
+                                cancel_token.clone(),
+                            )
+                            .map_err(|e| e.to_string())?;
+                            let exif = exif_processing::read_exif_data(&path_clone, &bytes);
+                            Ok(DecodedImageCacheEntry {
+                                image: Arc::new(loaded.image),
+                                exif,
+                                source_kind: loaded.source_kind,
+                            })
+                        }
                     }
-                })();
-            result
-        })
-        .await
-        .map_err(|e| e.to_string())??;
+                })
+            })
+            .await
+            .map_err(|e| e.to_string())??;
 
-        let arc_img = Arc::new(pristine_img);
+            state
+                .decoded_image_cache
+                .lock()
+                .unwrap()
+                .insert(source_path_str.clone(), decoded_entry.clone());
 
-        state.decoded_image_cache.lock().unwrap().insert(
-            source_path_str.clone(),
-            arc_img.clone(),
-            exif_data_loaded.clone(),
-        );
-
-        (arc_img, exif_data_loaded)
+            decoded_entry
+        }
     };
 
     if state.load_image_generation.load(Ordering::SeqCst) != my_generation {
@@ -991,26 +1028,20 @@ pub async fn load_image(
         return Err("Load cancelled".to_string());
     }
 
-    let (orig_width, orig_height) = pristine_arc.dimensions();
-
     *state.original_image.lock().unwrap() = Some(LoadedImage {
         path,
-        image: pristine_arc,
+        image: Arc::clone(&entry.image),
         is_raw,
+        source_kind: entry.source_kind,
     });
 
-    Ok(LoadImageResult {
-        width: orig_width,
-        height: orig_height,
-        metadata,
-        exif: exif_data,
-        is_raw,
-    })
+    Ok(load_image_result_from_entry(metadata, entry, is_raw))
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::cache_utils::DecodedImageCacheEntry;
     use crate::camera_defaults::ImageSourceKind;
     use image::{ImageBuffer, Rgb, Rgba};
     use rawler::formats::tiff::SRational;
@@ -1021,6 +1052,38 @@ mod tests {
 
     fn rgba_pixel_image() -> DynamicImage {
         DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba([0.25, 0.5, 1.0, 0.75])))
+    }
+
+    #[test]
+    fn cached_raf_load_returns_the_stored_embedded_preview_kind() {
+        let cached = DecodedImageCacheEntry {
+            image: Arc::new(DynamicImage::new_rgb8(2, 3)),
+            exif: HashMap::new(),
+            source_kind: ImageSourceKind::EmbeddedPreview,
+        };
+        let selected = select_cached_or_decoded(Some(cached), || {
+            panic!("a cache hit must not decode or infer from the .raf extension")
+        })
+        .unwrap();
+        let response = load_image_result_from_entry(ImageMetadata::default(), selected, true);
+        assert_eq!(response.source_kind, ImageSourceKind::EmbeddedPreview);
+        assert!(response.is_raw);
+    }
+
+    #[test]
+    fn source_kind_serialization_is_stable() {
+        assert_eq!(
+            serde_json::to_value(ImageSourceKind::DevelopedRaw).unwrap(),
+            "developed_raw"
+        );
+        assert_eq!(
+            serde_json::to_value(ImageSourceKind::EmbeddedPreview).unwrap(),
+            "embedded_preview"
+        );
+        assert_eq!(
+            serde_json::to_value(ImageSourceKind::NonRaw).unwrap(),
+            "non_raw"
+        );
     }
 
     #[test]

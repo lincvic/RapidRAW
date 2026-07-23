@@ -10,7 +10,7 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::{Arc, LazyLock};
 use std::thread;
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use anyhow::{Context, Result, ensure};
 use chrono::{DateTime, Utc};
@@ -51,7 +51,13 @@ use crate::mask_generation::MaskDefinition;
 use crate::preset_converter;
 use crate::tagging::COLOR_TAG_PREFIX;
 
-pub(crate) const THUMBNAIL_RENDER_VERSION: &str = "raf-render-metadata-v1";
+pub(crate) const THUMBNAIL_RENDER_VERSION: &str = "raf-render-metadata-v2";
+const THUMBNAIL_MANIFEST_SCHEMA_VERSION: u8 = 2;
+const THUMBNAIL_MANIFEST_MAX_BYTES: u64 = 4 * 1_024;
+const THUMBNAIL_JPEG_MAX_BYTES: u64 = 64 * 1_024 * 1_024;
+const THUMBNAIL_CACHE_RETENTION_PER_PATH: usize = 8;
+const THUMBNAIL_CACHE_CLEANUP_MAX_ENTRIES: usize = 256;
+const THUMBNAIL_CACHE_CLEANUP_GRACE: Duration = Duration::from_secs(24 * 60 * 60);
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
@@ -66,6 +72,29 @@ enum ThumbnailRenderPath {
     DefaultCpu,
     ObjectGpu,
     ObjectFallback,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct ThumbnailLutIdentity {
+    content_blake3: String,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ThumbnailLutRequest {
+    NotRequested,
+    Available(ThumbnailLutIdentity),
+    Unavailable,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+enum ThumbnailLutOutcome {
+    NotRequested,
+    Applied(ThumbnailLutIdentity),
+    Unavailable,
+    NotApplied,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -91,23 +120,37 @@ struct ThumbnailManifestKey {
     persisted_adjustments: Value,
     camera_defaults: CameraDefaults,
     render_profile: ThumbnailRenderProfile,
+    lut_request: ThumbnailLutRequest,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct ThumbnailCacheIdentity {
+    key_digest: String,
+    virtual_path_digest: String,
+    requested_render_path: ThumbnailRenderPath,
+    requested_lut: ThumbnailLutRequest,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ThumbnailRenderFingerprint {
-    key: ThumbnailManifestKey,
-    effective_adjustments: Value,
+    key_digest: String,
+    virtual_path_digest: String,
+    effective_adjustments_digest: String,
     source_kind: ImageSourceKind,
+    requested_render_path: ThumbnailRenderPath,
     actual_render_path: ThumbnailRenderPath,
+    requested_lut: ThumbnailLutRequest,
+    actual_lut_outcome: ThumbnailLutOutcome,
 }
 
-#[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 struct ThumbnailManifest {
-    key: ThumbnailManifestKey,
+    schema_version: u8,
     fingerprint: ThumbnailRenderFingerprint,
-    jpeg_filename: String,
+    jpeg_digest: String,
+    jpeg_byte_len: u64,
 }
 
 #[derive(Clone, Debug, PartialEq, Eq)]
@@ -120,6 +163,75 @@ struct ThumbnailCacheHit {
 struct ThumbnailPreloadedImage {
     image: Arc<DynamicImage>,
     source_kind: ImageSourceKind,
+}
+
+#[derive(Clone)]
+struct ResolvedThumbnailLut {
+    request: ThumbnailLutRequest,
+    lut: Option<Arc<crate::lut_processing::Lut>>,
+}
+
+impl ResolvedThumbnailLut {
+    fn applied_outcome(&self) -> ThumbnailLutOutcome {
+        match &self.request {
+            ThumbnailLutRequest::NotRequested => ThumbnailLutOutcome::NotRequested,
+            ThumbnailLutRequest::Available(identity) => {
+                ThumbnailLutOutcome::Applied(identity.clone())
+            }
+            ThumbnailLutRequest::Unavailable => ThumbnailLutOutcome::Unavailable,
+        }
+    }
+
+    fn fallback_outcome(&self) -> ThumbnailLutOutcome {
+        match &self.request {
+            ThumbnailLutRequest::NotRequested => ThumbnailLutOutcome::NotRequested,
+            ThumbnailLutRequest::Available(_) => ThumbnailLutOutcome::NotApplied,
+            ThumbnailLutRequest::Unavailable => ThumbnailLutOutcome::Unavailable,
+        }
+    }
+}
+
+fn thumbnail_lut_path(adjustments: &Value) -> Option<&str> {
+    let effects_visible = adjustments
+        .get("sectionVisibility")
+        .and_then(|visibility| visibility.get("effects"))
+        .and_then(Value::as_bool)
+        .unwrap_or(true);
+    effects_visible
+        .then(|| adjustments.get("lutPath").and_then(Value::as_str))
+        .flatten()
+}
+
+fn resolve_thumbnail_lut(adjustments: &Value) -> ResolvedThumbnailLut {
+    let Some(path) = thumbnail_lut_path(adjustments) else {
+        return ResolvedThumbnailLut {
+            request: ThumbnailLutRequest::NotRequested,
+            lut: None,
+        };
+    };
+
+    match crate::lut_processing::load_lut_snapshot(path) {
+        Ok(snapshot) => {
+            let identity = ThumbnailLutIdentity {
+                content_blake3: snapshot.content_blake3,
+            };
+            ResolvedThumbnailLut {
+                request: ThumbnailLutRequest::Available(identity),
+                lut: Some(Arc::new(snapshot.lut)),
+            }
+        }
+        Err(error) => {
+            log::warn!("Thumbnail LUT '{}' is unavailable: {error}", path);
+            ResolvedThumbnailLut {
+                request: ThumbnailLutRequest::Unavailable,
+                lut: None,
+            }
+        }
+    }
+}
+
+fn resolve_thumbnail_lut_request(adjustments: &Value) -> ThumbnailLutRequest {
+    resolve_thumbnail_lut(adjustments).request
 }
 
 impl ThumbnailPreloadedImage {
@@ -170,6 +282,7 @@ fn thumbnail_manifest_key(
     persisted_adjustments: &Value,
     camera_defaults: &CameraDefaults,
     render_profile: &ThumbnailRenderProfile,
+    lut_request: &ThumbnailLutRequest,
 ) -> ThumbnailManifestKey {
     ThumbnailManifestKey {
         render_version: THUMBNAIL_RENDER_VERSION.to_string(),
@@ -178,6 +291,7 @@ fn thumbnail_manifest_key(
         persisted_adjustments: persisted_adjustments.clone(),
         camera_defaults: camera_defaults.clone(),
         render_profile: render_profile.clone(),
+        lut_request: lut_request.clone(),
     }
 }
 
@@ -212,6 +326,7 @@ fn thumbnail_manifest_key_for_path_with<F>(
     virtual_path: &str,
     persisted_adjustments: &Value,
     render_profile: &ThumbnailRenderProfile,
+    lut_request: &ThumbnailLutRequest,
     extract_defaults: F,
 ) -> Option<ThumbnailManifestKey>
 where
@@ -234,6 +349,7 @@ where
         persisted_adjustments,
         &camera_defaults,
         render_profile,
+        lut_request,
     ))
 }
 
@@ -241,11 +357,13 @@ fn thumbnail_manifest_key_for_path(
     virtual_path: &str,
     persisted_adjustments: &Value,
     render_profile: &ThumbnailRenderProfile,
+    lut_request: &ThumbnailLutRequest,
 ) -> Option<ThumbnailManifestKey> {
     thumbnail_manifest_key_for_path_with(
         virtual_path,
         persisted_adjustments,
         render_profile,
+        lut_request,
         camera_defaults_for_path,
     )
 }
@@ -260,69 +378,202 @@ fn thumbnail_manifest_key_hash(key: &ThumbnailManifestKey) -> Result<String> {
     canonical_thumbnail_hash(key)
 }
 
+fn thumbnail_cache_identity(key: &ThumbnailManifestKey) -> Result<ThumbnailCacheIdentity> {
+    Ok(ThumbnailCacheIdentity {
+        key_digest: thumbnail_manifest_key_hash(key)?,
+        virtual_path_digest: thumbnail_virtual_path_digest(&key.virtual_path)?,
+        requested_render_path: key.render_profile.dispatch,
+        requested_lut: key.lut_request.clone(),
+    })
+}
+
 fn thumbnail_render_fingerprint_hash(fingerprint: &ThumbnailRenderFingerprint) -> Result<String> {
     canonical_thumbnail_hash(fingerprint)
 }
 
-fn thumbnail_manifest_path(cache_dir: &Path, key: &ThumbnailManifestKey) -> Result<PathBuf> {
-    Ok(cache_dir.join(format!(
-        "{}.thumbnail-manifest.json",
-        thumbnail_manifest_key_hash(key)?
-    )))
+fn thumbnail_virtual_path_digest(virtual_path: &str) -> Result<String> {
+    canonical_thumbnail_hash(&virtual_path)
 }
 
-fn thumbnail_jpeg_filename(fingerprint: &ThumbnailRenderFingerprint) -> Result<String> {
+fn thumbnail_render_fingerprint(
+    identity: &ThumbnailCacheIdentity,
+    effective_adjustments: &Value,
+    source_kind: ImageSourceKind,
+    actual_render_path: ThumbnailRenderPath,
+    actual_lut_outcome: ThumbnailLutOutcome,
+) -> Result<ThumbnailRenderFingerprint> {
+    Ok(ThumbnailRenderFingerprint {
+        key_digest: identity.key_digest.clone(),
+        virtual_path_digest: identity.virtual_path_digest.clone(),
+        effective_adjustments_digest: canonical_thumbnail_hash(effective_adjustments)?,
+        source_kind,
+        requested_render_path: identity.requested_render_path,
+        actual_render_path,
+        requested_lut: identity.requested_lut.clone(),
+        actual_lut_outcome,
+    })
+}
+
+fn thumbnail_manifest_path(cache_dir: &Path, identity: &ThumbnailCacheIdentity) -> Result<PathBuf> {
+    thumbnail_manifest_path_for_digest(cache_dir, &identity.key_digest)
+}
+
+fn thumbnail_manifest_path_for_digest(cache_dir: &Path, key_digest: &str) -> Result<PathBuf> {
+    ensure!(
+        thumbnail_digest_is_valid(key_digest),
+        "Invalid thumbnail key digest"
+    );
+    Ok(cache_dir.join(format!("{key_digest}.thumbnail-manifest.json")))
+}
+
+fn thumbnail_digest_is_valid(digest: &str) -> bool {
+    digest.len() == blake3::OUT_LEN * 2 && blake3::Hash::from_hex(digest).is_ok()
+}
+
+fn thumbnail_jpeg_digest(jpeg_bytes: &[u8]) -> String {
+    blake3::hash(jpeg_bytes).to_hex().to_string()
+}
+
+fn thumbnail_jpeg_filename(
+    fingerprint: &ThumbnailRenderFingerprint,
+    jpeg_digest: &str,
+) -> Result<String> {
+    ensure!(
+        thumbnail_digest_is_valid(jpeg_digest),
+        "Invalid thumbnail JPEG digest"
+    );
     Ok(format!(
-        "{}.jpg",
-        thumbnail_render_fingerprint_hash(fingerprint)?
+        "{}.{jpeg_digest}.jpg",
+        thumbnail_render_fingerprint_hash(fingerprint)?,
     ))
 }
 
 fn thumbnail_transient_jpeg_path(
     cache_dir: &Path,
     fingerprint: &ThumbnailRenderFingerprint,
+    jpeg_digest: &str,
 ) -> Result<PathBuf> {
+    ensure!(
+        thumbnail_digest_is_valid(jpeg_digest),
+        "Invalid thumbnail JPEG digest"
+    );
     Ok(cache_dir.join(format!(
-        "{}.transient.jpg",
-        thumbnail_render_fingerprint_hash(fingerprint)?
+        "{}.{jpeg_digest}.transient.jpg",
+        thumbnail_render_fingerprint_hash(fingerprint)?,
     )))
+}
+
+fn thumbnail_fingerprint_matches_identity(
+    fingerprint: &ThumbnailRenderFingerprint,
+    identity: &ThumbnailCacheIdentity,
+) -> bool {
+    fingerprint.key_digest == identity.key_digest
+        && fingerprint.virtual_path_digest == identity.virtual_path_digest
+        && fingerprint.requested_render_path == identity.requested_render_path
+        && fingerprint.requested_lut == identity.requested_lut
+}
+
+fn thumbnail_fingerprint_is_reusable(
+    fingerprint: &ThumbnailRenderFingerprint,
+    identity: &ThumbnailCacheIdentity,
+) -> bool {
+    thumbnail_fingerprint_matches_identity(fingerprint, identity)
+        && thumbnail_fingerprint_has_reusable_outcome(fingerprint)
+}
+
+fn thumbnail_fingerprint_has_reusable_outcome(fingerprint: &ThumbnailRenderFingerprint) -> bool {
+    fingerprint.actual_render_path == fingerprint.requested_render_path
+        && match (&fingerprint.requested_lut, &fingerprint.actual_lut_outcome) {
+            (ThumbnailLutRequest::NotRequested, ThumbnailLutOutcome::NotRequested) => true,
+            (ThumbnailLutRequest::Available(requested), ThumbnailLutOutcome::Applied(applied)) => {
+                requested == applied
+            }
+            _ => false,
+        }
+}
+
+fn thumbnail_jpeg_bytes_are_valid(bytes: &[u8], expected_digest: &str) -> bool {
+    bytes.len() as u64 <= THUMBNAIL_JPEG_MAX_BYTES
+        && thumbnail_jpeg_digest(bytes) == expected_digest
+        && image::load_from_memory_with_format(bytes, image::ImageFormat::Jpeg).is_ok()
 }
 
 fn lookup_thumbnail_manifest(
     cache_dir: &Path,
-    expected_key: &ThumbnailManifestKey,
+    expected_identity: &ThumbnailCacheIdentity,
 ) -> Option<ThumbnailCacheHit> {
-    let manifest_path = thumbnail_manifest_path(cache_dir, expected_key).ok()?;
+    let manifest_path = thumbnail_manifest_path(cache_dir, expected_identity).ok()?;
+    if fs::metadata(&manifest_path).ok()?.len() > THUMBNAIL_MANIFEST_MAX_BYTES {
+        return None;
+    }
     let manifest: ThumbnailManifest =
         serde_json::from_slice(&fs::read(&manifest_path).ok()?).ok()?;
-    if manifest.key != *expected_key
-        || manifest.fingerprint.key != manifest.key
-        || manifest.fingerprint.actual_render_path != expected_key.render_profile.dispatch
-        || manifest.jpeg_filename != thumbnail_jpeg_filename(&manifest.fingerprint).ok()?
+    if manifest.schema_version != THUMBNAIL_MANIFEST_SCHEMA_VERSION
+        || !thumbnail_fingerprint_is_reusable(&manifest.fingerprint, expected_identity)
+        || !thumbnail_digest_is_valid(&manifest.jpeg_digest)
+        || manifest.jpeg_byte_len > THUMBNAIL_JPEG_MAX_BYTES
     {
         return None;
     }
 
-    let filename_path = Path::new(&manifest.jpeg_filename);
-    if filename_path.components().count() != 1
-        || filename_path.file_name() != Some(filename_path.as_os_str())
-    {
+    let jpeg_filename =
+        thumbnail_jpeg_filename(&manifest.fingerprint, &manifest.jpeg_digest).ok()?;
+    let jpeg_path = cache_dir.join(&jpeg_filename);
+    let jpeg_metadata = fs::metadata(&jpeg_path).ok()?;
+    if !jpeg_metadata.is_file() || jpeg_metadata.len() != manifest.jpeg_byte_len {
+        return None;
+    }
+    let jpeg_bytes = fs::read(&jpeg_path).ok()?;
+    if !thumbnail_jpeg_bytes_are_valid(&jpeg_bytes, &manifest.jpeg_digest) {
         return None;
     }
 
-    let jpeg_path = cache_dir.join(filename_path);
-    jpeg_path.is_file().then_some(ThumbnailCacheHit {
+    Some(ThumbnailCacheHit {
         manifest_path: Some(manifest_path),
         jpeg_path,
     })
 }
 
 fn flushed_tempfile(cache_dir: &Path, bytes: &[u8]) -> Result<NamedTempFile> {
-    let mut temp = NamedTempFile::new_in(cache_dir)?;
+    let mut temp = tempfile::Builder::new()
+        .prefix(".thumbnail-stage-")
+        .tempfile_in(cache_dir)?;
     temp.write_all(bytes)?;
     temp.flush()?;
     temp.as_file().sync_all()?;
     Ok(temp)
+}
+
+fn persist_immutable_thumbnail_jpeg(
+    cache_dir: &Path,
+    jpeg_path: &Path,
+    jpeg_bytes: &[u8],
+    jpeg_digest: &str,
+) -> Result<()> {
+    ensure!(
+        thumbnail_jpeg_bytes_are_valid(jpeg_bytes, jpeg_digest),
+        "Thumbnail encoder produced invalid JPEG bytes"
+    );
+    let jpeg_temp = flushed_tempfile(cache_dir, jpeg_bytes)?;
+    match jpeg_temp.persist_noclobber(jpeg_path) {
+        Ok(file) => file.sync_all()?,
+        Err(error) if error.error.kind() == std::io::ErrorKind::AlreadyExists => {
+            let should_replace = match fs::read(jpeg_path) {
+                Ok(existing) => !thumbnail_jpeg_bytes_are_valid(&existing, jpeg_digest),
+                Err(read_error) if read_error.kind() == std::io::ErrorKind::NotFound => true,
+                Err(read_error) => return Err(read_error.into()),
+            };
+            if should_replace {
+                error
+                    .file
+                    .persist(jpeg_path)
+                    .map_err(|error| error.error)?
+                    .sync_all()?;
+            }
+        }
+        Err(error) => return Err(error.error.into()),
+    }
+    Ok(())
 }
 
 fn publish_thumbnail_cache_with_recheck<F>(
@@ -332,34 +583,33 @@ fn publish_thumbnail_cache_with_recheck<F>(
     recheck_key: F,
 ) -> Result<ThumbnailCacheHit>
 where
-    F: FnOnce() -> Option<ThumbnailManifestKey>,
+    F: FnOnce() -> Option<ThumbnailCacheIdentity>,
 {
     fs::create_dir_all(cache_dir)?;
-    let jpeg_filename = thumbnail_jpeg_filename(fingerprint)?;
+    let jpeg_digest = thumbnail_jpeg_digest(jpeg_bytes);
+    let jpeg_filename = thumbnail_jpeg_filename(fingerprint, &jpeg_digest)?;
     let jpeg_path = cache_dir.join(&jpeg_filename);
-    let jpeg_temp = flushed_tempfile(cache_dir, jpeg_bytes)?;
-    jpeg_temp
-        .persist(&jpeg_path)
-        .map_err(|error| error.error)?
-        .sync_all()?;
+    persist_immutable_thumbnail_jpeg(cache_dir, &jpeg_path, jpeg_bytes, &jpeg_digest)?;
 
-    let expected_key = &fingerprint.key;
     let manifest = ThumbnailManifest {
-        key: expected_key.clone(),
+        schema_version: THUMBNAIL_MANIFEST_SCHEMA_VERSION,
         fingerprint: fingerprint.clone(),
-        jpeg_filename,
+        jpeg_digest,
+        jpeg_byte_len: jpeg_bytes.len() as u64,
     };
-    let manifest_path = thumbnail_manifest_path(cache_dir, expected_key)?;
+    let manifest_path = thumbnail_manifest_path_for_digest(cache_dir, &fingerprint.key_digest)?;
     let manifest_temp = flushed_tempfile(cache_dir, &serde_json::to_vec(&manifest)?)?;
+    let rechecked_identity = recheck_key().context("Thumbnail source changed during generation")?;
     ensure!(
-        recheck_key().as_ref() == Some(expected_key),
+        thumbnail_fingerprint_matches_identity(fingerprint, &rechecked_identity),
         "Thumbnail source changed during generation"
     );
     manifest_temp
         .persist(&manifest_path)
-        .map_err(|error| error.error)?;
+        .map_err(|error| error.error)?
+        .sync_all()?;
 
-    lookup_thumbnail_manifest(cache_dir, expected_key)
+    lookup_thumbnail_manifest(cache_dir, &rechecked_identity)
         .context("Published thumbnail manifest did not validate")
 }
 
@@ -370,19 +620,17 @@ fn publish_transient_thumbnail_with_recheck<F>(
     recheck_key: F,
 ) -> Result<ThumbnailCacheHit>
 where
-    F: FnOnce() -> Option<ThumbnailManifestKey>,
+    F: FnOnce() -> Option<ThumbnailCacheIdentity>,
 {
     fs::create_dir_all(cache_dir)?;
-    let jpeg_path = thumbnail_transient_jpeg_path(cache_dir, fingerprint)?;
-    let jpeg_temp = flushed_tempfile(cache_dir, jpeg_bytes)?;
+    let jpeg_digest = thumbnail_jpeg_digest(jpeg_bytes);
+    let jpeg_path = thumbnail_transient_jpeg_path(cache_dir, fingerprint, &jpeg_digest)?;
+    persist_immutable_thumbnail_jpeg(cache_dir, &jpeg_path, jpeg_bytes, &jpeg_digest)?;
+    let rechecked_identity = recheck_key().context("Thumbnail source changed during generation")?;
     ensure!(
-        recheck_key().as_ref() == Some(&fingerprint.key),
+        thumbnail_fingerprint_matches_identity(fingerprint, &rechecked_identity),
         "Thumbnail source changed during generation"
     );
-    jpeg_temp
-        .persist(&jpeg_path)
-        .map_err(|error| error.error)?
-        .sync_all()?;
     Ok(ThumbnailCacheHit {
         manifest_path: None,
         jpeg_path,
@@ -391,28 +639,314 @@ where
 
 fn resolve_thumbnail_cache_with<F, R>(
     cache_dir: &Path,
-    key: &ThumbnailManifestKey,
+    identity: &ThumbnailCacheIdentity,
     force_regenerate: bool,
     generate: F,
     recheck_key: R,
 ) -> Result<ThumbnailCacheHit>
 where
     F: FnOnce() -> Result<(ThumbnailRenderFingerprint, Vec<u8>)>,
-    R: FnOnce() -> Option<ThumbnailManifestKey>,
+    R: FnOnce() -> Option<ThumbnailCacheIdentity>,
 {
-    if !force_regenerate && let Some(hit) = lookup_thumbnail_manifest(cache_dir, key) {
+    if !force_regenerate && let Some(hit) = lookup_thumbnail_manifest(cache_dir, identity) {
         return Ok(hit);
     }
 
     let (fingerprint, jpeg_bytes) = generate()?;
     ensure!(
-        fingerprint.key == *key,
+        thumbnail_fingerprint_matches_identity(&fingerprint, identity),
         "Thumbnail fingerprint did not contain the requested manifest key"
     );
-    if fingerprint.actual_render_path != key.render_profile.dispatch {
-        publish_transient_thumbnail_with_recheck(cache_dir, &fingerprint, &jpeg_bytes, recheck_key)
-    } else {
+    if thumbnail_fingerprint_is_reusable(&fingerprint, identity) {
         publish_thumbnail_cache_with_recheck(cache_dir, &fingerprint, &jpeg_bytes, recheck_key)
+    } else {
+        publish_transient_thumbnail_with_recheck(cache_dir, &fingerprint, &jpeg_bytes, recheck_key)
+    }
+}
+
+#[derive(Clone)]
+struct ThumbnailCleanupManifestEntry {
+    manifest_path: PathBuf,
+    jpeg_path: PathBuf,
+    virtual_path_digest: String,
+    modified: SystemTime,
+}
+
+struct ThumbnailCleanupUnit {
+    modified: SystemTime,
+    sort_name: String,
+    paths: Vec<PathBuf>,
+}
+
+fn thumbnail_manifest_key_digest_from_name(path: &Path) -> Option<&str> {
+    let name = path.file_name()?.to_str()?;
+    let digest = name.strip_suffix(".thumbnail-manifest.json")?;
+    thumbnail_digest_is_valid(digest).then_some(digest)
+}
+
+fn thumbnail_recognized_jpeg_name(path: &Path) -> bool {
+    let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+        return false;
+    };
+    let stem = name
+        .strip_suffix(".transient.jpg")
+        .or_else(|| name.strip_suffix(".jpg"));
+    let Some(stem) = stem else {
+        return false;
+    };
+    let mut parts = stem.split('.');
+    match (parts.next(), parts.next(), parts.next()) {
+        (Some(fingerprint), None, None) => thumbnail_digest_is_valid(fingerprint),
+        (Some(fingerprint), Some(jpeg), None) => {
+            thumbnail_digest_is_valid(fingerprint) && thumbnail_digest_is_valid(jpeg)
+        }
+        _ => false,
+    }
+}
+
+fn thumbnail_recognized_staging_name(path: &Path) -> bool {
+    path.file_name()
+        .and_then(|name| name.to_str())
+        .is_some_and(|name| name.starts_with(".thumbnail-stage-"))
+}
+
+fn thumbnail_lut_request_digest_is_valid(request: &ThumbnailLutRequest) -> bool {
+    match request {
+        ThumbnailLutRequest::Available(identity) => {
+            thumbnail_digest_is_valid(&identity.content_blake3)
+        }
+        ThumbnailLutRequest::NotRequested | ThumbnailLutRequest::Unavailable => true,
+    }
+}
+
+fn thumbnail_lut_outcome_digest_is_valid(outcome: &ThumbnailLutOutcome) -> bool {
+    match outcome {
+        ThumbnailLutOutcome::Applied(identity) => {
+            thumbnail_digest_is_valid(&identity.content_blake3)
+        }
+        ThumbnailLutOutcome::NotRequested
+        | ThumbnailLutOutcome::Unavailable
+        | ThumbnailLutOutcome::NotApplied => true,
+    }
+}
+
+fn thumbnail_cleanup_manifest_entry(
+    cache_dir: &Path,
+    manifest_path: &Path,
+) -> Option<ThumbnailCleanupManifestEntry> {
+    let filename_key_digest = thumbnail_manifest_key_digest_from_name(manifest_path)?;
+    let metadata = fs::metadata(manifest_path).ok()?;
+    if !metadata.is_file() || metadata.len() > THUMBNAIL_MANIFEST_MAX_BYTES {
+        return None;
+    }
+    let manifest: ThumbnailManifest =
+        serde_json::from_slice(&fs::read(manifest_path).ok()?).ok()?;
+    if manifest.schema_version != THUMBNAIL_MANIFEST_SCHEMA_VERSION
+        || manifest.fingerprint.key_digest != filename_key_digest
+        || !thumbnail_digest_is_valid(&manifest.fingerprint.key_digest)
+        || !thumbnail_digest_is_valid(&manifest.fingerprint.virtual_path_digest)
+        || !thumbnail_digest_is_valid(&manifest.fingerprint.effective_adjustments_digest)
+        || !thumbnail_lut_request_digest_is_valid(&manifest.fingerprint.requested_lut)
+        || !thumbnail_lut_outcome_digest_is_valid(&manifest.fingerprint.actual_lut_outcome)
+        || !thumbnail_fingerprint_has_reusable_outcome(&manifest.fingerprint)
+        || !thumbnail_digest_is_valid(&manifest.jpeg_digest)
+        || manifest.jpeg_byte_len > THUMBNAIL_JPEG_MAX_BYTES
+    {
+        return None;
+    }
+
+    let jpeg_filename =
+        thumbnail_jpeg_filename(&manifest.fingerprint, &manifest.jpeg_digest).ok()?;
+    let jpeg_path = cache_dir.join(jpeg_filename);
+    let jpeg_metadata = fs::metadata(&jpeg_path).ok()?;
+    if !jpeg_metadata.is_file() || jpeg_metadata.len() != manifest.jpeg_byte_len {
+        return None;
+    }
+    let jpeg_bytes = fs::read(&jpeg_path).ok()?;
+    if !thumbnail_jpeg_bytes_are_valid(&jpeg_bytes, &manifest.jpeg_digest) {
+        return None;
+    }
+
+    Some(ThumbnailCleanupManifestEntry {
+        manifest_path: manifest_path.to_path_buf(),
+        jpeg_path,
+        virtual_path_digest: manifest.fingerprint.virtual_path_digest,
+        modified: metadata.modified().unwrap_or(UNIX_EPOCH),
+    })
+}
+
+fn thumbnail_path_is_old_enough(path: &Path, cutoff: SystemTime) -> bool {
+    fs::metadata(path)
+        .ok()
+        .and_then(|metadata| metadata.modified().ok())
+        .is_some_and(|modified| modified <= cutoff)
+}
+
+fn remove_thumbnail_cleanup_units_with<F>(
+    units: Vec<ThumbnailCleanupUnit>,
+    max_removed_entries: usize,
+    mut remove_file: F,
+) -> Vec<PathBuf>
+where
+    F: FnMut(&Path) -> std::io::Result<()>,
+{
+    let mut removed = Vec::new();
+    for unit in units {
+        if removed.len() + unit.paths.len() > max_removed_entries {
+            break;
+        }
+        for path in unit.paths {
+            match remove_file(&path) {
+                Ok(()) => removed.push(path),
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+                Err(error) => {
+                    log::warn!(
+                        "Could not remove stale thumbnail artifact '{}': {error}",
+                        path.display()
+                    );
+                    break;
+                }
+            }
+        }
+    }
+    removed
+}
+
+fn cleanup_stale_thumbnail_artifacts_with(
+    cache_dir: &Path,
+    now: SystemTime,
+    grace: Duration,
+    max_removed_entries: usize,
+    retain_versions_per_virtual_path: usize,
+) -> Result<Vec<PathBuf>> {
+    if !cache_dir.exists() || max_removed_entries == 0 {
+        return Ok(Vec::new());
+    }
+    let cutoff = now.checked_sub(grace).unwrap_or(UNIX_EPOCH);
+    let mut paths: Vec<PathBuf> = fs::read_dir(cache_dir)?
+        .filter_map(std::result::Result::ok)
+        .map(|entry| entry.path())
+        .filter(|path| path.is_file())
+        .collect();
+    paths.sort();
+
+    let mut valid_entries = Vec::new();
+    let mut valid_manifest_paths = HashSet::new();
+    let mut all_valid_referenced_jpegs = HashSet::new();
+    for path in &paths {
+        if thumbnail_manifest_key_digest_from_name(path).is_some()
+            && let Some(entry) = thumbnail_cleanup_manifest_entry(cache_dir, path)
+        {
+            valid_manifest_paths.insert(entry.manifest_path.clone());
+            all_valid_referenced_jpegs.insert(entry.jpeg_path.clone());
+            valid_entries.push(entry);
+        }
+    }
+
+    let mut grouped: HashMap<String, Vec<ThumbnailCleanupManifestEntry>> = HashMap::new();
+    for entry in valid_entries {
+        grouped
+            .entry(entry.virtual_path_digest.clone())
+            .or_default()
+            .push(entry);
+    }
+
+    let mut stale_valid_entries = Vec::new();
+    let mut retained_jpegs = HashSet::new();
+    for entries in grouped.values_mut() {
+        entries.sort_by(|left, right| {
+            right.modified.cmp(&left.modified).then_with(|| {
+                right
+                    .manifest_path
+                    .file_name()
+                    .cmp(&left.manifest_path.file_name())
+            })
+        });
+        for (index, entry) in entries.iter().enumerate() {
+            if index < retain_versions_per_virtual_path
+                || !thumbnail_path_is_old_enough(&entry.manifest_path, cutoff)
+                || !thumbnail_path_is_old_enough(&entry.jpeg_path, cutoff)
+            {
+                retained_jpegs.insert(entry.jpeg_path.clone());
+            } else {
+                stale_valid_entries.push(entry.clone());
+            }
+        }
+    }
+
+    let mut units = Vec::new();
+    let mut assigned_stale_jpegs = HashSet::new();
+    for entry in stale_valid_entries {
+        let mut unit_paths = vec![entry.manifest_path.clone()];
+        if !retained_jpegs.contains(&entry.jpeg_path)
+            && assigned_stale_jpegs.insert(entry.jpeg_path.clone())
+        {
+            unit_paths.push(entry.jpeg_path.clone());
+        }
+        units.push(ThumbnailCleanupUnit {
+            modified: entry.modified,
+            sort_name: entry
+                .manifest_path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .unwrap_or_default()
+                .to_string(),
+            paths: unit_paths,
+        });
+    }
+
+    for path in &paths {
+        let recognized_manifest = thumbnail_manifest_key_digest_from_name(path).is_some();
+        let recognized_orphan_jpeg =
+            thumbnail_recognized_jpeg_name(path) && !all_valid_referenced_jpegs.contains(path);
+        let recognized_staging = thumbnail_recognized_staging_name(path);
+        let invalid_manifest = recognized_manifest && !valid_manifest_paths.contains(path);
+        if (invalid_manifest || recognized_orphan_jpeg || recognized_staging)
+            && thumbnail_path_is_old_enough(path, cutoff)
+        {
+            units.push(ThumbnailCleanupUnit {
+                modified: fs::metadata(path)
+                    .ok()
+                    .and_then(|metadata| metadata.modified().ok())
+                    .unwrap_or(UNIX_EPOCH),
+                sort_name: path
+                    .file_name()
+                    .and_then(|name| name.to_str())
+                    .unwrap_or_default()
+                    .to_string(),
+                paths: vec![path.clone()],
+            });
+        }
+    }
+
+    units.sort_by(|left, right| {
+        left.modified
+            .cmp(&right.modified)
+            .then_with(|| left.sort_name.cmp(&right.sort_name))
+    });
+    Ok(remove_thumbnail_cleanup_units_with(
+        units,
+        max_removed_entries,
+        |path| fs::remove_file(path),
+    ))
+}
+
+pub(crate) fn cleanup_thumbnail_cache_on_startup(app_handle: &AppHandle) {
+    let Ok(cache_dir) = get_thumb_cache_dir(app_handle) else {
+        return;
+    };
+    match cleanup_stale_thumbnail_artifacts_with(
+        &cache_dir,
+        SystemTime::now(),
+        THUMBNAIL_CACHE_CLEANUP_GRACE,
+        THUMBNAIL_CACHE_CLEANUP_MAX_ENTRIES,
+        THUMBNAIL_CACHE_RETENTION_PER_PATH,
+    ) {
+        Ok(removed) if !removed.is_empty() => {
+            log::info!("Removed {} stale thumbnail cache artifacts", removed.len());
+        }
+        Ok(_) => {}
+        Err(error) => log::warn!("Could not clean thumbnail cache on startup: {error}"),
     }
 }
 
@@ -1613,20 +2147,25 @@ struct ThumbnailLoadedInput {
 struct ThumbnailRenderedImage {
     image: DynamicImage,
     actual_render_path: ThumbnailRenderPath,
+    actual_lut_outcome: ThumbnailLutOutcome,
 }
 
 fn resolve_thumbnail_gpu_result<E>(
     result: std::result::Result<DynamicImage, E>,
     fallback: DynamicImage,
+    success_lut_outcome: ThumbnailLutOutcome,
+    fallback_lut_outcome: ThumbnailLutOutcome,
 ) -> ThumbnailRenderedImage {
     match result {
         Ok(image) => ThumbnailRenderedImage {
             image,
             actual_render_path: ThumbnailRenderPath::ObjectGpu,
+            actual_lut_outcome: success_lut_outcome,
         },
         Err(_) => ThumbnailRenderedImage {
             image: fallback,
             actual_render_path: ThumbnailRenderPath::ObjectFallback,
+            actual_lut_outcome: fallback_lut_outcome,
         },
     }
 }
@@ -1726,6 +2265,7 @@ fn render_thumbnail_object_gpu(
     composite_image: DynamicImage,
     raw_scale_factor: f32,
     adjustments: &Value,
+    resolved_lut: &ResolvedThumbnailLut,
     is_raw: bool,
     app_handle: &AppHandle,
     settings: &AppSettings,
@@ -1844,6 +2384,14 @@ fn render_thumbnail_object_gpu(
         return Ok(ThumbnailRenderedImage {
             image: cropped_preview.into_owned(),
             actual_render_path: ThumbnailRenderPath::ObjectFallback,
+            actual_lut_outcome: resolved_lut.fallback_outcome(),
+        });
+    }
+    if resolved_lut.request == ThumbnailLutRequest::Unavailable {
+        return Ok(ThumbnailRenderedImage {
+            image: cropped_preview.into_owned(),
+            actual_render_path: ThumbnailRenderPath::ObjectFallback,
+            actual_lut_outcome: ThumbnailLutOutcome::Unavailable,
         });
     }
     let unscaled_crop_offset = crop_data.map_or((0.0, 0.0), |crop| (crop.x as f32, crop.y as f32));
@@ -1871,19 +2419,6 @@ fn render_thumbnail_object_gpu(
 
     let tm_override = crate::image_processing::resolve_tonemapper_override(settings, is_raw);
     let gpu_adjustments = get_all_adjustments_from_json(adjustments, is_raw, tm_override);
-    let lut = adjustments["lutPath"].as_str().and_then(|path| {
-        let mut cache = state.lut_cache.lock().unwrap();
-        if let Some(cached_lut) = cache.get(path) {
-            return Some(cached_lut.clone());
-        }
-        if let Ok(loaded_lut) = crate::lut_processing::parse_lut_file(path) {
-            let loaded_lut = Arc::new(loaded_lut);
-            cache.insert(path.to_string(), Arc::clone(&loaded_lut));
-            return Some(loaded_lut);
-        }
-        None
-    });
-
     let mut hasher = DefaultHasher::new();
     path_str.hash(&mut hasher);
     adjustments.to_string().hash(&mut hasher);
@@ -1898,12 +2433,14 @@ fn render_thumbnail_object_gpu(
             gpu_processing::RenderRequest {
                 adjustments: gpu_adjustments,
                 mask_bitmaps: &mask_bitmaps,
-                lut,
+                lut: resolved_lut.lut.clone(),
                 roi: None,
             },
             "generate_thumbnail_data",
         ),
         cropped_preview.into_owned(),
+        resolved_lut.applied_outcome(),
+        resolved_lut.fallback_outcome(),
     ))
 }
 
@@ -1915,7 +2452,13 @@ fn generate_thumbnail_data(
     settings: &AppSettings,
     persisted_adjustments: &Value,
     defaults: &CameraDefaults,
-) -> Result<(DynamicImage, ResolvedRenderInput, ThumbnailRenderPath)> {
+    resolved_lut: &ResolvedThumbnailLut,
+) -> Result<(
+    DynamicImage,
+    ResolvedRenderInput,
+    ThumbnailRenderPath,
+    ThumbnailLutOutcome,
+)> {
     let (source_path, _) = parse_virtual_path(path_str);
     let source_path_str = source_path.to_string_lossy().to_string();
     let is_raw = is_raw_file(&source_path);
@@ -1933,6 +2476,7 @@ fn generate_thumbnail_data(
         ThumbnailRenderPath::DefaultCpu => ThumbnailRenderedImage {
             image: render_thumbnail_from_loaded(loaded.loaded, &render, is_raw, settings)?,
             actual_render_path: ThumbnailRenderPath::DefaultCpu,
+            actual_lut_outcome: resolved_lut.fallback_outcome(),
         },
         ThumbnailRenderPath::ObjectGpu => render_thumbnail_object_gpu(
             path_str,
@@ -1940,6 +2484,7 @@ fn generate_thumbnail_data(
             loaded.loaded.image,
             loaded.raw_scale_factor,
             &render.effective_adjustments,
+            resolved_lut,
             is_raw,
             app_handle,
             settings,
@@ -1952,11 +2497,17 @@ fn generate_thumbnail_data(
                 image: apply_coarse_rotation(Cow::Owned(loaded.loaded.image), orientation_steps)
                     .into_owned(),
                 actual_render_path: ThumbnailRenderPath::ObjectFallback,
+                actual_lut_outcome: resolved_lut.fallback_outcome(),
             }
         }
     };
 
-    Ok((rendered.image, render, rendered.actual_render_path))
+    Ok((
+        rendered.image,
+        render,
+        rendered.actual_render_path,
+        rendered.actual_lut_outcome,
+    ))
 }
 
 fn encode_thumbnail(image: &DynamicImage, target_width: u32) -> Result<Vec<u8>> {
@@ -1973,33 +2524,66 @@ struct CachedThumbnailResolution {
     is_edited: bool,
 }
 
-fn thumbnail_key_recheck_with<F>(
+enum CachedThumbnailAdapterMode {
+    Library,
+    DecodedImage,
+}
+
+enum CachedThumbnailAdapterOutput {
+    Library(String, u8, bool),
+    DecodedImage(DynamicImage),
+}
+
+fn adapt_cached_thumbnail_resolution(
+    resolution: CachedThumbnailResolution,
+    mode: CachedThumbnailAdapterMode,
+) -> Result<CachedThumbnailAdapterOutput> {
+    match mode {
+        CachedThumbnailAdapterMode::Library => Ok(CachedThumbnailAdapterOutput::Library(
+            resolution.hit.jpeg_path.to_string_lossy().into_owned(),
+            resolution.rating,
+            resolution.is_edited,
+        )),
+        CachedThumbnailAdapterMode::DecodedImage => {
+            let jpeg_path = resolution.hit.jpeg_path;
+            let image = image::open(&jpeg_path).with_context(|| {
+                format!("Could not open cached thumbnail {}", jpeg_path.display())
+            })?;
+            Ok(CachedThumbnailAdapterOutput::DecodedImage(image))
+        }
+    }
+}
+
+fn thumbnail_identity_recheck_with<F>(
     path_str: &str,
     camera_defaults: &CameraDefaults,
     render_profile: &ThumbnailRenderProfile,
     load_adjustments: F,
-) -> Option<ThumbnailManifestKey>
+) -> Option<ThumbnailCacheIdentity>
 where
     F: FnOnce(&Path) -> Value,
 {
     let (source_path, sidecar_path) = parse_virtual_path(path_str);
     let persisted_adjustments = load_adjustments(&sidecar_path);
+    let lut_request = resolve_thumbnail_lut_request(&persisted_adjustments);
     let source_modified = thumbnail_source_timestamp(&source_path)?;
-    Some(thumbnail_manifest_key(
+    let key = thumbnail_manifest_key(
         path_str,
         source_modified,
         &persisted_adjustments,
         camera_defaults,
         render_profile,
-    ))
+        &lut_request,
+    );
+    thumbnail_cache_identity(&key).ok()
 }
 
-fn thumbnail_key_recheck(
+fn thumbnail_identity_recheck(
     path_str: &str,
     camera_defaults: &CameraDefaults,
     render_profile: &ThumbnailRenderProfile,
-) -> Option<ThumbnailManifestKey> {
-    thumbnail_key_recheck_with(path_str, camera_defaults, render_profile, |sidecar_path| {
+) -> Option<ThumbnailCacheIdentity> {
+    thumbnail_identity_recheck_with(path_str, camera_defaults, render_profile, |sidecar_path| {
         crate::exif_processing::load_sidecar(sidecar_path).adjustments
     })
 }
@@ -2040,39 +2624,51 @@ fn generate_cached_thumbnail(
         &metadata.adjustments,
         gpu_context.is_some(),
     );
-    let key = thumbnail_manifest_key_for_path(path_str, &metadata.adjustments, &render_profile)
-        .context("Could not build thumbnail manifest key")?;
+    let resolved_lut = resolve_thumbnail_lut(&metadata.adjustments);
+    let key = thumbnail_manifest_key_for_path(
+        path_str,
+        &metadata.adjustments,
+        &render_profile,
+        &resolved_lut.request,
+    )
+    .context("Could not build thumbnail manifest key")?;
+    let identity = thumbnail_cache_identity(&key)?;
     let target_width = render_profile.target_width;
-    let key_for_generate = key.clone();
-    let key_for_recheck = key.clone();
+    let identity_for_generate = identity.clone();
+    let camera_defaults_for_generate = key.camera_defaults.clone();
+    let camera_defaults_for_recheck = key.camera_defaults.clone();
+    let render_profile_for_recheck = key.render_profile.clone();
+    drop(key);
     let persisted_adjustments = metadata.adjustments;
     let hit = resolve_thumbnail_cache_with(
         thumb_cache_dir,
-        &key,
+        &identity,
         force_regenerate,
         || {
-            let (image, render, actual_render_path) = generate_thumbnail_data(
+            let (image, render, actual_render_path, actual_lut_outcome) = generate_thumbnail_data(
                 path_str,
                 gpu_context,
                 preloaded_image,
                 app_handle,
                 settings,
                 &persisted_adjustments,
-                &key_for_generate.camera_defaults,
+                &camera_defaults_for_generate,
+                &resolved_lut,
             )?;
-            let fingerprint = ThumbnailRenderFingerprint {
+            let fingerprint = thumbnail_render_fingerprint(
+                &identity_for_generate,
+                &render.effective_adjustments,
+                render.source_kind,
                 actual_render_path,
-                key: key_for_generate,
-                effective_adjustments: render.effective_adjustments,
-                source_kind: render.source_kind,
-            };
+                actual_lut_outcome,
+            )?;
             Ok((fingerprint, encode_thumbnail(&image, target_width)?))
         },
         || {
-            thumbnail_key_recheck(
+            thumbnail_identity_recheck(
                 path_str,
-                &key_for_recheck.camera_defaults,
-                &key_for_recheck.render_profile,
+                &camera_defaults_for_recheck,
+                &render_profile_for_recheck,
             )
         },
     )?;
@@ -2093,36 +2689,27 @@ fn generate_single_thumbnail_and_cache(
     app_handle: &AppHandle,
     settings: &AppSettings,
 ) -> Option<(String, u8, bool)> {
-    generate_single_thumbnail_and_cache_with(path_str, || {
-        generate_cached_thumbnail(
-            path_str,
-            thumb_cache_dir,
-            gpu_context,
-            preloaded_image,
-            force_regenerate,
-            app_handle,
-            settings,
-        )
-    })
-}
-
-fn generate_single_thumbnail_and_cache_with<F>(
-    path_str: &str,
-    generate: F,
-) -> Option<(String, u8, bool)>
-where
-    F: FnOnce() -> Result<CachedThumbnailResolution>,
-{
-    match generate() {
-        Ok(result) => Some((
-            result.hit.jpeg_path.to_string_lossy().into_owned(),
-            result.rating,
-            result.is_edited,
-        )),
+    let resolution = generate_cached_thumbnail(
+        path_str,
+        thumb_cache_dir,
+        gpu_context,
+        preloaded_image,
+        force_regenerate,
+        app_handle,
+        settings,
+    )
+    .and_then(|resolution| {
+        adapt_cached_thumbnail_resolution(resolution, CachedThumbnailAdapterMode::Library)
+    });
+    match resolution {
+        Ok(CachedThumbnailAdapterOutput::Library(path, rating, is_edited)) => {
+            Some((path, rating, is_edited))
+        }
         Err(error) => {
             log::warn!("Failed to generate thumbnail for '{}': {error}", path_str);
             None
         }
+        Ok(CachedThumbnailAdapterOutput::DecodedImage(_)) => unreachable!(),
     }
 }
 
@@ -3779,30 +4366,19 @@ pub fn get_cached_or_generate_thumbnail_image(
 ) -> Result<DynamicImage> {
     let thumb_cache_dir = get_thumb_cache_dir(app_handle).map_err(|e| anyhow::anyhow!(e))?;
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
-    get_cached_or_generate_thumbnail_image_with(|| {
-        generate_cached_thumbnail(
-            path_str,
-            &thumb_cache_dir,
-            gpu_context,
-            None,
-            false,
-            app_handle,
-            &settings,
-        )
-    })
-}
-
-fn get_cached_or_generate_thumbnail_image_with<F>(generate: F) -> Result<DynamicImage>
-where
-    F: FnOnce() -> Result<CachedThumbnailResolution>,
-{
-    let cached = generate()?;
-    image::open(&cached.hit.jpeg_path).with_context(|| {
-        format!(
-            "Could not open cached thumbnail {}",
-            cached.hit.jpeg_path.display()
-        )
-    })
+    let resolution = generate_cached_thumbnail(
+        path_str,
+        &thumb_cache_dir,
+        gpu_context,
+        None,
+        false,
+        app_handle,
+        &settings,
+    )?;
+    match adapt_cached_thumbnail_resolution(resolution, CachedThumbnailAdapterMode::DecodedImage)? {
+        CachedThumbnailAdapterOutput::DecodedImage(image) => Ok(image),
+        CachedThumbnailAdapterOutput::Library(_, _, _) => unreachable!(),
+    }
 }
 
 #[tauri::command]
@@ -4426,6 +5002,25 @@ mod tests {
         DynamicImage::ImageRgb32F(Rgb32FImage::from_pixel(8, 6, Rgb([0.18, 0.25, 0.4])))
     }
 
+    fn thumbnail_test_jpeg(color: [f32; 3]) -> Vec<u8> {
+        let image = DynamicImage::ImageRgb32F(Rgb32FImage::from_pixel(8, 6, Rgb(color)));
+        encode_thumbnail(&image, 8).unwrap()
+    }
+
+    fn thumbnail_test_cube(last_blue: f32) -> String {
+        format!(
+            "LUT_3D_SIZE 2\n\
+             0 0 0\n\
+             1 0 0\n\
+             0 1 0\n\
+             1 1 0\n\
+             0 0 1\n\
+             1 0 1\n\
+             0 1 1\n\
+             1 1 {last_blue}\n"
+        )
+    }
+
     fn thumbnail_test_loaded(source_kind: ImageSourceKind) -> LoadedBaseImage {
         LoadedBaseImage {
             image: thumbnail_test_image(),
@@ -4461,23 +5056,53 @@ mod tests {
             &Value::Null,
             &thumbnail_test_defaults(),
             &thumbnail_test_profile(),
+            &ThumbnailLutRequest::NotRequested,
         )
     }
 
+    fn thumbnail_test_identity(key: &ThumbnailManifestKey) -> ThumbnailCacheIdentity {
+        thumbnail_cache_identity(key).unwrap()
+    }
+
+    fn thumbnail_test_effective_adjustments() -> Value {
+        json!({
+            "crop": {
+                "x": 2.0,
+                "y": 2.0,
+                "width": 4.0,
+                "height": 2.0,
+            },
+            "aspectRatio": 2.0,
+        })
+    }
+
     fn thumbnail_test_fingerprint(key: &ThumbnailManifestKey) -> ThumbnailRenderFingerprint {
-        ThumbnailRenderFingerprint {
-            key: key.clone(),
-            effective_adjustments: json!({
-                "crop": {
-                    "x": 2.0,
-                    "y": 2.0,
-                    "width": 4.0,
-                    "height": 2.0,
-                },
-                "aspectRatio": 2.0,
-            }),
-            source_kind: ImageSourceKind::DevelopedRaw,
-            actual_render_path: key.render_profile.dispatch,
+        let actual_lut_outcome = match &key.lut_request {
+            ThumbnailLutRequest::NotRequested => ThumbnailLutOutcome::NotRequested,
+            ThumbnailLutRequest::Available(identity) => {
+                ThumbnailLutOutcome::Applied(identity.clone())
+            }
+            ThumbnailLutRequest::Unavailable => ThumbnailLutOutcome::Unavailable,
+        };
+        thumbnail_render_fingerprint(
+            &thumbnail_test_identity(key),
+            &thumbnail_test_effective_adjustments(),
+            ImageSourceKind::DevelopedRaw,
+            key.render_profile.dispatch,
+            actual_lut_outcome,
+        )
+        .unwrap()
+    }
+
+    fn thumbnail_test_manifest(
+        fingerprint: &ThumbnailRenderFingerprint,
+        jpeg: &[u8],
+    ) -> ThumbnailManifest {
+        ThumbnailManifest {
+            schema_version: THUMBNAIL_MANIFEST_SCHEMA_VERSION,
+            fingerprint: fingerprint.clone(),
+            jpeg_digest: thumbnail_jpeg_digest(jpeg),
+            jpeg_byte_len: jpeg.len() as u64,
         }
     }
 
@@ -4558,7 +5183,12 @@ mod tests {
         let fallback = thumbnail_test_image();
         let expected = fallback.to_rgb32f();
 
-        let rendered = resolve_thumbnail_gpu_result::<&str>(Err("runtime GPU failure"), fallback);
+        let rendered = resolve_thumbnail_gpu_result::<&str>(
+            Err("runtime GPU failure"),
+            fallback,
+            ThumbnailLutOutcome::NotRequested,
+            ThumbnailLutOutcome::NotRequested,
+        );
 
         assert_eq!(
             rendered.actual_render_path,
@@ -4601,6 +5231,7 @@ mod tests {
             source.to_str().unwrap(),
             &Value::Null,
             &thumbnail_test_profile(),
+            &ThumbnailLutRequest::NotRequested,
             move |path| {
                 assert_eq!(path, source_for_extractor.as_path());
                 extraction_count_for_call.fetch_add(1, Ordering::SeqCst);
@@ -4655,6 +5286,7 @@ mod tests {
             source.to_str().unwrap(),
             &Value::Null,
             &thumbnail_test_profile(),
+            &ThumbnailLutRequest::NotRequested,
             |path| {
                 fs::write(path, b"after").unwrap();
                 filetime::set_file_mtime(path, changed_time).unwrap();
@@ -4678,8 +5310,7 @@ mod tests {
             thumbnail_manifest_key_hash(&path_key).unwrap(),
             base_key_hash
         );
-        let mut path_fingerprint = base_fingerprint.clone();
-        path_fingerprint.key = path_key;
+        let path_fingerprint = thumbnail_test_fingerprint(&path_key);
         assert_ne!(
             thumbnail_render_fingerprint_hash(&path_fingerprint).unwrap(),
             base_final_hash
@@ -4691,8 +5322,7 @@ mod tests {
             thumbnail_manifest_key_hash(&time_key).unwrap(),
             base_key_hash
         );
-        let mut time_fingerprint = base_fingerprint.clone();
-        time_fingerprint.key = time_key;
+        let time_fingerprint = thumbnail_test_fingerprint(&time_key);
         assert_ne!(
             thumbnail_render_fingerprint_hash(&time_fingerprint).unwrap(),
             base_final_hash
@@ -4704,8 +5334,7 @@ mod tests {
             thumbnail_manifest_key_hash(&defaults_key).unwrap(),
             base_key_hash
         );
-        let mut defaults_fingerprint = base_fingerprint.clone();
-        defaults_fingerprint.key = defaults_key;
+        let defaults_fingerprint = thumbnail_test_fingerprint(&defaults_key);
         assert_ne!(
             thumbnail_render_fingerprint_hash(&defaults_fingerprint).unwrap(),
             base_final_hash
@@ -4717,15 +5346,22 @@ mod tests {
             thumbnail_manifest_key_hash(&persisted_key).unwrap(),
             base_key_hash
         );
-        let mut persisted_fingerprint = base_fingerprint.clone();
-        persisted_fingerprint.key = persisted_key;
+        let persisted_fingerprint = thumbnail_test_fingerprint(&persisted_key);
         assert_ne!(
             thumbnail_render_fingerprint_hash(&persisted_fingerprint).unwrap(),
             base_final_hash
         );
 
-        let mut effective_fingerprint = base_fingerprint.clone();
-        effective_fingerprint.effective_adjustments["crop"]["width"] = json!(3.0);
+        let mut changed_effective = thumbnail_test_effective_adjustments();
+        changed_effective["crop"]["width"] = json!(3.0);
+        let effective_fingerprint = thumbnail_render_fingerprint(
+            &thumbnail_test_identity(&base_key),
+            &changed_effective,
+            ImageSourceKind::DevelopedRaw,
+            base_key.render_profile.dispatch,
+            ThumbnailLutOutcome::NotRequested,
+        )
+        .unwrap();
         assert_ne!(
             thumbnail_render_fingerprint_hash(&effective_fingerprint).unwrap(),
             base_final_hash
@@ -4781,10 +5417,7 @@ mod tests {
                 thumbnail_manifest_key_hash(&changed_key).unwrap(),
                 base_key_hash
             );
-            let changed_fingerprint = ThumbnailRenderFingerprint {
-                key: changed_key,
-                ..base_fingerprint.clone()
-            };
+            let changed_fingerprint = thumbnail_test_fingerprint(&changed_key);
             assert_ne!(
                 thumbnail_render_fingerprint_hash(&changed_fingerprint).unwrap(),
                 base_fingerprint_hash
@@ -4796,37 +5429,30 @@ mod tests {
     fn thumbnail_manifest_lookup_rejects_missing_malformed_and_mismatched_entries() {
         let temp = tempfile::tempdir().unwrap();
         let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
         let fingerprint = thumbnail_test_fingerprint(&key);
-        let manifest_path = thumbnail_manifest_path(temp.path(), &key).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
 
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
 
         fs::write(&manifest_path, b"{").unwrap();
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
 
         let other_key = thumbnail_test_key("/photos/other.RAF");
-        let key_mismatch = ThumbnailManifest {
-            key: other_key.clone(),
-            fingerprint: thumbnail_test_fingerprint(&other_key),
-            jpeg_filename: "unused.jpg".to_string(),
-        };
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let key_mismatch = thumbnail_test_manifest(&thumbnail_test_fingerprint(&other_key), &jpeg);
         fs::write(&manifest_path, serde_json::to_vec(&key_mismatch).unwrap()).unwrap();
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
 
-        let fingerprint_mismatch = ThumbnailManifest {
-            key: key.clone(),
-            fingerprint: ThumbnailRenderFingerprint {
-                key: other_key,
-                ..fingerprint.clone()
-            },
-            jpeg_filename: thumbnail_jpeg_filename(&fingerprint).unwrap(),
-        };
+        let mut mismatched_fingerprint = fingerprint;
+        mismatched_fingerprint.key_digest = thumbnail_test_identity(&other_key).key_digest;
+        let fingerprint_mismatch = thumbnail_test_manifest(&mismatched_fingerprint, &jpeg);
         fs::write(
             &manifest_path,
             serde_json::to_vec(&fingerprint_mismatch).unwrap(),
         )
         .unwrap();
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
     }
 
     #[test]
@@ -4834,101 +5460,620 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut key = thumbnail_test_key("/photos/image.RAF");
         key.render_profile.dispatch = ThumbnailRenderPath::ObjectGpu;
-        let fingerprint = thumbnail_test_fingerprint(&key);
-        let jpeg_filename = thumbnail_jpeg_filename(&fingerprint).unwrap();
-        let manifest_path = thumbnail_manifest_path(temp.path(), &key).unwrap();
-        let mut manifest = serde_json::to_value(ThumbnailManifest {
-            key: key.clone(),
-            fingerprint,
-            jpeg_filename: jpeg_filename.clone(),
-        })
-        .unwrap();
-        manifest["fingerprint"]["actualRenderPath"] = json!("object_fallback");
+        let identity = thumbnail_test_identity(&key);
+        let mut fingerprint = thumbnail_test_fingerprint(&key);
+        fingerprint.actual_render_path = ThumbnailRenderPath::ObjectFallback;
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let manifest = thumbnail_test_manifest(&fingerprint, &jpeg);
+        let jpeg_filename = thumbnail_jpeg_filename(&fingerprint, &manifest.jpeg_digest).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
 
         fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
-        fs::write(temp.path().join(jpeg_filename), b"fallback-jpeg").unwrap();
+        fs::write(temp.path().join(jpeg_filename), jpeg).unwrap();
 
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
     }
 
     #[test]
-    fn thumbnail_manifest_lookup_rejects_unsafe_wrong_and_missing_jpeg() {
+    fn thumbnail_manifest_lookup_rejects_invalid_digest_and_missing_jpeg() {
         let temp = tempfile::tempdir().unwrap();
         let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
         let fingerprint = thumbnail_test_fingerprint(&key);
-        let manifest_path = thumbnail_manifest_path(temp.path(), &key).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let mut invalid = thumbnail_test_manifest(&fingerprint, &jpeg);
+        invalid.jpeg_digest = "not-a-digest".to_string();
+        fs::write(&manifest_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
 
-        for jpeg_filename in ["../escape.jpg", "wrong.jpg"] {
-            let invalid = ThumbnailManifest {
-                key: key.clone(),
-                fingerprint: fingerprint.clone(),
-                jpeg_filename: jpeg_filename.to_string(),
-            };
-            fs::write(&manifest_path, serde_json::to_vec(&invalid).unwrap()).unwrap();
-            assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
-        }
-
-        let missing_jpeg = ThumbnailManifest {
-            key: key.clone(),
-            fingerprint: fingerprint.clone(),
-            jpeg_filename: thumbnail_jpeg_filename(&fingerprint).unwrap(),
-        };
+        let missing_jpeg = thumbnail_test_manifest(&fingerprint, &jpeg);
         fs::write(&manifest_path, serde_json::to_vec(&missing_jpeg).unwrap()).unwrap();
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
+    }
+
+    #[test]
+    fn thumbnail_manifest_lookup_rejects_digest_matching_non_jpeg() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let jpeg = b"digest-matching bytes that are not a JPEG";
+        let manifest = thumbnail_test_manifest(&fingerprint, jpeg);
+        let jpeg_filename = thumbnail_jpeg_filename(&fingerprint, &manifest.jpeg_digest).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
+
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(temp.path().join(jpeg_filename), jpeg).unwrap();
+
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
     }
 
     #[test]
     fn thumbnail_publication_makes_jpeg_available_before_manifest() {
         let temp = tempfile::tempdir().unwrap();
         let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
         let fingerprint = thumbnail_test_fingerprint(&key);
-        let manifest_path = thumbnail_manifest_path(temp.path(), &key).unwrap();
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
         let jpeg_path = temp
             .path()
-            .join(thumbnail_jpeg_filename(&fingerprint).unwrap());
-        let key_for_recheck = key.clone();
+            .join(thumbnail_jpeg_filename(&fingerprint, &thumbnail_jpeg_digest(&jpeg)).unwrap());
+        let identity_for_recheck = identity.clone();
 
-        let hit = publish_thumbnail_cache_with_recheck(
-            temp.path(),
-            &fingerprint,
-            b"synthetic-jpeg",
-            || {
-                assert!(jpeg_path.is_file());
-                assert!(!manifest_path.exists());
-                let staged_manifest_count = fs::read_dir(temp.path())
-                    .unwrap()
-                    .filter_map(std::result::Result::ok)
-                    .map(|entry| entry.path())
-                    .filter(|path| path != &jpeg_path && path != &manifest_path)
-                    .count();
-                assert_eq!(staged_manifest_count, 1);
-                assert!(lookup_thumbnail_manifest(temp.path(), &key_for_recheck).is_none());
-                Some(key_for_recheck.clone())
-            },
-        )
+        let hit = publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, &jpeg, || {
+            assert!(jpeg_path.is_file());
+            assert!(!manifest_path.exists());
+            let staged_manifest_count = fs::read_dir(temp.path())
+                .unwrap()
+                .filter_map(std::result::Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path != &jpeg_path && path != &manifest_path)
+                .count();
+            assert_eq!(staged_manifest_count, 1);
+            assert!(lookup_thumbnail_manifest(temp.path(), &identity_for_recheck).is_none());
+            Some(identity_for_recheck.clone())
+        })
         .unwrap();
 
         assert_eq!(hit.jpeg_path, jpeg_path);
         assert_eq!(hit.manifest_path, Some(manifest_path));
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_some());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_some());
     }
 
     #[test]
-    fn thumbnail_publication_replaces_existing_jpeg_bytes() {
+    fn thumbnail_force_publication_uses_content_derived_paths() {
         let temp = tempfile::tempdir().unwrap();
         let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
         let fingerprint = thumbnail_test_fingerprint(&key);
+        let first = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let forced = thumbnail_test_jpeg([0.7, 0.4, 0.2]);
+        let mut hits = Vec::new();
 
-        for bytes in [b"first-render".as_slice(), b"forced-render".as_slice()] {
-            let key_for_recheck = key.clone();
-            publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, bytes, move || {
-                Some(key_for_recheck)
-            })
-            .unwrap();
+        for bytes in [&first, &forced] {
+            let identity_for_recheck = identity.clone();
+            hits.push(
+                publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, bytes, move || {
+                    Some(identity_for_recheck)
+                })
+                .unwrap(),
+            );
         }
 
-        let hit = lookup_thumbnail_manifest(temp.path(), &key).unwrap();
-        assert_eq!(fs::read(hit.jpeg_path).unwrap(), b"forced-render");
+        assert_ne!(hits[0].jpeg_path, hits[1].jpeg_path);
+        assert_eq!(fs::read(&hits[0].jpeg_path).unwrap(), first);
+        assert_eq!(fs::read(&hits[1].jpeg_path).unwrap(), forced);
+        assert_eq!(
+            lookup_thumbnail_manifest(temp.path(), &identity),
+            Some(hits[1].clone())
+        );
+    }
+
+    #[test]
+    fn thumbnail_failed_force_publication_preserves_live_artifact() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let first_jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let rejected_jpeg = thumbnail_test_jpeg([0.7, 0.4, 0.2]);
+        let identity_for_initial_recheck = identity.clone();
+        let live_hit = publish_thumbnail_cache_with_recheck(
+            temp.path(),
+            &fingerprint,
+            &first_jpeg,
+            move || Some(identity_for_initial_recheck),
+        )
+        .unwrap();
+        let manifest_path = live_hit.manifest_path.clone().unwrap();
+        let manifest_before = fs::read(&manifest_path).unwrap();
+        let jpeg_before = fs::read(&live_hit.jpeg_path).unwrap();
+
+        let rejected =
+            publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, &rejected_jpeg, || {
+                None
+            });
+
+        assert!(rejected.is_err());
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read(&live_hit.jpeg_path).unwrap(), jpeg_before);
+        assert_eq!(
+            lookup_thumbnail_manifest(temp.path(), &identity),
+            Some(live_hit)
+        );
+    }
+
+    #[test]
+    fn thumbnail_lookup_rejects_same_length_content_corruption() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let identity_for_recheck = identity.clone();
+        let hit =
+            publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, &jpeg, move || {
+                Some(identity_for_recheck)
+            })
+            .unwrap();
+        let mut corrupted = fs::read(&hit.jpeg_path).unwrap();
+        let middle = corrupted.len() / 2;
+        corrupted[middle] ^= 0x01;
+        fs::write(&hit.jpeg_path, &corrupted).unwrap();
+
+        assert_eq!(corrupted.len(), jpeg.len());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
+    }
+
+    #[test]
+    fn thumbnail_cache_regenerates_corrupt_content_addressed_jpeg() {
+        let temp = tempfile::tempdir().unwrap();
+        let key = thumbnail_test_key("/photos/image.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let identity_for_initial_recheck = identity.clone();
+        let initial_hit =
+            publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, &jpeg, move || {
+                Some(identity_for_initial_recheck)
+            })
+            .unwrap();
+        let mut corrupted = jpeg.clone();
+        let middle = corrupted.len() / 2;
+        corrupted[middle] ^= 0x01;
+        fs::write(&initial_hit.jpeg_path, corrupted).unwrap();
+
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
+
+        let identity_for_recheck = identity.clone();
+        let regenerated = resolve_thumbnail_cache_with(
+            temp.path(),
+            &identity,
+            false,
+            || Ok((fingerprint, jpeg.clone())),
+            move || Some(identity_for_recheck),
+        )
+        .unwrap();
+
+        assert_eq!(regenerated.jpeg_path, initial_hit.jpeg_path);
+        assert_eq!(fs::read(&regenerated.jpeg_path).unwrap(), jpeg);
+        assert_eq!(
+            lookup_thumbnail_manifest(temp.path(), &identity),
+            Some(regenerated)
+        );
+    }
+
+    #[test]
+    fn thumbnail_manifest_omits_large_adjustment_payload_but_key_digest_tracks_it() {
+        let marker = format!(
+            "large-ai-patch-marker-start{}large-ai-patch-marker-end",
+            "x".repeat(2 * 1_024 * 1_024)
+        );
+        let mut key = thumbnail_test_key("/photos/image.RAF");
+        key.persisted_adjustments = json!({
+            "aiPatches": [{ "maskDataBase64": marker }],
+        });
+        let key_digest = thumbnail_manifest_key_hash(&key).unwrap();
+        let mut changed_key = key.clone();
+        changed_key.persisted_adjustments["aiPatches"][0]["maskDataBase64"] =
+            json!(format!("{}-changed", marker));
+        assert_ne!(
+            thumbnail_manifest_key_hash(&changed_key).unwrap(),
+            key_digest
+        );
+        let fingerprint = thumbnail_render_fingerprint(
+            &thumbnail_test_identity(&key),
+            &key.persisted_adjustments,
+            ImageSourceKind::DevelopedRaw,
+            key.render_profile.dispatch,
+            ThumbnailLutOutcome::NotRequested,
+        )
+        .unwrap();
+        let manifest = thumbnail_test_manifest(&fingerprint, &thumbnail_test_jpeg([0.1, 0.2, 0.3]));
+
+        let serialized = serde_json::to_string(&manifest).unwrap();
+
+        assert_eq!(serialized.matches(&marker).count(), 0);
+        assert!(serialized.len() < 4 * 1_024);
+    }
+
+    #[test]
+    fn thumbnail_manifest_key_changes_when_lut_bytes_change_at_same_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let lut_path = temp.path().join("mutable.cube");
+        let adjustments = json!({
+            "lutPath": lut_path,
+            "sectionVisibility": { "effects": true },
+        });
+        fs::write(&lut_path, thumbnail_test_cube(1.0)).unwrap();
+        let first_request = resolve_thumbnail_lut_request(&adjustments);
+        let first = thumbnail_manifest_key(
+            "/photos/image.RAF",
+            ThumbnailSourceTimestamp {
+                seconds: 1_721_000_000,
+                nanoseconds: 123_456_789,
+            },
+            &adjustments,
+            &thumbnail_test_defaults(),
+            &thumbnail_test_profile(),
+            &first_request,
+        );
+        fs::write(&lut_path, thumbnail_test_cube(0.5)).unwrap();
+        let second_request = resolve_thumbnail_lut_request(&adjustments);
+        let second = thumbnail_manifest_key(
+            "/photos/image.RAF",
+            first.source_modified,
+            &adjustments,
+            &thumbnail_test_defaults(),
+            &thumbnail_test_profile(),
+            &second_request,
+        );
+
+        assert_ne!(
+            thumbnail_manifest_key_hash(&first).unwrap(),
+            thumbnail_manifest_key_hash(&second).unwrap()
+        );
+    }
+
+    #[test]
+    fn thumbnail_missing_or_malformed_lut_is_immediate_but_not_reusable() {
+        let temp = tempfile::tempdir().unwrap();
+        let malformed = temp.path().join("malformed.cube");
+        fs::write(&malformed, "not a LUT").unwrap();
+        let missing = temp.path().join("missing.cube");
+
+        for lut_path in [missing, malformed] {
+            let adjustments = json!({
+                "lutPath": lut_path,
+                "sectionVisibility": { "effects": true },
+            });
+            let mut key = thumbnail_test_key(lut_path.to_str().unwrap());
+            key.persisted_adjustments = adjustments;
+            key.render_profile.dispatch = ThumbnailRenderPath::ObjectGpu;
+            key.lut_request = resolve_thumbnail_lut_request(&key.persisted_adjustments);
+            let identity = thumbnail_test_identity(&key);
+            let fingerprint = thumbnail_test_fingerprint(&key);
+            let generation_count = Arc::new(AtomicUsize::new(0));
+
+            for expected_count in 1..=2 {
+                let fingerprint_for_generate = fingerprint.clone();
+                let identity_for_recheck = identity.clone();
+                let generation_count_for_call = Arc::clone(&generation_count);
+                let hit = resolve_thumbnail_cache_with(
+                    temp.path(),
+                    &identity,
+                    false,
+                    move || {
+                        generation_count_for_call.fetch_add(1, Ordering::SeqCst);
+                        Ok((
+                            fingerprint_for_generate,
+                            thumbnail_test_jpeg([0.2, 0.3, 0.4]),
+                        ))
+                    },
+                    move || Some(identity_for_recheck),
+                )
+                .unwrap();
+
+                assert_eq!(hit.manifest_path, None);
+                assert_eq!(generation_count.load(Ordering::SeqCst), expected_count);
+            }
+        }
+    }
+
+    #[test]
+    fn thumbnail_publication_rejects_lut_change_during_sidecar_recheck() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("lut-recheck.RAF");
+        let lut_path = temp.path().join("mutable.cube");
+        fs::write(&source, b"source").unwrap();
+        fs::write(&lut_path, thumbnail_test_cube(1.0)).unwrap();
+        let adjustments = json!({
+            "lutPath": lut_path,
+            "sectionVisibility": { "effects": true },
+        });
+        let defaults = thumbnail_test_defaults();
+        let profile = thumbnail_test_profile();
+        let lut_request = resolve_thumbnail_lut_request(&adjustments);
+        let key = thumbnail_manifest_key(
+            source.to_str().unwrap(),
+            thumbnail_source_timestamp(&source).unwrap(),
+            &adjustments,
+            &defaults,
+            &profile,
+            &lut_request,
+        );
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let adjustments_for_recheck = adjustments.clone();
+
+        let result = publish_thumbnail_cache_with_recheck(
+            temp.path(),
+            &fingerprint,
+            &thumbnail_test_jpeg([0.1, 0.2, 0.3]),
+            || {
+                thumbnail_identity_recheck_with(
+                    source.to_str().unwrap(),
+                    &defaults,
+                    &profile,
+                    |_| {
+                        fs::write(&lut_path, thumbnail_test_cube(0.5)).unwrap();
+                        adjustments_for_recheck
+                    },
+                )
+            },
+        );
+
+        assert!(result.is_err());
+        assert!(lookup_thumbnail_manifest(temp.path(), &thumbnail_test_identity(&key)).is_none());
+    }
+
+    #[test]
+    fn thumbnail_cleanup_retains_newest_eight_versions_per_virtual_path() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let old_base = filetime::FileTime::from_unix_time(100_000, 0);
+        let mut hits = Vec::new();
+
+        for version in 0..10 {
+            let mut key = thumbnail_test_key("/photos/autosaved.RAF");
+            key.source_modified.seconds += version;
+            let identity = thumbnail_test_identity(&key);
+            let fingerprint = thumbnail_test_fingerprint(&key);
+            let identity_for_recheck = identity.clone();
+            let hit = publish_thumbnail_cache_with_recheck(
+                temp.path(),
+                &fingerprint,
+                &thumbnail_test_jpeg([version as f32 / 20.0, 0.2, 0.3]),
+                move || Some(identity_for_recheck),
+            )
+            .unwrap();
+            let mtime =
+                filetime::FileTime::from_unix_time(old_base.unix_seconds() + version as i64, 0);
+            filetime::set_file_mtime(hit.manifest_path.as_ref().unwrap(), mtime).unwrap();
+            filetime::set_file_mtime(&hit.jpeg_path, mtime).unwrap();
+            hits.push(hit);
+        }
+
+        let removed = cleanup_stale_thumbnail_artifacts_with(
+            temp.path(),
+            now,
+            Duration::from_secs(24 * 60 * 60),
+            256,
+            8,
+        )
+        .unwrap();
+
+        assert_eq!(removed.len(), 4);
+        for hit in &hits[..2] {
+            assert!(!hit.manifest_path.as_ref().unwrap().exists());
+            assert!(!hit.jpeg_path.exists());
+        }
+        for hit in &hits[2..] {
+            assert!(hit.manifest_path.as_ref().unwrap().exists());
+            assert!(hit.jpeg_path.exists());
+        }
+    }
+
+    #[test]
+    fn thumbnail_cleanup_production_entry_cap_is_256() {
+        assert_eq!(THUMBNAIL_CACHE_CLEANUP_MAX_ENTRIES, 256);
+    }
+
+    #[test]
+    fn thumbnail_cleanup_keeps_pair_when_jpeg_is_within_grace_period() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let grace = Duration::from_secs(24 * 60 * 60);
+        let key = thumbnail_test_key("/photos/in-flight.RAF");
+        let identity = thumbnail_test_identity(&key);
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let identity_for_recheck = identity.clone();
+        let hit = publish_thumbnail_cache_with_recheck(
+            temp.path(),
+            &fingerprint,
+            &thumbnail_test_jpeg([0.2, 0.3, 0.4]),
+            move || Some(identity_for_recheck),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            hit.manifest_path.as_ref().unwrap(),
+            filetime::FileTime::from_unix_time(50_000, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &hit.jpeg_path,
+            filetime::FileTime::from_unix_time(1_999_999, 0),
+        )
+        .unwrap();
+
+        let removed =
+            cleanup_stale_thumbnail_artifacts_with(temp.path(), now, grace, 256, 0).unwrap();
+
+        assert!(removed.is_empty());
+        assert!(hit.manifest_path.unwrap().exists());
+        assert!(hit.jpeg_path.exists());
+    }
+
+    #[test]
+    fn thumbnail_cleanup_removes_only_aged_legacy_v1_jpegs() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let grace = Duration::from_secs(24 * 60 * 60);
+        let legacy_jpeg = temp.path().join(format!("{}.jpg", "a".repeat(64)));
+        let legacy_transient = temp
+            .path()
+            .join(format!("{}.transient.jpg", "b".repeat(64)));
+        let fresh_legacy = temp.path().join(format!("{}.jpg", "c".repeat(64)));
+        let unrelated = temp.path().join("not-owned.jpg");
+        for path in [&legacy_jpeg, &legacy_transient, &fresh_legacy, &unrelated] {
+            fs::write(path, b"legacy").unwrap();
+        }
+        filetime::set_file_mtime(&legacy_jpeg, filetime::FileTime::from_unix_time(50_000, 0))
+            .unwrap();
+        filetime::set_file_mtime(
+            &legacy_transient,
+            filetime::FileTime::from_unix_time(60_000, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(
+            &fresh_legacy,
+            filetime::FileTime::from_unix_time(1_999_999, 0),
+        )
+        .unwrap();
+        filetime::set_file_mtime(&unrelated, filetime::FileTime::from_unix_time(40_000, 0))
+            .unwrap();
+
+        let removed =
+            cleanup_stale_thumbnail_artifacts_with(temp.path(), now, grace, 256, 8).unwrap();
+
+        assert_eq!(removed, vec![legacy_jpeg.clone(), legacy_transient.clone()]);
+        assert!(!legacy_jpeg.exists());
+        assert!(!legacy_transient.exists());
+        assert!(fresh_legacy.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn thumbnail_cleanup_honors_age_order_and_entry_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let grace = Duration::from_secs(24 * 60 * 60);
+        let digest = "a".repeat(64);
+        let oldest = temp
+            .path()
+            .join(format!("{}.{}.transient.jpg", digest, "1".repeat(64)));
+        let same_time_first =
+            temp.path()
+                .join(format!("{}.{}.transient.jpg", digest, "2".repeat(64)));
+        let same_time_second =
+            temp.path()
+                .join(format!("{}.{}.transient.jpg", digest, "3".repeat(64)));
+        let fresh = temp
+            .path()
+            .join(format!("{}.{}.transient.jpg", digest, "4".repeat(64)));
+        let unrelated = temp.path().join("do-not-delete.txt");
+        for path in [
+            &oldest,
+            &same_time_first,
+            &same_time_second,
+            &fresh,
+            &unrelated,
+        ] {
+            fs::write(path, b"orphan").unwrap();
+        }
+        filetime::set_file_mtime(&oldest, filetime::FileTime::from_unix_time(50_000, 0)).unwrap();
+        for path in [&same_time_first, &same_time_second, &unrelated] {
+            filetime::set_file_mtime(path, filetime::FileTime::from_unix_time(60_000, 0)).unwrap();
+        }
+        filetime::set_file_mtime(&fresh, filetime::FileTime::from_unix_time(1_999_999, 0)).unwrap();
+
+        let removed =
+            cleanup_stale_thumbnail_artifacts_with(temp.path(), now, grace, 2, 8).unwrap();
+
+        assert_eq!(removed, vec![oldest.clone(), same_time_first.clone()]);
+        assert!(!oldest.exists());
+        assert!(!same_time_first.exists());
+        assert!(same_time_second.exists());
+        assert!(fresh.exists());
+        assert!(unrelated.exists());
+    }
+
+    #[test]
+    fn thumbnail_cleanup_does_not_split_pair_at_entry_cap() {
+        let temp = tempfile::tempdir().unwrap();
+        let now = UNIX_EPOCH + Duration::from_secs(2_000_000);
+        let mut hits = Vec::new();
+        for version in 0..9 {
+            let mut key = thumbnail_test_key("/photos/capped-autosave.RAF");
+            key.source_modified.seconds += version;
+            let identity = thumbnail_test_identity(&key);
+            let fingerprint = thumbnail_test_fingerprint(&key);
+            let identity_for_recheck = identity.clone();
+            let hit = publish_thumbnail_cache_with_recheck(
+                temp.path(),
+                &fingerprint,
+                &thumbnail_test_jpeg([version as f32 / 20.0, 0.3, 0.2]),
+                move || Some(identity_for_recheck),
+            )
+            .unwrap();
+            let mtime = filetime::FileTime::from_unix_time(50_000 + version as i64, 0);
+            filetime::set_file_mtime(hit.manifest_path.as_ref().unwrap(), mtime).unwrap();
+            filetime::set_file_mtime(&hit.jpeg_path, mtime).unwrap();
+            hits.push(hit);
+        }
+
+        let removed = cleanup_stale_thumbnail_artifacts_with(
+            temp.path(),
+            now,
+            Duration::from_secs(24 * 60 * 60),
+            1,
+            8,
+        )
+        .unwrap();
+
+        assert!(removed.is_empty());
+        assert!(hits[0].manifest_path.as_ref().unwrap().exists());
+        assert!(hits[0].jpeg_path.exists());
+
+        let removed = cleanup_stale_thumbnail_artifacts_with(
+            temp.path(),
+            now,
+            Duration::from_secs(24 * 60 * 60),
+            2,
+            8,
+        )
+        .unwrap();
+        assert_eq!(removed.len(), 2);
+        assert!(!hits[0].manifest_path.as_ref().unwrap().exists());
+        assert!(!hits[0].jpeg_path.exists());
+    }
+
+    #[test]
+    fn thumbnail_cleanup_stops_pair_after_manifest_removal_failure() {
+        let manifest_path = PathBuf::from("manifest.thumbnail-manifest.json");
+        let jpeg_path = PathBuf::from("content.jpg");
+        let unit = ThumbnailCleanupUnit {
+            modified: UNIX_EPOCH,
+            sort_name: "manifest.thumbnail-manifest.json".to_string(),
+            paths: vec![manifest_path.clone(), jpeg_path.clone()],
+        };
+        let mut attempted = Vec::new();
+
+        let removed = remove_thumbnail_cleanup_units_with(vec![unit], 2, |path| {
+            attempted.push(path.to_path_buf());
+            if path == manifest_path {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "injected manifest removal failure",
+                ))
+            } else {
+                Ok(())
+            }
+        });
+
+        assert!(removed.is_empty());
+        assert_eq!(attempted, vec![manifest_path]);
     }
 
     #[test]
@@ -4947,24 +6092,30 @@ mod tests {
             &adjustments,
             &defaults,
             &profile,
+            &ThumbnailLutRequest::NotRequested,
         );
+        let identity = thumbnail_test_identity(&key);
         let fingerprint = thumbnail_test_fingerprint(&key);
         let changed_time = filetime::FileTime::from_unix_time(2_000_000_001, 987_654_321);
         let source_for_recheck = source.clone();
         let adjustments_for_recheck = adjustments.clone();
         let path_str = source.to_str().unwrap();
 
-        let result =
-            publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, b"stale-jpeg", || {
-                thumbnail_key_recheck_with(path_str, &defaults, &profile, |_| {
+        let result = publish_thumbnail_cache_with_recheck(
+            temp.path(),
+            &fingerprint,
+            &thumbnail_test_jpeg([0.1, 0.2, 0.3]),
+            || {
+                thumbnail_identity_recheck_with(path_str, &defaults, &profile, |_| {
                     fs::write(&source_for_recheck, b"after").unwrap();
                     filetime::set_file_mtime(&source_for_recheck, changed_time).unwrap();
                     adjustments_for_recheck
                 })
-            });
+            },
+        );
 
         assert!(result.is_err());
-        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+        assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
     }
 
     #[test]
@@ -4972,38 +6123,42 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut key = thumbnail_test_key("/photos/image.RAF");
         key.render_profile.dispatch = ThumbnailRenderPath::ObjectGpu;
+        let identity = thumbnail_test_identity(&key);
         let mut fallback_fingerprint = thumbnail_test_fingerprint(&key);
         fallback_fingerprint.actual_render_path = ThumbnailRenderPath::ObjectFallback;
         let mut gpu_fingerprint = fallback_fingerprint.clone();
         gpu_fingerprint.actual_render_path = ThumbnailRenderPath::ObjectGpu;
-        let gpu_jpeg_path = temp
-            .path()
-            .join(thumbnail_jpeg_filename(&gpu_fingerprint).unwrap());
-        let manifest_path = thumbnail_manifest_path(temp.path(), &key).unwrap();
+        let fallback_jpeg = thumbnail_test_jpeg([0.2, 0.3, 0.4]);
+        let gpu_jpeg_path = temp.path().join(
+            thumbnail_jpeg_filename(&gpu_fingerprint, &thumbnail_jpeg_digest(&fallback_jpeg))
+                .unwrap(),
+        );
+        let manifest_path = thumbnail_manifest_path(temp.path(), &identity).unwrap();
         let generation_count = Arc::new(AtomicUsize::new(0));
 
         for expected_generation_count in 1..=2 {
             let fingerprint_for_generate = fallback_fingerprint.clone();
-            let key_for_recheck = key.clone();
+            let identity_for_recheck = identity.clone();
             let generation_count_for_call = Arc::clone(&generation_count);
+            let jpeg_for_generate = fallback_jpeg.clone();
             let resolution = resolve_thumbnail_cache_with(
                 temp.path(),
-                &key,
+                &identity,
                 false,
                 move || {
                     generation_count_for_call.fetch_add(1, Ordering::SeqCst);
-                    Ok((fingerprint_for_generate, b"fallback-jpeg".to_vec()))
+                    Ok((fingerprint_for_generate, jpeg_for_generate))
                 },
-                move || Some(key_for_recheck),
+                move || Some(identity_for_recheck),
             )
             .unwrap();
 
             assert_eq!(resolution.manifest_path, None);
-            assert_eq!(fs::read(&resolution.jpeg_path).unwrap(), b"fallback-jpeg");
+            assert_eq!(fs::read(&resolution.jpeg_path).unwrap(), fallback_jpeg);
             assert_ne!(resolution.jpeg_path, gpu_jpeg_path);
             assert!(!manifest_path.exists());
             assert!(!gpu_jpeg_path.exists());
-            assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+            assert!(lookup_thumbnail_manifest(temp.path(), &identity).is_none());
             assert_eq!(
                 generation_count.load(Ordering::SeqCst),
                 expected_generation_count
@@ -5016,13 +6171,15 @@ mod tests {
         let temp = tempfile::tempdir().unwrap();
         let mut key = thumbnail_test_key("/photos/image.RAF");
         key.render_profile.dispatch = ThumbnailRenderPath::ObjectGpu;
+        let identity = thumbnail_test_identity(&key);
         let gpu_fingerprint = thumbnail_test_fingerprint(&key);
-        let key_for_initial_recheck = key.clone();
+        let gpu_jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
+        let identity_for_initial_recheck = identity.clone();
         let existing_hit = publish_thumbnail_cache_with_recheck(
             temp.path(),
             &gpu_fingerprint,
-            b"valid-gpu-jpeg",
-            move || Some(key_for_initial_recheck),
+            &gpu_jpeg,
+            move || Some(identity_for_initial_recheck),
         )
         .unwrap();
         let manifest_path = existing_hit.manifest_path.clone().unwrap();
@@ -5030,99 +6187,102 @@ mod tests {
 
         let mut fallback_fingerprint = gpu_fingerprint;
         fallback_fingerprint.actual_render_path = ThumbnailRenderPath::ObjectFallback;
-        let key_for_fallback_recheck = key.clone();
+        let fallback_jpeg = thumbnail_test_jpeg([0.7, 0.4, 0.2]);
+        let identity_for_fallback_recheck = identity.clone();
         let fallback = resolve_thumbnail_cache_with(
             temp.path(),
-            &key,
+            &identity,
             true,
-            move || Ok((fallback_fingerprint, b"transient-fallback-jpeg".to_vec())),
-            move || Some(key_for_fallback_recheck),
+            move || Ok((fallback_fingerprint, fallback_jpeg.clone())),
+            move || Some(identity_for_fallback_recheck),
         )
         .unwrap();
 
         assert_eq!(fallback.manifest_path, None);
         assert_eq!(
             fs::read(fallback.jpeg_path).unwrap(),
-            b"transient-fallback-jpeg"
+            thumbnail_test_jpeg([0.7, 0.4, 0.2])
         );
-        assert_eq!(
-            fs::read(&existing_hit.jpeg_path).unwrap(),
-            b"valid-gpu-jpeg"
-        );
+        assert_eq!(fs::read(&existing_hit.jpeg_path).unwrap(), gpu_jpeg);
         assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
         assert_eq!(
-            lookup_thumbnail_manifest(temp.path(), &key),
+            lookup_thumbnail_manifest(temp.path(), &identity),
             Some(existing_hit)
         );
     }
 
     #[test]
     fn thumbnail_tagging_and_library_share_manifest() {
-        let _production_library_boundary = generate_single_thumbnail_and_cache;
-        let _production_tagging_boundary = get_cached_or_generate_thumbnail_image;
         let temp = tempfile::tempdir().unwrap();
         let key = thumbnail_test_key("/photos/image.RAF?vc=shared");
+        let identity = thumbnail_test_identity(&key);
         let fingerprint = thumbnail_test_fingerprint(&key);
-        let jpeg = encode_thumbnail(&thumbnail_test_image(), 8).unwrap();
+        let jpeg = thumbnail_test_jpeg([0.1, 0.2, 0.3]);
         let generation_count = Arc::new(AtomicUsize::new(0));
         let generation_count_for_library = Arc::clone(&generation_count);
         let fingerprint_for_library = fingerprint.clone();
-        let key_for_library_recheck = key.clone();
-
-        let library = generate_single_thumbnail_and_cache_with(&key.virtual_path, || {
-            let hit = resolve_thumbnail_cache_with(
-                temp.path(),
-                &key,
-                false,
-                move || {
-                    generation_count_for_library.fetch_add(1, Ordering::SeqCst);
-                    Ok((fingerprint_for_library, jpeg))
-                },
-                move || Some(key_for_library_recheck),
-            )?;
-            Ok(CachedThumbnailResolution {
-                hit,
+        let identity_for_recheck = identity.clone();
+        let library_hit = resolve_thumbnail_cache_with(
+            temp.path(),
+            &identity,
+            false,
+            move || {
+                generation_count_for_library.fetch_add(1, Ordering::SeqCst);
+                Ok((fingerprint_for_library, jpeg))
+            },
+            move || Some(identity_for_recheck),
+        )
+        .unwrap();
+        let manifest_path = library_hit.manifest_path.clone().unwrap();
+        let jpeg_before = fs::read(&library_hit.jpeg_path).unwrap();
+        let manifest_before = fs::read(&manifest_path).unwrap();
+        let artifact_count = fs::read_dir(temp.path()).unwrap().count();
+        let library = adapt_cached_thumbnail_resolution(
+            CachedThumbnailResolution {
+                hit: library_hit.clone(),
                 rating: 4,
                 is_edited: true,
-            })
-        })
+            },
+            CachedThumbnailAdapterMode::Library,
+        )
         .unwrap();
-        let library_hit = lookup_thumbnail_manifest(temp.path(), &key).unwrap();
-        let artifact_count_after_library = fs::read_dir(temp.path()).unwrap().count();
 
-        let tagging = get_cached_or_generate_thumbnail_image_with(|| {
-            let hit = resolve_thumbnail_cache_with(
-                temp.path(),
-                &key,
-                false,
-                || panic!("tagging must consume the library manifest hit"),
-                || panic!("a manifest hit must not publish"),
-            )?;
-            Ok(CachedThumbnailResolution {
-                hit,
+        let tagging_hit = resolve_thumbnail_cache_with(
+            temp.path(),
+            &identity,
+            false,
+            || panic!("tagging must consume the library manifest hit"),
+            || panic!("a manifest hit must not publish"),
+        )
+        .unwrap();
+        let tagging = adapt_cached_thumbnail_resolution(
+            CachedThumbnailResolution {
+                hit: tagging_hit.clone(),
                 rating: 4,
                 is_edited: true,
-            })
-        })
+            },
+            CachedThumbnailAdapterMode::DecodedImage,
+        )
         .unwrap();
-        let tagging_hit = lookup_thumbnail_manifest(temp.path(), &key).unwrap();
 
         assert_eq!(generation_count.load(Ordering::SeqCst), 1);
-        assert_eq!(library.0, library_hit.jpeg_path.to_string_lossy());
-        assert_eq!((library.1, library.2), (4, true));
+        match library {
+            CachedThumbnailAdapterOutput::Library(path, rating, is_edited) => {
+                assert_eq!(path, library_hit.jpeg_path.to_string_lossy());
+                assert_eq!((rating, is_edited), (4, true));
+            }
+            CachedThumbnailAdapterOutput::DecodedImage(_) => panic!("expected library output"),
+        }
+        match tagging {
+            CachedThumbnailAdapterOutput::DecodedImage(image) => {
+                assert_eq!(image.dimensions(), (8, 6));
+            }
+            CachedThumbnailAdapterOutput::Library(_, _, _) => panic!("expected decoded image"),
+        }
         assert_eq!(library_hit, tagging_hit);
-        assert_eq!(tagging.dimensions(), (8, 6));
-        assert_eq!(
-            fs::read_dir(temp.path()).unwrap().count(),
-            artifact_count_after_library
-        );
-
-        let legacy_path = temp.path().join(format!(
-            "{}.jpg",
-            thumbnail_manifest_key_hash(&key).unwrap()
-        ));
-        assert_ne!(legacy_path, library_hit.jpeg_path);
-        assert!(!legacy_path.exists());
+        assert_eq!(fs::read(&library_hit.jpeg_path).unwrap(), jpeg_before);
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_before);
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), artifact_count);
     }
 
     #[tokio::test]

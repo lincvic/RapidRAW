@@ -99,6 +99,7 @@ struct ThumbnailRenderFingerprint {
     key: ThumbnailManifestKey,
     effective_adjustments: Value,
     source_kind: ImageSourceKind,
+    actual_render_path: ThumbnailRenderPath,
 }
 
 #[derive(Clone, Debug, PartialEq, Serialize, Deserialize)]
@@ -111,7 +112,7 @@ struct ThumbnailManifest {
 
 #[derive(Clone, Debug, PartialEq, Eq)]
 struct ThumbnailCacheHit {
-    manifest_path: PathBuf,
+    manifest_path: Option<PathBuf>,
     jpeg_path: PathBuf,
 }
 
@@ -277,6 +278,16 @@ fn thumbnail_jpeg_filename(fingerprint: &ThumbnailRenderFingerprint) -> Result<S
     ))
 }
 
+fn thumbnail_transient_jpeg_path(
+    cache_dir: &Path,
+    fingerprint: &ThumbnailRenderFingerprint,
+) -> Result<PathBuf> {
+    Ok(cache_dir.join(format!(
+        "{}.transient.jpg",
+        thumbnail_render_fingerprint_hash(fingerprint)?
+    )))
+}
+
 fn lookup_thumbnail_manifest(
     cache_dir: &Path,
     expected_key: &ThumbnailManifestKey,
@@ -286,6 +297,7 @@ fn lookup_thumbnail_manifest(
         serde_json::from_slice(&fs::read(&manifest_path).ok()?).ok()?;
     if manifest.key != *expected_key
         || manifest.fingerprint.key != manifest.key
+        || manifest.fingerprint.actual_render_path != expected_key.render_profile.dispatch
         || manifest.jpeg_filename != thumbnail_jpeg_filename(&manifest.fingerprint).ok()?
     {
         return None;
@@ -300,7 +312,7 @@ fn lookup_thumbnail_manifest(
 
     let jpeg_path = cache_dir.join(filename_path);
     jpeg_path.is_file().then_some(ThumbnailCacheHit {
-        manifest_path,
+        manifest_path: Some(manifest_path),
         jpeg_path,
     })
 }
@@ -351,6 +363,32 @@ where
         .context("Published thumbnail manifest did not validate")
 }
 
+fn publish_transient_thumbnail_with_recheck<F>(
+    cache_dir: &Path,
+    fingerprint: &ThumbnailRenderFingerprint,
+    jpeg_bytes: &[u8],
+    recheck_key: F,
+) -> Result<ThumbnailCacheHit>
+where
+    F: FnOnce() -> Option<ThumbnailManifestKey>,
+{
+    fs::create_dir_all(cache_dir)?;
+    let jpeg_path = thumbnail_transient_jpeg_path(cache_dir, fingerprint)?;
+    let jpeg_temp = flushed_tempfile(cache_dir, jpeg_bytes)?;
+    ensure!(
+        recheck_key().as_ref() == Some(&fingerprint.key),
+        "Thumbnail source changed during generation"
+    );
+    jpeg_temp
+        .persist(&jpeg_path)
+        .map_err(|error| error.error)?
+        .sync_all()?;
+    Ok(ThumbnailCacheHit {
+        manifest_path: None,
+        jpeg_path,
+    })
+}
+
 fn resolve_thumbnail_cache_with<F, R>(
     cache_dir: &Path,
     key: &ThumbnailManifestKey,
@@ -371,7 +409,11 @@ where
         fingerprint.key == *key,
         "Thumbnail fingerprint did not contain the requested manifest key"
     );
-    publish_thumbnail_cache_with_recheck(cache_dir, &fingerprint, &jpeg_bytes, recheck_key)
+    if fingerprint.actual_render_path != key.render_profile.dispatch {
+        publish_transient_thumbnail_with_recheck(cache_dir, &fingerprint, &jpeg_bytes, recheck_key)
+    } else {
+        publish_thumbnail_cache_with_recheck(cache_dir, &fingerprint, &jpeg_bytes, recheck_key)
+    }
 }
 
 fn resolve_image_metadata(
@@ -1568,6 +1610,31 @@ struct ThumbnailLoadedInput {
     raw_scale_factor: f32,
 }
 
+struct ThumbnailRenderedImage {
+    image: DynamicImage,
+    actual_render_path: ThumbnailRenderPath,
+}
+
+fn resolve_thumbnail_gpu_result<E>(
+    result: std::result::Result<DynamicImage, E>,
+    fallback: DynamicImage,
+) -> ThumbnailRenderedImage {
+    match result {
+        Ok(image) => ThumbnailRenderedImage {
+            image,
+            actual_render_path: ThumbnailRenderPath::ObjectGpu,
+        },
+        Err(_) => ThumbnailRenderedImage {
+            image: fallback,
+            actual_render_path: ThumbnailRenderPath::ObjectFallback,
+        },
+    }
+}
+
+fn thumbnail_gpu_input_exceeds_limit(width: u32, height: u32, max_dimension: u32) -> bool {
+    width > max_dimension || height > max_dimension
+}
+
 fn composite_preloaded_thumbnail_with<F>(
     preloaded: ThumbnailPreloadedImage,
     adjustments: &Value,
@@ -1662,7 +1729,7 @@ fn render_thumbnail_object_gpu(
     is_raw: bool,
     app_handle: &AppHandle,
     settings: &AppSettings,
-) -> Result<DynamicImage> {
+) -> Result<ThumbnailRenderedImage> {
     let state = app_handle.state::<AppState>();
     let target_res = settings.thumbnail_resolution.unwrap_or(720);
     let geometry_hash = calculate_geometry_hash(adjustments);
@@ -1763,6 +1830,22 @@ fn render_thumbnail_object_gpu(
 
     let cropped_preview = apply_crop(rotated_image, &scaled_crop_json);
     let (preview_w, preview_h) = cropped_preview.dimensions();
+    if thumbnail_gpu_input_exceeds_limit(
+        preview_w,
+        preview_h,
+        context.limits.max_texture_dimension_2d,
+    ) {
+        log::warn!(
+            "Thumbnail dimensions ({}x{}) exceed GPU limits ({}); using a transient fallback",
+            preview_w,
+            preview_h,
+            context.limits.max_texture_dimension_2d
+        );
+        return Ok(ThumbnailRenderedImage {
+            image: cropped_preview.into_owned(),
+            actual_render_path: ThumbnailRenderPath::ObjectFallback,
+        });
+    }
     let unscaled_crop_offset = crop_data.map_or((0.0, 0.0), |crop| (crop.x as f32, crop.y as f32));
     let mask_definitions: Vec<MaskDefinition> = adjustments
         .get("masks")
@@ -1806,22 +1889,22 @@ fn render_thumbnail_object_gpu(
     adjustments.to_string().hash(&mut hasher);
     let unique_hash = hasher.finish();
 
-    match gpu_processing::process_and_get_dynamic_image(
-        context,
-        &state,
-        cropped_preview.as_ref(),
-        unique_hash,
-        gpu_processing::RenderRequest {
-            adjustments: gpu_adjustments,
-            mask_bitmaps: &mask_bitmaps,
-            lut,
-            roi: None,
-        },
-        "generate_thumbnail_data",
-    ) {
-        Ok(processed_image) => Ok(processed_image),
-        Err(_) => Ok(cropped_preview.into_owned()),
-    }
+    Ok(resolve_thumbnail_gpu_result(
+        gpu_processing::process_and_get_dynamic_image(
+            context,
+            &state,
+            cropped_preview.as_ref(),
+            unique_hash,
+            gpu_processing::RenderRequest {
+                adjustments: gpu_adjustments,
+                mask_bitmaps: &mask_bitmaps,
+                lut,
+                roi: None,
+            },
+            "generate_thumbnail_data",
+        ),
+        cropped_preview.into_owned(),
+    ))
 }
 
 fn generate_thumbnail_data(
@@ -1832,7 +1915,7 @@ fn generate_thumbnail_data(
     settings: &AppSettings,
     persisted_adjustments: &Value,
     defaults: &CameraDefaults,
-) -> Result<(DynamicImage, ResolvedRenderInput)> {
+) -> Result<(DynamicImage, ResolvedRenderInput, ThumbnailRenderPath)> {
     let (source_path, _) = parse_virtual_path(path_str);
     let source_path_str = source_path.to_string_lossy().to_string();
     let is_raw = is_raw_file(&source_path);
@@ -1846,10 +1929,11 @@ fn generate_thumbnail_data(
     )?;
     let render = prepare_thumbnail_render_input(persisted_adjustments, defaults, &loaded.loaded);
 
-    let image = match select_thumbnail_render_path(&render, gpu_context.is_some()) {
-        ThumbnailRenderPath::DefaultCpu => {
-            render_thumbnail_from_loaded(loaded.loaded, &render, is_raw, settings)?
-        }
+    let rendered = match select_thumbnail_render_path(&render, gpu_context.is_some()) {
+        ThumbnailRenderPath::DefaultCpu => ThumbnailRenderedImage {
+            image: render_thumbnail_from_loaded(loaded.loaded, &render, is_raw, settings)?,
+            actual_render_path: ThumbnailRenderPath::DefaultCpu,
+        },
         ThumbnailRenderPath::ObjectGpu => render_thumbnail_object_gpu(
             path_str,
             gpu_context.expect("GPU dispatch requires a context"),
@@ -1864,11 +1948,15 @@ fn generate_thumbnail_data(
             let orientation_steps = render.effective_adjustments["orientationSteps"]
                 .as_u64()
                 .unwrap_or(0) as u8;
-            apply_coarse_rotation(Cow::Owned(loaded.loaded.image), orientation_steps).into_owned()
+            ThumbnailRenderedImage {
+                image: apply_coarse_rotation(Cow::Owned(loaded.loaded.image), orientation_steps)
+                    .into_owned(),
+                actual_render_path: ThumbnailRenderPath::ObjectFallback,
+            }
         }
     };
 
-    Ok((image, render))
+    Ok((rendered.image, render, rendered.actual_render_path))
 }
 
 fn encode_thumbnail(image: &DynamicImage, target_width: u32) -> Result<Vec<u8>> {
@@ -1885,14 +1973,18 @@ struct CachedThumbnailResolution {
     is_edited: bool,
 }
 
-fn thumbnail_key_recheck(
+fn thumbnail_key_recheck_with<F>(
     path_str: &str,
     camera_defaults: &CameraDefaults,
     render_profile: &ThumbnailRenderProfile,
-) -> Option<ThumbnailManifestKey> {
+    load_adjustments: F,
+) -> Option<ThumbnailManifestKey>
+where
+    F: FnOnce(&Path) -> Value,
+{
     let (source_path, sidecar_path) = parse_virtual_path(path_str);
+    let persisted_adjustments = load_adjustments(&sidecar_path);
     let source_modified = thumbnail_source_timestamp(&source_path)?;
-    let persisted_adjustments = crate::exif_processing::load_sidecar(&sidecar_path).adjustments;
     Some(thumbnail_manifest_key(
         path_str,
         source_modified,
@@ -1900,6 +1992,16 @@ fn thumbnail_key_recheck(
         camera_defaults,
         render_profile,
     ))
+}
+
+fn thumbnail_key_recheck(
+    path_str: &str,
+    camera_defaults: &CameraDefaults,
+    render_profile: &ThumbnailRenderProfile,
+) -> Option<ThumbnailManifestKey> {
+    thumbnail_key_recheck_with(path_str, camera_defaults, render_profile, |sidecar_path| {
+        crate::exif_processing::load_sidecar(sidecar_path).adjustments
+    })
 }
 
 fn generate_cached_thumbnail(
@@ -1949,7 +2051,7 @@ fn generate_cached_thumbnail(
         &key,
         force_regenerate,
         || {
-            let (image, render) = generate_thumbnail_data(
+            let (image, render, actual_render_path) = generate_thumbnail_data(
                 path_str,
                 gpu_context,
                 preloaded_image,
@@ -1959,6 +2061,7 @@ fn generate_cached_thumbnail(
                 &key_for_generate.camera_defaults,
             )?;
             let fingerprint = ThumbnailRenderFingerprint {
+                actual_render_path,
                 key: key_for_generate,
                 effective_adjustments: render.effective_adjustments,
                 source_kind: render.source_kind,
@@ -4374,6 +4477,7 @@ mod tests {
                 "aspectRatio": 2.0,
             }),
             source_kind: ImageSourceKind::DevelopedRaw,
+            actual_render_path: key.render_profile.dispatch,
         }
     }
 
@@ -4447,6 +4551,41 @@ mod tests {
             select_thumbnail_render_path(&render, true),
             ThumbnailRenderPath::ObjectGpu
         );
+    }
+
+    #[test]
+    fn thumbnail_gpu_failure_reports_actual_fallback_path() {
+        let fallback = thumbnail_test_image();
+        let expected = fallback.to_rgb32f();
+
+        let rendered = resolve_thumbnail_gpu_result::<&str>(Err("runtime GPU failure"), fallback);
+
+        assert_eq!(
+            rendered.actual_render_path,
+            ThumbnailRenderPath::ObjectFallback
+        );
+        assert_eq!(rendered.image.to_rgb32f(), expected);
+    }
+
+    #[test]
+    fn thumbnail_gpu_limit_only_falls_back_above_max_dimension() {
+        let max_dimension = 4_096;
+
+        assert!(!thumbnail_gpu_input_exceeds_limit(
+            max_dimension,
+            max_dimension,
+            max_dimension
+        ));
+        assert!(thumbnail_gpu_input_exceeds_limit(
+            max_dimension + 1,
+            1,
+            max_dimension
+        ));
+        assert!(thumbnail_gpu_input_exceeds_limit(
+            1,
+            max_dimension + 1,
+            max_dimension
+        ));
     }
 
     #[test]
@@ -4691,6 +4830,28 @@ mod tests {
     }
 
     #[test]
+    fn thumbnail_manifest_lookup_rejects_actual_render_path_mismatch() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut key = thumbnail_test_key("/photos/image.RAF");
+        key.render_profile.dispatch = ThumbnailRenderPath::ObjectGpu;
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let jpeg_filename = thumbnail_jpeg_filename(&fingerprint).unwrap();
+        let manifest_path = thumbnail_manifest_path(temp.path(), &key).unwrap();
+        let mut manifest = serde_json::to_value(ThumbnailManifest {
+            key: key.clone(),
+            fingerprint,
+            jpeg_filename: jpeg_filename.clone(),
+        })
+        .unwrap();
+        manifest["fingerprint"]["actualRenderPath"] = json!("object_fallback");
+
+        fs::write(&manifest_path, serde_json::to_vec(&manifest).unwrap()).unwrap();
+        fs::write(temp.path().join(jpeg_filename), b"fallback-jpeg").unwrap();
+
+        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+    }
+
+    #[test]
     fn thumbnail_manifest_lookup_rejects_unsafe_wrong_and_missing_jpeg() {
         let temp = tempfile::tempdir().unwrap();
         let key = thumbnail_test_key("/photos/image.RAF");
@@ -4748,7 +4909,7 @@ mod tests {
         .unwrap();
 
         assert_eq!(hit.jpeg_path, jpeg_path);
-        assert_eq!(hit.manifest_path, manifest_path);
+        assert_eq!(hit.manifest_path, Some(manifest_path));
         assert!(lookup_thumbnail_manifest(temp.path(), &key).is_some());
     }
 
@@ -4768,6 +4929,131 @@ mod tests {
 
         let hit = lookup_thumbnail_manifest(temp.path(), &key).unwrap();
         assert_eq!(fs::read(hit.jpeg_path).unwrap(), b"forced-render");
+    }
+
+    #[test]
+    fn thumbnail_publication_rejects_source_change_during_sidecar_recheck() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("changing-during-sidecar.RAF");
+        fs::write(&source, b"before").unwrap();
+        let initial_time = filetime::FileTime::from_unix_time(2_000_000_000, 123_456_789);
+        filetime::set_file_mtime(&source, initial_time).unwrap();
+        let adjustments = json!({ "exposure": 0.5 });
+        let defaults = thumbnail_test_defaults();
+        let profile = thumbnail_test_profile();
+        let key = thumbnail_manifest_key(
+            source.to_str().unwrap(),
+            thumbnail_source_timestamp(&source).unwrap(),
+            &adjustments,
+            &defaults,
+            &profile,
+        );
+        let fingerprint = thumbnail_test_fingerprint(&key);
+        let changed_time = filetime::FileTime::from_unix_time(2_000_000_001, 987_654_321);
+        let source_for_recheck = source.clone();
+        let adjustments_for_recheck = adjustments.clone();
+        let path_str = source.to_str().unwrap();
+
+        let result =
+            publish_thumbnail_cache_with_recheck(temp.path(), &fingerprint, b"stale-jpeg", || {
+                thumbnail_key_recheck_with(path_str, &defaults, &profile, |_| {
+                    fs::write(&source_for_recheck, b"after").unwrap();
+                    filetime::set_file_mtime(&source_for_recheck, changed_time).unwrap();
+                    adjustments_for_recheck
+                })
+            });
+
+        assert!(result.is_err());
+        assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+    }
+
+    #[test]
+    fn thumbnail_runtime_fallback_is_immediate_but_not_reusable() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut key = thumbnail_test_key("/photos/image.RAF");
+        key.render_profile.dispatch = ThumbnailRenderPath::ObjectGpu;
+        let mut fallback_fingerprint = thumbnail_test_fingerprint(&key);
+        fallback_fingerprint.actual_render_path = ThumbnailRenderPath::ObjectFallback;
+        let mut gpu_fingerprint = fallback_fingerprint.clone();
+        gpu_fingerprint.actual_render_path = ThumbnailRenderPath::ObjectGpu;
+        let gpu_jpeg_path = temp
+            .path()
+            .join(thumbnail_jpeg_filename(&gpu_fingerprint).unwrap());
+        let manifest_path = thumbnail_manifest_path(temp.path(), &key).unwrap();
+        let generation_count = Arc::new(AtomicUsize::new(0));
+
+        for expected_generation_count in 1..=2 {
+            let fingerprint_for_generate = fallback_fingerprint.clone();
+            let key_for_recheck = key.clone();
+            let generation_count_for_call = Arc::clone(&generation_count);
+            let resolution = resolve_thumbnail_cache_with(
+                temp.path(),
+                &key,
+                false,
+                move || {
+                    generation_count_for_call.fetch_add(1, Ordering::SeqCst);
+                    Ok((fingerprint_for_generate, b"fallback-jpeg".to_vec()))
+                },
+                move || Some(key_for_recheck),
+            )
+            .unwrap();
+
+            assert_eq!(resolution.manifest_path, None);
+            assert_eq!(fs::read(&resolution.jpeg_path).unwrap(), b"fallback-jpeg");
+            assert_ne!(resolution.jpeg_path, gpu_jpeg_path);
+            assert!(!manifest_path.exists());
+            assert!(!gpu_jpeg_path.exists());
+            assert!(lookup_thumbnail_manifest(temp.path(), &key).is_none());
+            assert_eq!(
+                generation_count.load(Ordering::SeqCst),
+                expected_generation_count
+            );
+        }
+    }
+
+    #[test]
+    fn thumbnail_transient_fallback_preserves_existing_gpu_cache() {
+        let temp = tempfile::tempdir().unwrap();
+        let mut key = thumbnail_test_key("/photos/image.RAF");
+        key.render_profile.dispatch = ThumbnailRenderPath::ObjectGpu;
+        let gpu_fingerprint = thumbnail_test_fingerprint(&key);
+        let key_for_initial_recheck = key.clone();
+        let existing_hit = publish_thumbnail_cache_with_recheck(
+            temp.path(),
+            &gpu_fingerprint,
+            b"valid-gpu-jpeg",
+            move || Some(key_for_initial_recheck),
+        )
+        .unwrap();
+        let manifest_path = existing_hit.manifest_path.clone().unwrap();
+        let manifest_bytes = fs::read(&manifest_path).unwrap();
+
+        let mut fallback_fingerprint = gpu_fingerprint;
+        fallback_fingerprint.actual_render_path = ThumbnailRenderPath::ObjectFallback;
+        let key_for_fallback_recheck = key.clone();
+        let fallback = resolve_thumbnail_cache_with(
+            temp.path(),
+            &key,
+            true,
+            move || Ok((fallback_fingerprint, b"transient-fallback-jpeg".to_vec())),
+            move || Some(key_for_fallback_recheck),
+        )
+        .unwrap();
+
+        assert_eq!(fallback.manifest_path, None);
+        assert_eq!(
+            fs::read(fallback.jpeg_path).unwrap(),
+            b"transient-fallback-jpeg"
+        );
+        assert_eq!(
+            fs::read(&existing_hit.jpeg_path).unwrap(),
+            b"valid-gpu-jpeg"
+        );
+        assert_eq!(fs::read(&manifest_path).unwrap(), manifest_bytes);
+        assert_eq!(
+            lookup_thumbnail_manifest(temp.path(), &key),
+            Some(existing_hit)
+        );
     }
 
     #[test]

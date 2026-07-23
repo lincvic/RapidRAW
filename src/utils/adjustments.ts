@@ -593,9 +593,21 @@ const deepCloneParametric = (pCurve: any): ParametricCurve => ({
   blue: { ...DEFAULT_PARAMETRIC_CURVE_SETTINGS, ...(pCurve?.blue || {}) },
 });
 
-export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any => {
+const deepCloneAdjustmentValue = <T>(value: T): T => {
+  if (Array.isArray(value)) {
+    return value.map((item) => deepCloneAdjustmentValue(item)) as T;
+  }
+
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, deepCloneAdjustmentValue(item)])) as T;
+  }
+
+  return value;
+};
+
+export const normalizeLoadedAdjustments = (loadedAdjustments: Partial<Adjustments> | null | undefined): Adjustments => {
   if (!loadedAdjustments) {
-    return INITIAL_ADJUSTMENTS;
+    return deepCloneAdjustmentValue(INITIAL_ADJUSTMENTS);
   }
 
   const normalizeSubMasks = (subMasks: any[]) => {
@@ -649,7 +661,7 @@ export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any 
     subMasks: normalizeSubMasks(patch.subMasks),
   }));
 
-  return {
+  return deepCloneAdjustmentValue({
     ...INITIAL_ADJUSTMENTS,
     ...loadedAdjustments,
     flareAmount: loadedAdjustments.flareAmount ?? INITIAL_ADJUSTMENTS.flareAmount,
@@ -689,7 +701,7 @@ export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any 
       ...(loadedAdjustments.sectionVisibility || {}),
     },
     sharpnessThreshold: loadedAdjustments.sharpnessThreshold ?? INITIAL_ADJUSTMENTS.sharpnessThreshold,
-  };
+  } as Adjustments);
 };
 
 export interface AdjustmentGroup {

@@ -2175,6 +2175,28 @@ fn thumbnail_gpu_input_exceeds_limit(width: u32, height: u32, max_dimension: u32
     width > max_dimension || height > max_dimension
 }
 
+fn thumbnail_object_geometry_cache_hash(
+    adjustments: &Value,
+    identity: &ThumbnailCacheIdentity,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    calculate_geometry_hash(adjustments).hash(&mut hasher);
+    identity.key_digest.hash(&mut hasher);
+    hasher.finish()
+}
+
+fn thumbnail_object_gpu_transform_hash(
+    path_str: &str,
+    adjustments: &Value,
+    identity: &ThumbnailCacheIdentity,
+) -> u64 {
+    let mut hasher = DefaultHasher::new();
+    path_str.hash(&mut hasher);
+    adjustments.to_string().hash(&mut hasher);
+    identity.key_digest.hash(&mut hasher);
+    hasher.finish()
+}
+
 fn composite_preloaded_thumbnail_with<F>(
     preloaded: ThumbnailPreloadedImage,
     adjustments: &Value,
@@ -2262,6 +2284,7 @@ fn load_thumbnail_input(
 
 fn render_thumbnail_object_gpu(
     path_str: &str,
+    identity: &ThumbnailCacheIdentity,
     context: &GpuContext,
     composite_image: DynamicImage,
     raw_scale_factor: f32,
@@ -2273,7 +2296,7 @@ fn render_thumbnail_object_gpu(
 ) -> Result<ThumbnailRenderedImage> {
     let state = app_handle.state::<AppState>();
     let target_res = settings.thumbnail_resolution.unwrap_or(720);
-    let geometry_hash = calculate_geometry_hash(adjustments);
+    let geometry_hash = thumbnail_object_geometry_cache_hash(adjustments, identity);
     let crop_data: Option<Crop> = serde_json::from_value(adjustments["crop"].clone()).ok();
 
     let cached_base: Option<(DynamicImage, f32)> = {
@@ -2420,10 +2443,7 @@ fn render_thumbnail_object_gpu(
 
     let tm_override = crate::image_processing::resolve_tonemapper_override(settings, is_raw);
     let gpu_adjustments = get_all_adjustments_from_json(adjustments, is_raw, tm_override);
-    let mut hasher = DefaultHasher::new();
-    path_str.hash(&mut hasher);
-    adjustments.to_string().hash(&mut hasher);
-    let unique_hash = hasher.finish();
+    let unique_hash = thumbnail_object_gpu_transform_hash(path_str, adjustments, identity);
 
     Ok(resolve_thumbnail_gpu_result(
         gpu_processing::process_and_get_dynamic_image(
@@ -2447,6 +2467,7 @@ fn render_thumbnail_object_gpu(
 
 fn generate_thumbnail_data(
     path_str: &str,
+    identity: &ThumbnailCacheIdentity,
     gpu_context: Option<&GpuContext>,
     preloaded_image: Option<ThumbnailPreloadedImage>,
     app_handle: &AppHandle,
@@ -2481,6 +2502,7 @@ fn generate_thumbnail_data(
         },
         ThumbnailRenderPath::ObjectGpu => render_thumbnail_object_gpu(
             path_str,
+            identity,
             gpu_context.expect("GPU dispatch requires a context"),
             loaded.loaded.image,
             loaded.raw_scale_factor,
@@ -2648,6 +2670,7 @@ fn generate_cached_thumbnail(
         || {
             let (image, render, actual_render_path, actual_lut_outcome) = generate_thumbnail_data(
                 path_str,
+                &identity_for_generate,
                 gpu_context,
                 preloaded_image,
                 app_handle,
@@ -5217,6 +5240,45 @@ mod tests {
             max_dimension + 1,
             max_dimension
         ));
+    }
+
+    #[test]
+    fn thumbnail_object_gpu_cache_keys_change_with_source_identity() {
+        let path = "/photos/image.RAF";
+        let adjustments = json!({
+            "crop": {
+                "x": 0.0,
+                "y": 0.0,
+                "width": 8.0,
+                "height": 6.0,
+            },
+            "exposure": 0.5,
+        });
+        let base_key = thumbnail_test_key(path);
+        let base_identity = thumbnail_test_identity(&base_key);
+        let mut changed_key = base_key.clone();
+        changed_key.source_modified.nanoseconds += 1;
+        let changed_identity = thumbnail_test_identity(&changed_key);
+
+        let base_geometry_hash = thumbnail_object_geometry_cache_hash(&adjustments, &base_identity);
+        let base_gpu_hash = thumbnail_object_gpu_transform_hash(path, &adjustments, &base_identity);
+
+        assert_eq!(
+            thumbnail_object_geometry_cache_hash(&adjustments, &base_identity),
+            base_geometry_hash
+        );
+        assert_eq!(
+            thumbnail_object_gpu_transform_hash(path, &adjustments, &base_identity),
+            base_gpu_hash
+        );
+        assert_ne!(
+            thumbnail_object_geometry_cache_hash(&adjustments, &changed_identity),
+            base_geometry_hash
+        );
+        assert_ne!(
+            thumbnail_object_gpu_transform_hash(path, &adjustments, &changed_identity),
+            base_gpu_hash
+        );
     }
 
     #[test]

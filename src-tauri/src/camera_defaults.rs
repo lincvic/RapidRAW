@@ -45,15 +45,25 @@ impl ResolvedRenderInput {
         loaded: &LoadedBaseImage,
     ) -> Self {
         let (width, height) = loaded.image.dimensions();
+        Self::from_dimensions(persisted, defaults, loaded.source_kind, width, height)
+    }
+
+    pub(crate) fn from_dimensions(
+        persisted: &Value,
+        defaults: &CameraDefaults,
+        source_kind: ImageSourceKind,
+        width: u32,
+        height: u32,
+    ) -> Self {
         Self {
             effective_adjustments: effective_adjustments(
                 persisted,
                 defaults,
-                loaded.source_kind,
+                source_kind,
                 width,
                 height,
             ),
-            source_kind: loaded.source_kind,
+            source_kind,
             persisted_is_null: persisted.is_null(),
         }
     }

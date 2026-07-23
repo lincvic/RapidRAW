@@ -1,5 +1,5 @@
 #[cfg(target_os = "android")]
-use jni::objects::{JObject, JString, JValue};
+use jni::objects::{JByteArray, JObject, JString, JValue};
 #[cfg(target_os = "android")]
 use jni::{JNIEnv, JavaVM};
 #[cfg(target_os = "android")]
@@ -8,12 +8,60 @@ use jni22::{EnvUnowned as VerifierEnvUnowned, objects::JObject as VerifierJObjec
 use ndk_context::android_context;
 #[cfg(target_os = "android")]
 use std::fs;
+use std::io::{self, Read};
 #[cfg(target_os = "android")]
 use std::path::PathBuf;
 #[cfg(target_os = "android")]
 static INIT_NDK_CONTEXT: std::sync::Once = std::sync::Once::new();
 #[cfg(target_os = "android")]
 static INIT_RUSTLS_PLATFORM_VERIFIER: std::sync::Once = std::sync::Once::new();
+
+const BOUNDED_READ_CHUNK_BYTES: usize = 8192;
+
+pub(crate) fn read_to_limit_plus_one(
+    mut reader: impl Read,
+    maximum_bytes: usize,
+    initial_capacity: usize,
+) -> io::Result<Vec<u8>> {
+    let maximum_capacity = maximum_bytes
+        .checked_add(1)
+        .ok_or_else(|| io::Error::new(io::ErrorKind::InvalidInput, "read limit overflowed"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(initial_capacity.min(maximum_capacity))
+        .map_err(|error| io::Error::other(format!("Failed to allocate bounded read: {error}")))?;
+    let mut chunk = [0_u8; BOUNDED_READ_CHUNK_BYTES];
+
+    while bytes.len() < maximum_capacity {
+        let remaining = maximum_capacity - bytes.len();
+        let read_len = remaining.min(chunk.len());
+        let bytes_read = reader.read(&mut chunk[..read_len])?;
+        if bytes_read == 0 {
+            break;
+        }
+
+        let required = bytes
+            .len()
+            .checked_add(bytes_read)
+            .ok_or_else(|| io::Error::other("bounded read length overflowed"))?;
+        if required > bytes.capacity() {
+            let target_capacity = bytes
+                .capacity()
+                .checked_mul(2)
+                .unwrap_or(maximum_capacity)
+                .max(required)
+                .min(maximum_capacity);
+            bytes
+                .try_reserve_exact(target_capacity - bytes.len())
+                .map_err(|error| {
+                    io::Error::other(format!("Failed to grow bounded read: {error}"))
+                })?;
+        }
+        bytes.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    Ok(bytes)
+}
 
 #[cfg(target_os = "android")]
 pub fn initialize_android(window: &tauri::WebviewWindow) {
@@ -361,6 +409,115 @@ pub fn read_android_content_uri(uri_str: &str) -> Result<Vec<u8>, String> {
         }
 
         Ok(bytes)
+    })();
+
+    close_android_closeable(&mut env, &input_stream);
+    result
+}
+
+#[cfg(target_os = "android")]
+struct AndroidInputStreamReader<'borrow, 'local> {
+    env: &'borrow mut JNIEnv<'local>,
+    input_stream: &'borrow JObject<'local>,
+    java_buffer: JByteArray<'local>,
+    rust_buffer: [i8; BOUNDED_READ_CHUNK_BYTES],
+}
+
+#[cfg(target_os = "android")]
+impl Read for AndroidInputStreamReader<'_, '_> {
+    fn read(&mut self, output: &mut [u8]) -> io::Result<usize> {
+        if output.is_empty() {
+            return Ok(0);
+        }
+
+        let request_len = output.len().min(BOUNDED_READ_CHUNK_BYTES);
+        loop {
+            let read_count = self
+                .env
+                .call_method(
+                    self.input_stream,
+                    "read",
+                    "([BII)I",
+                    &[
+                        (&self.java_buffer).into(),
+                        JValue::from(0),
+                        JValue::from(request_len as i32),
+                    ],
+                )
+                .and_then(|value| value.i())
+                .map_err(|error| io::Error::other(map_android_jni_error(self.env, error)))?;
+
+            if read_count < 0 {
+                return Ok(0);
+            }
+            if read_count == 0 {
+                continue;
+            }
+
+            let read_len = usize::try_from(read_count)
+                .map_err(|_| io::Error::other("Android InputStream returned a negative length"))?;
+            if read_len > request_len {
+                return Err(io::Error::other(format!(
+                    "Android InputStream returned {} bytes for a {}-byte request",
+                    read_len, request_len
+                )));
+            }
+            self.env
+                .get_byte_array_region(&self.java_buffer, 0, &mut self.rust_buffer[..read_len])
+                .map_err(|error| io::Error::other(map_android_jni_error(self.env, error)))?;
+            for (destination, source) in output[..read_len]
+                .iter_mut()
+                .zip(&self.rust_buffer[..read_len])
+            {
+                *destination = *source as u8;
+            }
+            return Ok(read_len);
+        }
+    }
+}
+
+#[cfg(target_os = "android")]
+pub fn read_android_content_uri_bounded(
+    uri_str: &str,
+    maximum_bytes: usize,
+) -> Result<Vec<u8>, String> {
+    let vm = unsafe { JavaVM::from_raw(android_context().vm().cast()) }
+        .map_err(|e| format!("Failed to access Android JVM: {}", e))?;
+    let mut env = vm
+        .attach_current_thread()
+        .map_err(|e| format!("Failed to attach current thread to Android JVM: {}", e))?;
+
+    let resolver = get_android_content_resolver(&mut env)?;
+    let uri = parse_android_uri(&mut env, uri_str)?;
+    let input_stream = env
+        .call_method(
+            &resolver,
+            "openInputStream",
+            "(Landroid/net/Uri;)Ljava/io/InputStream;",
+            &[(&uri).into()],
+        )
+        .and_then(|value| value.l())
+        .map_err(|e| map_android_jni_error(&mut env, e))?;
+
+    if input_stream.is_null() {
+        return Err(format!(
+            "Failed to open InputStream for Android content URI: {}",
+            uri_str
+        ));
+    }
+
+    let result = (|| -> Result<Vec<u8>, String> {
+        let java_buffer = env
+            .new_byte_array(BOUNDED_READ_CHUNK_BYTES as i32)
+            .map_err(|error| map_android_jni_error(&mut env, error))?;
+        let mut reader = AndroidInputStreamReader {
+            env: &mut env,
+            input_stream: &input_stream,
+            java_buffer,
+            rust_buffer: [0_i8; BOUNDED_READ_CHUNK_BYTES],
+        };
+        read_to_limit_plus_one(&mut reader, maximum_bytes, 0)
+            .map_err(|error| format!("Failed to read Android content URI: {}", error))
     })();
 
     close_android_closeable(&mut env, &input_stream);

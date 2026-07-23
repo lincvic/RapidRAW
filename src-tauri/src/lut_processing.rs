@@ -1,13 +1,13 @@
 #[cfg(target_os = "android")]
 use crate::android_integration::{
-    get_android_cached_lut_path, is_android_content_uri, read_android_content_uri,
+    get_android_cached_lut_path, is_android_content_uri, read_android_content_uri_bounded,
     resolve_android_content_uri_name,
 };
 use anyhow::anyhow;
 use image::{DynamicImage, GenericImageView, ImageReader, Limits, Rgb, Rgb32FImage};
 use serde::Serialize;
 use std::fs::{copy, create_dir_all, read_dir};
-use std::io::{BufRead, BufReader, Cursor, Read};
+use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -16,6 +16,7 @@ use mozjpeg_rs::{Encoder, Preset};
 use tauri::{AppHandle, Manager, State};
 
 use crate::AppState;
+use crate::android_integration::read_to_limit_plus_one;
 use crate::cache_utils::calculate_transform_hash;
 use crate::image_processing::{
     RenderRequest, get_all_adjustments_from_json, process_and_get_dynamic_image,
@@ -153,7 +154,7 @@ fn import_android_lut(source: &str) -> anyhow::Result<()> {
         .and_then(|s| s.to_str())
         .unwrap_or("cube")
         .to_lowercase();
-    let bytes = read_android_content_uri(source)
+    let bytes = read_android_content_uri_bounded(source, MAX_LUT_SNAPSHOT_BYTES)
         .map_err(|e| anyhow!("Failed to read content URI: {}", e))?;
     validate_lut_snapshot_size(bytes.len() as u64)?;
 
@@ -244,87 +245,100 @@ fn parse_cube(reader: impl BufRead) -> anyhow::Result<Lut> {
             continue;
         }
 
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.is_empty() {
+        let mut parts = trimmed.split_whitespace();
+        let Some(first) = parts.next() else {
+            continue;
+        };
+
+        if first.eq_ignore_ascii_case("TITLE")
+            || first.eq_ignore_ascii_case("DOMAIN_MIN")
+            || first.eq_ignore_ascii_case("DOMAIN_MAX")
+        {
             continue;
         }
 
-        match parts[0].to_uppercase().as_str() {
-            "TITLE" | "DOMAIN_MIN" | "DOMAIN_MAX" => continue,
+        if first.eq_ignore_ascii_case("LUT_3D_SIZE") {
+            if size.is_some() {
+                return Err(anyhow!(
+                    "LUT_3D_SIZE may only appear once in a .cube file (line {})",
+                    line_num
+                ));
+            }
+            let size_token = parts
+                .next()
+                .ok_or_else(|| anyhow!("Malformed LUT_3D_SIZE on line {}: '{}'", line_num, line))?;
+            let parsed_size = size_token.parse().map_err(|e| {
+                anyhow!(
+                    "Failed to parse LUT_3D_SIZE on line {}: '{}'. Error: {}",
+                    line_num,
+                    line,
+                    e
+                )
+            })?;
+            let (_, parsed_values) = checked_lut_counts(parsed_size, ".cube")?;
+            size = Some(parsed_size);
+            expected_values = Some(parsed_values);
+            continue;
+        }
 
-            "LUT_3D_SIZE" => {
-                if parts.len() < 2 {
-                    return Err(anyhow!(
-                        "Malformed LUT_3D_SIZE on line {}: '{}'",
-                        line_num,
-                        line
-                    ));
-                }
-                let parsed_size = parts[1].parse().map_err(|e| {
-                    anyhow!(
-                        "Failed to parse LUT_3D_SIZE on line {}: '{}'. Error: {}",
-                        line_num,
-                        line,
-                        e
-                    )
-                })?;
-                let (_, parsed_values) = checked_lut_counts(parsed_size, ".cube")?;
-                if data.len() > parsed_values {
-                    return Err(anyhow!(
-                        ".cube LUT already contains {} values, which exceeds the declared edge {}",
-                        data.len(),
-                        parsed_size
-                    ));
-                }
-                size = Some(parsed_size);
-                expected_values = Some(parsed_values);
+        if let Some(maximum_values) = expected_values {
+            let green_token = parts.next().ok_or_else(|| {
+                anyhow!(
+                    "Invalid data line on line {}: '{}'. Expected 3 float values",
+                    line_num,
+                    line
+                )
+            })?;
+            let blue_token = parts.next().ok_or_else(|| {
+                anyhow!(
+                    "Invalid data line on line {}: '{}'. Expected 3 float values",
+                    line_num,
+                    line
+                )
+            })?;
+            if let Some(extra) = parts.next()
+                && !extra.starts_with('#')
+            {
+                return Err(anyhow!(
+                    "Invalid data line on line {}: '{}'. Found more than 3 values",
+                    line_num,
+                    line
+                ));
             }
-            _ => {
-                if let Some(maximum_values) = expected_values {
-                    if parts.len() < 3 {
-                        return Err(anyhow!(
-                            "Invalid data line on line {}: '{}'. Expected 3 float values, found {}",
-                            line_num,
-                            line,
-                            parts.len()
-                        ));
-                    }
-                    if data.len() == maximum_values {
-                        return Err(anyhow!(
-                            ".cube LUT contains more data than declared for edge {}",
-                            size.unwrap_or_default()
-                        ));
-                    }
-                    reserve_lut_triplet(&mut data, maximum_values, ".cube")?;
-                    let r: f32 = parts[0].parse().map_err(|e| {
-                        anyhow!(
-                            "Failed to parse R value on line {}: '{}'. Error: {}",
-                            line_num,
-                            line,
-                            e
-                        )
-                    })?;
-                    let g: f32 = parts[1].parse().map_err(|e| {
-                        anyhow!(
-                            "Failed to parse G value on line {}: '{}'. Error: {}",
-                            line_num,
-                            line,
-                            e
-                        )
-                    })?;
-                    let b: f32 = parts[2].parse().map_err(|e| {
-                        anyhow!(
-                            "Failed to parse B value on line {}: '{}'. Error: {}",
-                            line_num,
-                            line,
-                            e
-                        )
-                    })?;
-                    data.push(r);
-                    data.push(g);
-                    data.push(b);
-                }
+            if data.len() == maximum_values {
+                return Err(anyhow!(
+                    ".cube LUT contains more data than declared for edge {}",
+                    size.unwrap_or_default()
+                ));
             }
+            reserve_lut_triplet(&mut data, maximum_values, ".cube")?;
+            let r: f32 = first.parse().map_err(|e| {
+                anyhow!(
+                    "Failed to parse R value on line {}: '{}'. Error: {}",
+                    line_num,
+                    line,
+                    e
+                )
+            })?;
+            let g: f32 = green_token.parse().map_err(|e| {
+                anyhow!(
+                    "Failed to parse G value on line {}: '{}'. Error: {}",
+                    line_num,
+                    line,
+                    e
+                )
+            })?;
+            let b: f32 = blue_token.parse().map_err(|e| {
+                anyhow!(
+                    "Failed to parse B value on line {}: '{}'. Error: {}",
+                    line_num,
+                    line,
+                    e
+                )
+            })?;
+            data.push(r);
+            data.push(g);
+            data.push(b);
         }
     }
 
@@ -355,8 +369,13 @@ fn parse_3dl(reader: impl BufRead) -> anyhow::Result<Lut> {
         if trimmed.is_empty() || trimmed.starts_with('#') {
             continue;
         }
-        let parts: Vec<&str> = trimmed.split_whitespace().collect();
-        if parts.len() == 3 {
+        let mut parts = trimmed.split_whitespace();
+        let (Some(red_token), Some(green_token), Some(blue_token)) =
+            (parts.next(), parts.next(), parts.next())
+        else {
+            continue;
+        };
+        if parts.next().is_none() {
             if data.len() == MAX_LUT_VALUES {
                 return Err(anyhow!(
                     "3DL LUT has more than {} entries; the maximum supported edge is {}",
@@ -365,9 +384,9 @@ fn parse_3dl(reader: impl BufRead) -> anyhow::Result<Lut> {
                 ));
             }
             reserve_lut_triplet(&mut data, MAX_LUT_VALUES, "3DL")?;
-            let r: f32 = parts[0].parse()?;
-            let g: f32 = parts[1].parse()?;
-            let b: f32 = parts[2].parse()?;
+            let r: f32 = red_token.parse()?;
+            let g: f32 = green_token.parse()?;
+            let b: f32 = blue_token.parse()?;
             data.push(r);
             data.push(g);
             data.push(b);
@@ -526,44 +545,23 @@ fn parse_lut_bytes(extension: &str, bytes: &[u8]) -> anyhow::Result<Lut> {
     }
 }
 
+fn read_lut_reader_bounded(
+    reader: impl std::io::Read,
+    initial_capacity: usize,
+) -> anyhow::Result<Vec<u8>> {
+    let bytes = read_to_limit_plus_one(reader, MAX_LUT_SNAPSHOT_BYTES, initial_capacity)?;
+    validate_lut_snapshot_size(bytes.len() as u64)?;
+    Ok(bytes)
+}
+
 fn read_lut_file_bounded(path: &str) -> anyhow::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
+    let file = std::fs::File::open(path)?;
     let metadata_len = file.metadata()?.len();
     validate_lut_snapshot_size(metadata_len)?;
 
     let initial_capacity = usize::try_from(metadata_len)
         .map_err(|_| anyhow!("LUT file size cannot be represented on this platform"))?;
-    let mut bytes = Vec::new();
-    bytes
-        .try_reserve_exact(initial_capacity)
-        .map_err(|error| anyhow!("Failed to allocate LUT snapshot: {}", error))?;
-    let mut chunk = [0_u8; 8192];
-
-    while bytes.len() <= MAX_LUT_SNAPSHOT_BYTES {
-        let remaining = MAX_LUT_SNAPSHOT_BYTES + 1 - bytes.len();
-        let read_len = remaining.min(chunk.len());
-        let bytes_read = file.read(&mut chunk[..read_len])?;
-        if bytes_read == 0 {
-            break;
-        }
-        let required = bytes.len() + bytes_read;
-        if required > bytes.capacity() {
-            let maximum_capacity = MAX_LUT_SNAPSHOT_BYTES + 1;
-            let target_capacity = bytes
-                .capacity()
-                .checked_mul(2)
-                .unwrap_or(maximum_capacity)
-                .max(required)
-                .min(maximum_capacity);
-            bytes
-                .try_reserve_exact(target_capacity - bytes.len())
-                .map_err(|error| anyhow!("Failed to grow LUT snapshot: {}", error))?;
-        }
-        bytes.extend_from_slice(&chunk[..bytes_read]);
-    }
-
-    validate_lut_snapshot_size(bytes.len() as u64)?;
-    Ok(bytes)
+    read_lut_reader_bounded(file, initial_capacity)
 }
 
 pub(crate) fn load_lut_snapshot_with<F>(
@@ -591,7 +589,8 @@ pub(crate) fn load_lut_snapshot(path_str: &str) -> anyhow::Result<LutSnapshot> {
     load_lut_snapshot_with(path_str, |path| {
         #[cfg(target_os = "android")]
         if is_android_content_uri(path) {
-            let bytes = read_android_content_uri(path).map_err(|error| anyhow!("{}", error))?;
+            let bytes = read_android_content_uri_bounded(path, MAX_LUT_SNAPSHOT_BYTES)
+                .map_err(|error| anyhow!("{}", error))?;
             validate_lut_snapshot_size(bytes.len() as u64)?;
             return Ok(bytes);
         }
@@ -890,9 +889,39 @@ pub fn load_and_parse_lut(path: String, state: State<AppState>) -> Result<LutPar
 mod tests {
     use super::*;
     use std::fs;
+    use std::io::{self, Read};
+    use std::sync::Mutex;
 
     const EXPECTED_MAX_LUT_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
     const EXPECTED_MAX_LUT_EDGE: u32 = 65;
+    static LARGE_READER_TEST_LOCK: Mutex<()> = Mutex::new(());
+
+    struct SyntheticReader {
+        remaining: usize,
+        bytes_read: usize,
+        largest_request: usize,
+    }
+
+    impl SyntheticReader {
+        fn new(byte_len: usize) -> Self {
+            Self {
+                remaining: byte_len,
+                bytes_read: 0,
+                largest_request: 0,
+            }
+        }
+    }
+
+    impl Read for SyntheticReader {
+        fn read(&mut self, buffer: &mut [u8]) -> io::Result<usize> {
+            self.largest_request = self.largest_request.max(buffer.len());
+            let read_len = self.remaining.min(buffer.len());
+            buffer[..read_len].fill(b'\n');
+            self.remaining -= read_len;
+            self.bytes_read += read_len;
+            Ok(read_len)
+        }
+    }
 
     fn constant_lut_rows(edge: u32, include_cube_header: bool) -> Vec<u8> {
         let entries = usize::try_from(edge).unwrap().pow(3);
@@ -931,6 +960,13 @@ mod tests {
         .into_bytes()
     }
 
+    fn encoded_test_image(width: u32, height: u32, format: image::ImageFormat) -> Vec<u8> {
+        let image = DynamicImage::new_rgb8(width, height);
+        let mut encoded = Cursor::new(Vec::new());
+        image.write_to(&mut encoded, format).unwrap();
+        encoded.into_inner()
+    }
+
     #[test]
     fn lut_snapshot_hashes_and_parses_the_same_byte_read() {
         let temp = tempfile::tempdir().unwrap();
@@ -954,10 +990,15 @@ mod tests {
 
     #[test]
     fn injected_lut_snapshot_reader_rejects_bytes_above_limit() {
-        let error = load_lut_snapshot_with("oversized.cube", |_| {
-            Ok(vec![0; EXPECTED_MAX_LUT_SNAPSHOT_BYTES + 1])
-        })
-        .unwrap_err();
+        let _large_test_guard = LARGE_READER_TEST_LOCK.lock().unwrap();
+        let bytes = read_to_limit_plus_one(
+            SyntheticReader::new(EXPECTED_MAX_LUT_SNAPSHOT_BYTES + 1),
+            EXPECTED_MAX_LUT_SNAPSHOT_BYTES,
+            0,
+        )
+        .unwrap();
+
+        let error = load_lut_snapshot_with("oversized.cube", |_| Ok(bytes)).unwrap_err();
 
         assert!(
             error.to_string().contains("32 MiB"),
@@ -980,6 +1021,33 @@ mod tests {
             error.to_string().contains("32 MiB"),
             "unexpected error: {error:#}"
         );
+    }
+
+    #[test]
+    fn bounded_lut_reader_accepts_exact_snapshot_limit() {
+        let _large_test_guard = LARGE_READER_TEST_LOCK.lock().unwrap();
+        let mut reader = SyntheticReader::new(EXPECTED_MAX_LUT_SNAPSHOT_BYTES);
+
+        let bytes = read_lut_reader_bounded(&mut reader, 0).unwrap();
+
+        assert_eq!(bytes.len(), EXPECTED_MAX_LUT_SNAPSHOT_BYTES);
+        assert_eq!(reader.bytes_read, EXPECTED_MAX_LUT_SNAPSHOT_BYTES);
+        assert!(reader.largest_request <= 8192);
+    }
+
+    #[test]
+    fn bounded_lut_reader_rejects_limit_plus_one_after_metadata_growth() {
+        let _large_test_guard = LARGE_READER_TEST_LOCK.lock().unwrap();
+        let mut reader = SyntheticReader::new(EXPECTED_MAX_LUT_SNAPSHOT_BYTES + 1);
+
+        let error = read_lut_reader_bounded(&mut reader, 1).unwrap_err();
+
+        assert!(
+            error.to_string().contains("32 MiB"),
+            "unexpected error: {error:#}"
+        );
+        assert_eq!(reader.bytes_read, EXPECTED_MAX_LUT_SNAPSHOT_BYTES + 1);
+        assert!(reader.largest_request <= 8192);
     }
 
     #[test]
@@ -1010,6 +1078,59 @@ mod tests {
             error.contains("maximum supported edge is 65"),
             "unexpected error: {error}"
         );
+    }
+
+    #[test]
+    fn cube_rejects_pathological_short_token_data_line() {
+        let mut bytes = b"LUT_3D_SIZE 1\n".to_vec();
+        for _ in 0..100_000 {
+            bytes.extend_from_slice(b"0 ");
+        }
+        bytes.extend_from_slice(b"0\n");
+
+        let error = parse_cube(BufReader::new(Cursor::new(bytes))).unwrap_err();
+
+        assert!(
+            error.to_string().contains("more than 3 values"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cube_rejects_identical_repeated_size_directive() {
+        let bytes = b"LUT_3D_SIZE 1\nLUT_3D_SIZE 1\n0 0 0\n";
+
+        let error = parse_cube(BufReader::new(Cursor::new(bytes))).unwrap_err();
+
+        assert!(
+            error.to_string().contains("may only appear once"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cube_rejects_conflicting_repeated_size_directive() {
+        let mut bytes = b"LUT_3D_SIZE 1\nLUT_3D_SIZE 2\n".to_vec();
+        for _ in 0..8 {
+            bytes.extend_from_slice(b"0 0 0\n");
+        }
+
+        let error = parse_cube(BufReader::new(Cursor::new(bytes))).unwrap_err();
+
+        assert!(
+            error.to_string().contains("may only appear once"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cube_accepts_inline_comment_after_data_values() {
+        let bytes = b"LUT_3D_SIZE 1\n0 0 0 # black point\n";
+
+        let lut = parse_cube(BufReader::new(Cursor::new(bytes))).unwrap();
+
+        assert_eq!(lut.size, 1);
+        assert_eq!(lut.data, vec![0.0, 0.0, 0.0]);
     }
 
     #[test]
@@ -1050,21 +1171,46 @@ mod tests {
     }
 
     #[test]
-    fn hald_decode_rejects_dimensions_above_bounded_limit() {
-        let image = DynamicImage::new_rgb8(525, 525);
-        let mut encoded = Cursor::new(Vec::new());
-        image
-            .write_to(&mut encoded, image::ImageFormat::Png)
-            .unwrap();
+    fn three_dl_ignores_wide_non_data_line() {
+        let mut bytes = Vec::new();
+        for _ in 0..100_000 {
+            bytes.extend_from_slice(b"header ");
+        }
+        bytes.extend_from_slice(b"header\n0 0 0\n");
 
-        let error = parse_lut_bytes("png", encoded.get_ref()).unwrap_err();
+        let lut = parse_3dl(BufReader::new(Cursor::new(bytes))).unwrap();
 
-        assert!(
-            error
-                .to_string()
-                .contains("maximum supported HALD dimension is 524x524"),
-            "unexpected error: {error:#}"
-        );
+        assert_eq!(lut.size, 1);
+        assert_eq!(lut.data, vec![0.0, 0.0, 0.0]);
+    }
+
+    #[test]
+    fn hald_decode_rejects_oversized_compressed_images() {
+        for (extension, format) in [
+            ("png", image::ImageFormat::Png),
+            ("jpg", image::ImageFormat::Jpeg),
+            ("tiff", image::ImageFormat::Tiff),
+        ] {
+            let encoded = encoded_test_image(525, 525, format);
+            let error = parse_lut_bytes(extension, &encoded).unwrap_err();
+
+            assert!(
+                error
+                    .to_string()
+                    .contains("maximum supported HALD dimension is 524x524"),
+                "unexpected {extension} error: {error:#}"
+            );
+        }
+    }
+
+    #[test]
+    fn hald_decode_accepts_valid_512_square() {
+        let encoded = encoded_test_image(512, 512, image::ImageFormat::Png);
+
+        let lut = parse_lut_bytes("png", &encoded).unwrap();
+
+        assert_eq!(lut.size, 64);
+        assert_eq!(lut.data.len(), 64_usize.pow(3) * 3);
     }
 
     #[test]

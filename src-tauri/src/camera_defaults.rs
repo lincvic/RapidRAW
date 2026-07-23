@@ -7,7 +7,7 @@ use rawler::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use std::path::Path;
+use std::{panic::AssertUnwindSafe, path::Path};
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -214,20 +214,30 @@ pub fn effective_adjustments(
     json!({ "crop": crop, "aspectRatio": defaults.aspect_ratio })
 }
 
+fn camera_defaults_for_path_with<F>(path: &Path, extract: F) -> CameraDefaults
+where
+    F: FnOnce(&Path) -> anyhow::Result<CameraDefaults>,
+{
+    match std::panic::catch_unwind(AssertUnwindSafe(|| extract(path))) {
+        Ok(Ok(defaults)) => defaults,
+        Ok(Err(error)) => {
+            log::debug!("No camera defaults for '{}': {error}", path.display());
+            CameraDefaults::default()
+        }
+        Err(_) => {
+            log::debug!("RAW camera default extraction panicked");
+            CameraDefaults::default()
+        }
+    }
+}
+
 pub fn camera_defaults_for_path(path: &Path) -> CameraDefaults {
-    let result = (|| -> anyhow::Result<CameraDefaults> {
+    camera_defaults_for_path_with(path, |path| {
         let source = RawSource::new(path)?;
         let decoder = rawler::get_decoder(&source)?;
         let metadata = decoder.raw_metadata(&source, &RawDecodeParams::default())?;
         Ok(camera_defaults_from_raw(&metadata))
-    })();
-    match result {
-        Ok(defaults) => defaults,
-        Err(error) => {
-            log::debug!("No camera defaults for '{}': {error}", path.display());
-            CameraDefaults::default()
-        }
-    }
+    })
 }
 
 #[cfg(test)]
@@ -728,5 +738,15 @@ mod tests {
             camera_defaults_for_path(&invalid_path),
             CameraDefaults::default()
         );
+    }
+
+    #[test]
+    fn camera_defaults_for_path_contains_extractor_panics() {
+        let defaults = camera_defaults_for_path_with(
+            Path::new("unused.RAF"),
+            |_| -> anyhow::Result<CameraDefaults> { panic!("synthetic extractor panic") },
+        );
+
+        assert_eq!(defaults, CameraDefaults::default());
     }
 }

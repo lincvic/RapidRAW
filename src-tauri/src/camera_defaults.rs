@@ -1,10 +1,13 @@
 use crate::image_processing::Crop;
 use rawler::{
     Orientation,
-    decoders::RawMetadata,
+    decoders::{RawDecodeParams, RawMetadata},
     imgop::{Dim2, Point, Rect},
+    rawsource::RawSource,
 };
 use serde::{Deserialize, Serialize};
+use serde_json::{Value, json};
+use std::path::Path;
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
@@ -195,6 +198,38 @@ pub(crate) fn scaled_camera_crop(
     Some(scaled)
 }
 
+pub fn effective_adjustments(
+    persisted: &Value,
+    defaults: &CameraDefaults,
+    source_kind: ImageSourceKind,
+    developed_width: u32,
+    developed_height: u32,
+) -> Value {
+    if !persisted.is_null() || source_kind != ImageSourceKind::DevelopedRaw {
+        return persisted.clone();
+    }
+    let Some(crop) = scaled_camera_crop(defaults, developed_width, developed_height) else {
+        return persisted.clone();
+    };
+    json!({ "crop": crop, "aspectRatio": defaults.aspect_ratio })
+}
+
+pub fn camera_defaults_for_path(path: &Path) -> CameraDefaults {
+    let result = (|| -> anyhow::Result<CameraDefaults> {
+        let source = RawSource::new(path)?;
+        let decoder = rawler::get_decoder(&source)?;
+        let metadata = decoder.raw_metadata(&source, &RawDecodeParams::default())?;
+        Ok(camera_defaults_from_raw(&metadata))
+    })();
+    match result {
+        Ok(defaults) => defaults,
+        Err(error) => {
+            log::debug!("No camera defaults for '{}': {error}", path.display());
+            CameraDefaults::default()
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -204,7 +239,7 @@ mod tests {
         decoders::{RawCameraCrop, RawMetadata},
         imgop::{Dim2, Point, Rect},
     };
-    use serde_json::json;
+    use serde_json::{Value, json};
 
     fn crop(x: f64, y: f64, width: f64, height: f64) -> Crop {
         Crop {
@@ -539,6 +574,159 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ImageSourceKind::NonRaw).unwrap(),
             json!("non_raw")
+        );
+    }
+
+    #[test]
+    fn defaults_apply_only_to_literal_null_developed_raw_adjustments() {
+        let defaults = CameraDefaults {
+            crop: Some(crop(10.0, 20.0, 100.0, 40.0)),
+            aspect_ratio: Some(2.5),
+            canvas_width: Some(200),
+            canvas_height: Some(100),
+        };
+        let null = Value::Null;
+
+        assert_eq!(
+            effective_adjustments(&null, &defaults, ImageSourceKind::DevelopedRaw, 200, 100,),
+            json!({
+                "crop": {
+                    "x": 10.0,
+                    "y": 20.0,
+                    "width": 100.0,
+                    "height": 40.0,
+                },
+                "aspectRatio": 2.5,
+            })
+        );
+        assert_eq!(
+            effective_adjustments(&null, &defaults, ImageSourceKind::EmbeddedPreview, 200, 100,),
+            Value::Null
+        );
+        assert_eq!(
+            effective_adjustments(&null, &defaults, ImageSourceKind::NonRaw, 200, 100),
+            Value::Null
+        );
+    }
+
+    #[test]
+    fn defaults_scale_to_downsampled_developed_dimensions() {
+        let defaults = CameraDefaults {
+            crop: Some(crop(10.0, 20.0, 100.0, 40.0)),
+            aspect_ratio: Some(2.5),
+            canvas_width: Some(200),
+            canvas_height: Some(100),
+        };
+
+        assert_eq!(
+            effective_adjustments(
+                &Value::Null,
+                &defaults,
+                ImageSourceKind::DevelopedRaw,
+                100,
+                50,
+            ),
+            json!({
+                "crop": {
+                    "x": 5.0,
+                    "y": 10.0,
+                    "width": 50.0,
+                    "height": 20.0,
+                },
+                "aspectRatio": 2.5,
+            })
+        );
+    }
+
+    #[test]
+    fn every_persisted_non_null_value_wins_unchanged() {
+        let defaults = CameraDefaults {
+            crop: Some(crop(10.0, 20.0, 100.0, 40.0)),
+            aspect_ratio: Some(2.5),
+            canvas_width: Some(200),
+            canvas_height: Some(100),
+        };
+        let persisted_values = [
+            json!({}),
+            json!({ "crop": null }),
+            json!({
+                "crop": { "x": 1.0, "y": 2.0, "width": 3.0, "height": 4.0 },
+                "aspectRatio": 0.75,
+            }),
+            json!(["saved", "adjustments"]),
+            json!("saved adjustments"),
+            json!(true),
+            json!(42),
+        ];
+
+        for persisted in persisted_values {
+            assert_eq!(
+                effective_adjustments(
+                    &persisted,
+                    &defaults,
+                    ImageSourceKind::DevelopedRaw,
+                    200,
+                    100,
+                ),
+                persisted
+            );
+        }
+    }
+
+    #[test]
+    fn invalid_defaults_leave_literal_null_adjustments_unchanged() {
+        let valid = CameraDefaults {
+            crop: Some(crop(10.0, 20.0, 100.0, 40.0)),
+            aspect_ratio: Some(2.5),
+            canvas_width: Some(200),
+            canvas_height: Some(100),
+        };
+        for (width, height) in [(0, 100), (200, 0)] {
+            assert_eq!(
+                effective_adjustments(
+                    &Value::Null,
+                    &valid,
+                    ImageSourceKind::DevelopedRaw,
+                    width,
+                    height,
+                ),
+                Value::Null
+            );
+        }
+
+        let invalid_defaults = [
+            CameraDefaults::default(),
+            defaults_with_crop(crop(10.0, 20.0, 0.0, 40.0), 200, 100),
+            defaults_with_crop(crop(150.0, 20.0, 100.0, 40.0), 200, 100),
+        ];
+        for defaults in invalid_defaults {
+            assert_eq!(
+                effective_adjustments(
+                    &Value::Null,
+                    &defaults,
+                    ImageSourceKind::DevelopedRaw,
+                    200,
+                    100,
+                ),
+                Value::Null
+            );
+        }
+    }
+
+    #[test]
+    fn camera_defaults_for_path_is_non_failing() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing.RAF");
+        assert_eq!(
+            camera_defaults_for_path(&missing_path),
+            CameraDefaults::default()
+        );
+
+        let invalid_path = temp_dir.path().join("invalid.RAF");
+        std::fs::write(&invalid_path, b"not a valid RAF").unwrap();
+        assert_eq!(
+            camera_defaults_for_path(&invalid_path),
+            CameraDefaults::default()
         );
     }
 }

@@ -1,7 +1,9 @@
 use crate::{
     formats::is_raw_file,
+    image_loader::LoadedBaseImage,
     image_processing::{Crop, ImageMetadata},
 };
+use image::GenericImageView;
 use rawler::{
     Orientation,
     decoders::{RawDecodeParams, RawMetadata},
@@ -27,6 +29,34 @@ pub struct CameraDefaults {
     pub aspect_ratio: Option<f64>,
     pub canvas_width: Option<u32>,
     pub canvas_height: Option<u32>,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct ResolvedRenderInput {
+    pub(crate) effective_adjustments: Value,
+    pub(crate) source_kind: ImageSourceKind,
+    pub(crate) persisted_is_null: bool,
+}
+
+impl ResolvedRenderInput {
+    pub(crate) fn from_loaded(
+        persisted: &Value,
+        defaults: &CameraDefaults,
+        loaded: &LoadedBaseImage,
+    ) -> Self {
+        let (width, height) = loaded.image.dimensions();
+        Self {
+            effective_adjustments: effective_adjustments(
+                persisted,
+                defaults,
+                loaded.source_kind,
+                width,
+                height,
+            ),
+            source_kind: loaded.source_kind,
+            persisted_is_null: persisted.is_null(),
+        }
+    }
 }
 
 #[derive(Clone, Debug, Serialize)]
@@ -266,7 +296,9 @@ pub fn metadata_result_for_path(metadata: ImageMetadata, source_path: &Path) -> 
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::image_loader::LoadedBaseImage;
     use crate::image_processing::{Crop, ImageMetadata};
+    use image::DynamicImage;
     use rawler::{
         Orientation,
         decoders::{RawCameraCrop, RawMetadata},
@@ -290,6 +322,47 @@ mod tests {
             aspect_ratio: None,
             canvas_width: Some(canvas_width),
             canvas_height: Some(canvas_height),
+        }
+    }
+
+    #[test]
+    fn resolved_render_input_scales_once_and_preserves_null_tone_path() {
+        let defaults = CameraDefaults {
+            crop: Some(crop(2.0, 2.0, 4.0, 2.0)),
+            aspect_ratio: Some(2.0),
+            canvas_width: Some(8),
+            canvas_height: Some(6),
+        };
+        let cases = [
+            (
+                (8, 6),
+                ImageSourceKind::DevelopedRaw,
+                json!({
+                    "crop": { "x": 2.0, "y": 2.0, "width": 4.0, "height": 2.0 },
+                    "aspectRatio": 2.0,
+                }),
+            ),
+            (
+                (4, 3),
+                ImageSourceKind::DevelopedRaw,
+                json!({
+                    "crop": { "x": 1.0, "y": 1.0, "width": 2.0, "height": 1.0 },
+                    "aspectRatio": 2.0,
+                }),
+            ),
+            ((4, 3), ImageSourceKind::EmbeddedPreview, Value::Null),
+        ];
+
+        for ((width, height), source_kind, expected) in cases {
+            let loaded = LoadedBaseImage {
+                image: DynamicImage::new_rgb8(width, height),
+                source_kind,
+            };
+            let render = ResolvedRenderInput::from_loaded(&Value::Null, &defaults, &loaded);
+
+            assert_eq!(render.effective_adjustments, expected);
+            assert_eq!(render.source_kind, source_kind);
+            assert!(render.persisted_is_null);
         }
     }
 

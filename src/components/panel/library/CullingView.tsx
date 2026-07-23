@@ -28,6 +28,7 @@ import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useLibraryActions } from '../../../hooks/useLibraryActions';
 import { COLOR_LABELS, Color } from '../../../utils/adjustments';
 import { IconAperture, IconFocalLength, IconIso, IconShutter } from '../editor/ExifIcons';
+import { generateExplicitPreviewForPath, type PreviewMetadataResult } from '../../../services/imagePreviews';
 
 interface SyncViewport {
   isActive: boolean;
@@ -241,16 +242,14 @@ function CullingPreview({
 
     const fetchPreviewWithAdjustments = async () => {
       try {
-        const metadata: any = await invoke(Invokes.LoadMetadata, { path: image.path });
+        const metadata = await invoke<PreviewMetadataResult>(Invokes.LoadMetadata, {
+          path: image.path,
+        });
         if (!active) return;
 
-        const adjustments =
-          metadata && metadata.adjustments && !metadata.adjustments.is_null ? metadata.adjustments : {};
+        const adjustments = metadata.adjustments ?? {};
 
-        const bytes = await invoke<Uint8Array>(Invokes.GeneratePreviewForPath, {
-          path: image.path,
-          jsAdjustments: adjustments,
-        });
+        const bytes = await generateExplicitPreviewForPath(image.path, adjustments);
         if (!active) return;
 
         const blob = new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' });
@@ -267,10 +266,7 @@ function CullingPreview({
 
         if (active) {
           try {
-            const fallbackBytes = await invoke<Uint8Array>(Invokes.GeneratePreviewForPath, {
-              path: image.path,
-              jsAdjustments: {},
-            });
+            const fallbackBytes = await generateExplicitPreviewForPath(image.path, {});
             if (!active) return;
             const blob = new Blob([new Uint8Array(fallbackBytes)], { type: 'image/jpeg' });
             const localBlobUrl = URL.createObjectURL(blob);

@@ -10,6 +10,7 @@ import clsx from 'clsx';
 import throttle from 'lodash.throttle';
 import Text from '../ui/Text';
 import { TextColors, TextVariants } from '../../types/typography';
+import { generateExplicitPreviewForPath } from '../../services/imagePreviews';
 
 interface NegativeParams {
   red_weight: number;
@@ -141,11 +142,8 @@ export default function NegativeConversionModal({
       updatePreview(DEFAULT_PARAMS, true);
 
       if (selectedImagePath) {
-        invoke('generate_preview_for_path', {
-          path: selectedImagePath,
-          jsAdjustments: {},
-        })
-          .then((res: any) => {
+        generateExplicitPreviewForPath(selectedImagePath, {})
+          .then((res) => {
             const blob = new Blob([new Uint8Array(res)], { type: 'image/jpeg' });
             setOriginalUrl(URL.createObjectURL(blob));
           })

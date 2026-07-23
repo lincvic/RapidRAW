@@ -23,6 +23,7 @@ import clsx from 'clsx';
 import { LAYOUTS, type Layout, type LayoutDefinition } from '../../utils/CollageVariants';
 import Text from '../ui/Text';
 import { TextVariants } from '../../types/typography';
+import { generateExplicitPreviewForPath, type PreviewMetadataResult } from '../../services/imagePreviews';
 
 interface CollageModalProps {
   isOpen: boolean;
@@ -145,13 +146,12 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
       setError(null);
       try {
         const imagePromises = sourceImages.map(async (imageFile) => {
-          const metadata: any = await invoke(Invokes.LoadMetadata, { path: imageFile.path });
-          const adjustments = metadata.adjustments && !metadata.adjustments.is_null ? metadata.adjustments : {};
-
-          const imageData: Uint8Array = await invoke(Invokes.GeneratePreviewForPath, {
+          const metadata = await invoke<PreviewMetadataResult>(Invokes.LoadMetadata, {
             path: imageFile.path,
-            jsAdjustments: adjustments,
           });
+          const adjustments = metadata.adjustments ?? {};
+
+          const imageData = await generateExplicitPreviewForPath(imageFile.path, adjustments);
           const blob = new Blob([new Uint8Array(imageData)], { type: 'image/jpeg' });
           const url = URL.createObjectURL(blob);
 

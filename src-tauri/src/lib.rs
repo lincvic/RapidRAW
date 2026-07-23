@@ -44,7 +44,7 @@ use std::hash::{Hash, Hasher};
 use std::io::Cursor;
 use std::io::Write;
 use std::panic;
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::mpsc::{self, Receiver, Sender};
 use std::thread;
@@ -75,15 +75,21 @@ use crate::cache_utils::{
     DecodedImageCache, GEOMETRY_KEYS, calculate_full_job_hash, calculate_geometry_hash,
     calculate_transform_hash, calculate_visual_hash,
 };
+use crate::camera_defaults::{
+    CameraDefaults, ImageSourceKind, ResolvedRenderInput, camera_defaults_for_path,
+};
 use crate::file_management::{parse_virtual_path, read_file_mapped};
 use crate::formats::is_raw_file;
 use crate::hdr_deghosting::{align_hdr_frames, assert_uniform_dimensions, load_hdr_frames};
-use crate::image_loader::{composite_patches_on_image, load_and_composite};
+use crate::image_loader::{
+    LoadedBaseImage, composite_patches_on_image, load_and_composite_with_metadata,
+};
 use crate::image_processing::{
-    Crop, GeometryParams, RenderRequest, apply_coarse_rotation, apply_cpu_default_raw_processing,
-    apply_flip, apply_geometry_warp, apply_linear_to_srgb, downscale_f32_image,
-    get_all_adjustments_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
-    resolve_tonemapper_override, resolve_tonemapper_override_from_handle, warp_image_geometry,
+    AllAdjustments, Crop, GeometryParams, RenderRequest, apply_coarse_rotation,
+    apply_cpu_default_raw_processing, apply_flip, apply_geometry_warp, apply_linear_to_srgb,
+    downscale_f32_image, get_all_adjustments_from_json, get_or_init_gpu_context,
+    process_and_get_dynamic_image, resolve_tonemapper_override,
+    resolve_tonemapper_override_from_handle, warp_image_geometry,
 };
 use crate::mask_generation::{
     MaskDefinition, generate_mask_bitmap, get_cached_or_generate_mask,
@@ -1511,25 +1517,422 @@ async fn save_collage(base64_data: String, first_path_str: String) -> Result<Str
     Ok(output_path.to_string_lossy().to_string())
 }
 
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratePreviewRequest {
+    path: String,
+    #[serde(default)]
+    js_adjustments: Option<Value>,
+}
+
+fn winning_standalone_preview_adjustments<'a>(
+    persisted: &'a Value,
+    explicit_adjustments: Option<&'a Value>,
+) -> &'a Value {
+    explicit_adjustments.unwrap_or(persisted)
+}
+
+pub(crate) fn prepare_standalone_preview(
+    persisted: &Value,
+    explicit_adjustments: Option<&Value>,
+    loaded: &LoadedBaseImage,
+    defaults: &CameraDefaults,
+) -> ResolvedRenderInput {
+    ResolvedRenderInput::from_loaded(
+        winning_standalone_preview_adjustments(persisted, explicit_adjustments),
+        defaults,
+        loaded,
+    )
+}
+
+fn standalone_preview_camera_defaults_with<F>(
+    source_path: &Path,
+    persisted: &Value,
+    explicit_adjustments: Option<&Value>,
+    loaded: &LoadedBaseImage,
+    load_defaults: F,
+) -> CameraDefaults
+where
+    F: FnOnce(&Path) -> CameraDefaults,
+{
+    let winning_adjustments =
+        winning_standalone_preview_adjustments(persisted, explicit_adjustments);
+    if winning_adjustments.is_null()
+        && loaded.source_kind == ImageSourceKind::DevelopedRaw
+        && is_raw_file(source_path)
+    {
+        load_defaults(source_path)
+    } else {
+        CameraDefaults::default()
+    }
+}
+
+pub(crate) fn render_standalone_preview_geometry<'a>(
+    loaded: &'a LoadedBaseImage,
+    render: &ResolvedRenderInput,
+) -> (Cow<'a, DynamicImage>, (f32, f32)) {
+    apply_all_transformations(Cow::Borrowed(&loaded.image), &render.effective_adjustments)
+}
+
+fn standalone_preview_mask_definitions(render: &ResolvedRenderInput) -> Vec<MaskDefinition> {
+    render
+        .effective_adjustments
+        .get("masks")
+        .and_then(|masks| serde_json::from_value(masks.clone()).ok())
+        .unwrap_or_default()
+}
+
+fn standalone_preview_full_job_hash(path: &str, render: &ResolvedRenderInput) -> u64 {
+    calculate_full_job_hash(path, &render.effective_adjustments)
+}
+
+fn standalone_preview_gpu_adjustments(
+    render: &ResolvedRenderInput,
+    is_raw: bool,
+    tonemapper_override: Option<u32>,
+) -> AllAdjustments {
+    get_all_adjustments_from_json(&render.effective_adjustments, is_raw, tonemapper_override)
+}
+
+fn standalone_preview_gpu_is_raw(path: &str) -> bool {
+    is_raw_file(path)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera_defaults::{CameraDefaults, ImageSourceKind};
+    use crate::image_loader::LoadedBaseImage;
+    use crate::image_processing::Crop;
+    use image::{GrayImage, Rgb, RgbImage};
+    use serde_json::json;
+
+    fn standalone_preview_loaded(source_kind: ImageSourceKind) -> LoadedBaseImage {
+        LoadedBaseImage {
+            image: DynamicImage::new_rgb8(8, 6),
+            source_kind,
+        }
+    }
+
+    fn standalone_preview_defaults() -> CameraDefaults {
+        CameraDefaults {
+            crop: Some(Crop {
+                x: 2.0,
+                y: 2.0,
+                width: 4.0,
+                height: 2.0,
+            }),
+            aspect_ratio: Some(2.0),
+            canvas_width: Some(8),
+            canvas_height: Some(6),
+        }
+    }
+
+    fn standalone_preview_png(image: DynamicImage) -> String {
+        let mut bytes = Cursor::new(Vec::new());
+        image.write_to(&mut bytes, ImageFormat::Png).unwrap();
+        general_purpose::STANDARD.encode(bytes.into_inner())
+    }
+
+    #[test]
+    fn standalone_preview_request_tracks_omitted_and_explicit_adjustments() {
+        let omitted: GeneratePreviewRequest =
+            serde_json::from_value(json!({ "path": "image.raf" })).unwrap();
+        assert_eq!(omitted.path, "image.raf");
+        assert_eq!(omitted.js_adjustments, None);
+
+        let explicit: GeneratePreviewRequest = serde_json::from_value(json!({
+            "path": "image.raf",
+            "jsAdjustments": { "crop": null },
+        }))
+        .unwrap();
+        assert_eq!(explicit.js_adjustments, Some(json!({ "crop": null })));
+    }
+
+    #[test]
+    fn standalone_preview_omitted_developed_raw_uses_camera_crop() {
+        let loaded = standalone_preview_loaded(ImageSourceKind::DevelopedRaw);
+        let render =
+            prepare_standalone_preview(&Value::Null, None, &loaded, &standalone_preview_defaults());
+
+        assert_eq!(
+            render.effective_adjustments,
+            json!({
+                "crop": { "x": 2.0, "y": 2.0, "width": 4.0, "height": 2.0 },
+                "aspectRatio": 2.0,
+            })
+        );
+        assert_eq!(render.source_kind, ImageSourceKind::DevelopedRaw);
+        assert!(render.persisted_is_null);
+
+        let (image, crop_offset) = render_standalone_preview_geometry(&loaded, &render);
+        assert_eq!(image.dimensions(), (4, 2));
+        assert_eq!(crop_offset, (2.0, 2.0));
+    }
+
+    #[test]
+    fn standalone_preview_omitted_embedded_preview_stays_full_frame() {
+        let loaded = standalone_preview_loaded(ImageSourceKind::EmbeddedPreview);
+        let render =
+            prepare_standalone_preview(&Value::Null, None, &loaded, &standalone_preview_defaults());
+
+        assert_eq!(render.effective_adjustments, Value::Null);
+        assert_eq!(render.source_kind, ImageSourceKind::EmbeddedPreview);
+        assert!(render.persisted_is_null);
+
+        let (image, crop_offset) = render_standalone_preview_geometry(&loaded, &render);
+        assert_eq!(image.dimensions(), (8, 6));
+        assert_eq!(crop_offset, (0.0, 0.0));
+    }
+
+    #[test]
+    fn standalone_preview_transform_free_geometry_borrows_loaded_image() {
+        let full_frame = standalone_preview_loaded(ImageSourceKind::NonRaw);
+        let full_frame_render = prepare_standalone_preview(
+            &Value::Null,
+            None,
+            &full_frame,
+            &standalone_preview_defaults(),
+        );
+        let (full_frame_image, full_frame_offset) =
+            render_standalone_preview_geometry(&full_frame, &full_frame_render);
+
+        assert!(matches!(&full_frame_image, Cow::Borrowed(_)));
+        assert_eq!(full_frame_image.dimensions(), (8, 6));
+        assert_eq!(full_frame_offset, (0.0, 0.0));
+
+        let cropped = standalone_preview_loaded(ImageSourceKind::DevelopedRaw);
+        let cropped_render = prepare_standalone_preview(
+            &Value::Null,
+            None,
+            &cropped,
+            &standalone_preview_defaults(),
+        );
+        let (cropped_image, cropped_offset) =
+            render_standalone_preview_geometry(&cropped, &cropped_render);
+
+        assert!(matches!(&cropped_image, Cow::Owned(_)));
+        assert_eq!(cropped_image.dimensions(), (4, 2));
+        assert_eq!(cropped_offset, (2.0, 2.0));
+    }
+
+    #[test]
+    fn standalone_preview_embedded_raf_uses_raw_gpu_format() {
+        let cases = [
+            ("image.raf", ImageSourceKind::EmbeddedPreview, 1),
+            ("image.jpg", ImageSourceKind::NonRaw, 0),
+        ];
+
+        for (path, source_kind, expected_is_raw) in cases {
+            let loaded = standalone_preview_loaded(source_kind);
+            let render = prepare_standalone_preview(
+                &Value::Null,
+                None,
+                &loaded,
+                &standalone_preview_defaults(),
+            );
+            let is_raw = standalone_preview_gpu_is_raw(path);
+            let gpu_adjustments = standalone_preview_gpu_adjustments(&render, is_raw, None);
+
+            assert_eq!(
+                gpu_adjustments.global.is_raw_image, expected_is_raw,
+                "GPU format policy must follow the source file format for {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_preview_camera_defaults_load_only_for_null_developed_raw() {
+        let null = Value::Null;
+        let explicit_empty = json!({});
+        let persisted_object = json!({ "exposure": 0.5 });
+        let cases = [
+            (
+                "image.raf",
+                &null,
+                None,
+                ImageSourceKind::DevelopedRaw,
+                true,
+            ),
+            (
+                "image.raf",
+                &null,
+                Some(&explicit_empty),
+                ImageSourceKind::DevelopedRaw,
+                false,
+            ),
+            (
+                "image.raf",
+                &null,
+                None,
+                ImageSourceKind::EmbeddedPreview,
+                false,
+            ),
+            ("image.jpg", &null, None, ImageSourceKind::NonRaw, false),
+            (
+                "image.raf",
+                &persisted_object,
+                None,
+                ImageSourceKind::DevelopedRaw,
+                false,
+            ),
+        ];
+
+        for (path, persisted, explicit, source_kind, should_load) in cases {
+            let loaded = standalone_preview_loaded(source_kind);
+            let calls = std::cell::Cell::new(0);
+            let sentinel = standalone_preview_defaults();
+            let defaults = standalone_preview_camera_defaults_with(
+                std::path::Path::new(path),
+                persisted,
+                explicit,
+                &loaded,
+                |extracted_path| {
+                    calls.set(calls.get() + 1);
+                    assert_eq!(extracted_path, std::path::Path::new(path));
+                    sentinel.clone()
+                },
+            );
+
+            assert_eq!(calls.get(), usize::from(should_load), "path: {path}");
+            assert_eq!(
+                defaults,
+                if should_load {
+                    sentinel
+                } else {
+                    CameraDefaults::default()
+                },
+                "path: {path}"
+            );
+        }
+    }
+
+    #[test]
+    fn standalone_preview_explicit_values_win_and_track_null_provenance() {
+        let loaded = standalone_preview_loaded(ImageSourceKind::DevelopedRaw);
+        for explicit in [json!({}), json!({ "crop": null })] {
+            let render = prepare_standalone_preview(
+                &Value::Null,
+                Some(&explicit),
+                &loaded,
+                &standalone_preview_defaults(),
+            );
+
+            assert_eq!(render.effective_adjustments, explicit);
+            assert!(!render.persisted_is_null);
+            let (image, crop_offset) = render_standalone_preview_geometry(&loaded, &render);
+            assert_eq!(image.dimensions(), (8, 6));
+            assert_eq!(crop_offset, (0.0, 0.0));
+        }
+    }
+
+    #[test]
+    fn standalone_preview_downstream_uses_resolved_effective_value() {
+        let patch_color = standalone_preview_png(DynamicImage::ImageRgb8(RgbImage::from_pixel(
+            8,
+            6,
+            Rgb([255, 0, 0]),
+        )));
+        let patch_mask = standalone_preview_png(DynamicImage::ImageLuma8(GrayImage::from_pixel(
+            8,
+            6,
+            Luma([255]),
+        )));
+        let explicit = json!({
+            "aiPatches": [{
+                "id": "patch-1",
+                "name": "Patch 1",
+                "visible": true,
+                "invert": false,
+                "subMasks": [],
+                "patchData": {
+                    "color": patch_color,
+                    "mask": patch_mask,
+                    "isSrgbEncoded": false,
+                },
+            }],
+            "crop": { "x": 2.0, "y": 2.0, "width": 4.0, "height": 2.0 },
+            "exposure": 0.8,
+            "lutPath": "example.cube",
+            "masks": [{
+                "id": "mask-1",
+                "name": "Mask 1",
+                "visible": true,
+                "invert": false,
+                "opacity": 100.0,
+                "adjustments": {},
+                "subMasks": [],
+            }],
+            "transformScale": 100.0,
+        });
+        let persisted = Value::Null;
+        let loaded = crate::image_loader::load_and_composite_with_metadata_using(
+            || {
+                Ok(LoadedBaseImage {
+                    image: DynamicImage::ImageRgb8(RgbImage::from_pixel(8, 6, Rgb([0, 0, 0]))),
+                    source_kind: ImageSourceKind::DevelopedRaw,
+                })
+            },
+            winning_standalone_preview_adjustments(&persisted, Some(&explicit)),
+        )
+        .unwrap();
+        let render = prepare_standalone_preview(
+            &persisted,
+            Some(&explicit),
+            &loaded,
+            &standalone_preview_defaults(),
+        );
+        assert_eq!(
+            winning_standalone_preview_adjustments(&persisted, Some(&explicit)),
+            &render.effective_adjustments
+        );
+        assert_eq!(loaded.source_kind, ImageSourceKind::DevelopedRaw);
+        assert_eq!(
+            loaded.image.to_rgba32f().get_pixel(0, 0).0,
+            [1.0, 0.0, 0.0, 1.0]
+        );
+
+        let (image, crop_offset) = render_standalone_preview_geometry(&loaded, &render);
+        let masks = standalone_preview_mask_definitions(&render);
+        let gpu_hash = standalone_preview_full_job_hash("image.raf", &render);
+        let gpu_adjustments = standalone_preview_gpu_adjustments(&render, true, None);
+
+        assert_eq!(image.dimensions(), (4, 2));
+        assert_eq!(crop_offset, (2.0, 2.0));
+        assert_eq!(masks.len(), 1);
+        assert_eq!(masks[0].id, "mask-1");
+        assert_eq!(
+            gpu_hash,
+            calculate_full_job_hash("image.raf", &render.effective_adjustments)
+        );
+        assert_eq!(gpu_adjustments.global.exposure, 1.0);
+        assert_eq!(gpu_adjustments.mask_count, 1);
+        assert_eq!(render.effective_adjustments["lutPath"], "example.cube");
+    }
+}
+
 #[tauri::command]
 async fn generate_preview_for_path(
-    path: String,
-    js_adjustments: Value,
+    request: GeneratePreviewRequest,
     app_handle: tauri::AppHandle,
 ) -> Result<Response, String> {
     tokio::task::spawn_blocking(move || {
         let state = app_handle.state::<AppState>();
         let context = get_or_init_gpu_context(&state, &app_handle)?;
-        let (source_path, _) = parse_virtual_path(&path);
+        let (source_path, sidecar_path) = parse_virtual_path(&request.path);
         let source_path_str = source_path.to_string_lossy().to_string();
-        let is_raw = is_raw_file(&source_path_str);
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
+        let persisted_adjustments = exif_processing::load_sidecar(&sidecar_path).adjustments;
+        let composite_adjustments = winning_standalone_preview_adjustments(
+            &persisted_adjustments,
+            request.js_adjustments.as_ref(),
+        );
 
-        let base_image = match read_file_mapped(&source_path) {
-            Ok(mmap) => load_and_composite(
+        let loaded = match read_file_mapped(&source_path) {
+            Ok(mmap) => load_and_composite_with_metadata(
                 &mmap,
                 &source_path_str,
-                &js_adjustments,
+                composite_adjustments,
                 false,
                 &settings,
                 None,
@@ -1542,10 +1945,10 @@ async fn generate_preview_for_path(
                     e
                 );
                 let bytes = fs::read(&source_path).map_err(|io_err| io_err.to_string())?;
-                load_and_composite(
+                load_and_composite_with_metadata(
                     &bytes,
                     &source_path_str,
-                    &js_adjustments,
+                    composite_adjustments,
                     false,
                     &settings,
                     None,
@@ -1554,16 +1957,27 @@ async fn generate_preview_for_path(
             }
         };
 
+        let defaults = standalone_preview_camera_defaults_with(
+            &source_path,
+            &persisted_adjustments,
+            request.js_adjustments.as_ref(),
+            &loaded,
+            camera_defaults_for_path,
+        );
+        let render = prepare_standalone_preview(
+            &persisted_adjustments,
+            request.js_adjustments.as_ref(),
+            &loaded,
+            &defaults,
+        );
+        let downstream_adjustments = &render.effective_adjustments;
         let (transformed_image, unscaled_crop_offset) =
-            apply_all_transformations(Cow::Borrowed(&base_image), &js_adjustments);
+            render_standalone_preview_geometry(&loaded, &render);
         let (img_w, img_h) = transformed_image.dimensions();
-        let mask_definitions: Vec<MaskDefinition> = js_adjustments
-            .get("masks")
-            .and_then(|m| serde_json::from_value(m.clone()).ok())
-            .unwrap_or_default();
+        let mask_definitions = standalone_preview_mask_definitions(&render);
 
         let warped_image =
-            resolve_warped_image_for_masks(&state, &js_adjustments, &mask_definitions);
+            resolve_warped_image_for_masks(&state, downstream_adjustments, &mask_definitions);
         let mask_bitmaps: Vec<ImageBuffer<Luma<u8>, Vec<u8>>> = mask_definitions
             .iter()
             .filter_map(|def| {
@@ -1578,11 +1992,12 @@ async fn generate_preview_for_path(
             })
             .collect();
 
+        let is_raw = standalone_preview_gpu_is_raw(&source_path_str);
         let tm_override = resolve_tonemapper_override(&settings, is_raw);
-        let all_adjustments = get_all_adjustments_from_json(&js_adjustments, is_raw, tm_override);
-        let lut_path = js_adjustments["lutPath"].as_str();
+        let all_adjustments = standalone_preview_gpu_adjustments(&render, is_raw, tm_override);
+        let lut_path = downstream_adjustments["lutPath"].as_str();
         let lut = lut_path.and_then(|p| lut_processing::get_or_load_lut(&state, p).ok());
-        let unique_hash = calculate_full_job_hash(&source_path_str, &js_adjustments);
+        let unique_hash = standalone_preview_full_job_hash(&source_path_str, &render);
 
         let final_image = process_and_get_dynamic_image(
             &context,

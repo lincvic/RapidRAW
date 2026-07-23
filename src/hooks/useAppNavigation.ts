@@ -231,6 +231,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           metadata: null,
           originalUrl: null,
           path,
+          sourceKind: null,
           thumbnailUrl: useProcessStore.getState().thumbnails[path],
           width: 0,
         },

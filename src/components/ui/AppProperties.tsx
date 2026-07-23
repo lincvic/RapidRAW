@@ -1,6 +1,7 @@
 import { ExportPreset } from './ExportImportProperties';
 import { Adjustments, CopyPasteSettings } from '../../utils/adjustments';
 import { ToolType } from '../panel/right/Masks';
+import type { ImageSourceKind } from '../../types/imageLoading';
 
 export const GLOBAL_KEYS = [
   ' ',
@@ -304,6 +305,7 @@ export interface SelectedImage {
   original_base64?: string;
   originalUrl: string | null;
   path: string;
+  sourceKind: ImageSourceKind | null;
   thumbnailUrl: string;
   width: number;
 }

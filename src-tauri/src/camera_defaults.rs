@@ -1,4 +1,7 @@
-use crate::image_processing::Crop;
+use crate::{
+    formats::is_raw_file,
+    image_processing::{Crop, ImageMetadata},
+};
 use rawler::{
     Orientation,
     decoders::{RawDecodeParams, RawMetadata},
@@ -24,6 +27,14 @@ pub struct CameraDefaults {
     pub aspect_ratio: Option<f64>,
     pub canvas_width: Option<u32>,
     pub canvas_height: Option<u32>,
+}
+
+#[derive(Clone, Debug, Serialize)]
+pub struct LoadMetadataResult {
+    #[serde(flatten)]
+    pub metadata: ImageMetadata,
+    #[serde(rename = "cameraDefaults")]
+    pub camera_defaults: CameraDefaults,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -240,16 +251,29 @@ pub fn camera_defaults_for_path(path: &Path) -> CameraDefaults {
     })
 }
 
+pub fn metadata_result_for_path(metadata: ImageMetadata, source_path: &Path) -> LoadMetadataResult {
+    let camera_defaults = if is_raw_file(source_path) {
+        camera_defaults_for_path(source_path)
+    } else {
+        CameraDefaults::default()
+    };
+    LoadMetadataResult {
+        metadata,
+        camera_defaults,
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::image_processing::Crop;
+    use crate::image_processing::{Crop, ImageMetadata};
     use rawler::{
         Orientation,
         decoders::{RawCameraCrop, RawMetadata},
         imgop::{Dim2, Point, Rect},
     };
     use serde_json::{Value, json};
+    use std::collections::HashMap;
 
     fn crop(x: f64, y: f64, width: f64, height: f64) -> Crop {
         Crop {
@@ -584,6 +608,64 @@ mod tests {
         assert_eq!(
             serde_json::to_value(ImageSourceKind::NonRaw).unwrap(),
             json!("non_raw")
+        );
+    }
+
+    #[test]
+    fn load_metadata_response_is_flattened() {
+        let metadata = ImageMetadata {
+            adjustments: Value::Null,
+            ..ImageMetadata::default()
+        };
+        let response = LoadMetadataResult {
+            metadata,
+            camera_defaults: CameraDefaults {
+                canvas_width: Some(200),
+                ..CameraDefaults::default()
+            },
+        };
+        let value = serde_json::to_value(response).unwrap();
+        assert!(value["adjustments"].is_null());
+        assert_eq!(value["cameraDefaults"]["canvasWidth"], 200);
+        assert!(value.get("metadata").is_none());
+    }
+
+    #[test]
+    fn metadata_advisory_failure_preserves_sidecar_fields() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_raw = temp.path().join("missing.RAF");
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: json!({}),
+            tags: Some(vec!["keep-me".into()]),
+            exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+        };
+        let value = serde_json::to_value(metadata_result_for_path(metadata, &missing_raw)).unwrap();
+        assert_eq!(value["version"], 7);
+        assert_eq!(value["rating"], 4);
+        assert_eq!(value["adjustments"], json!({}));
+        assert_eq!(value["tags"], json!(["keep-me"]));
+        assert_eq!(value["exif"]["Model"], "GFX100RF");
+        assert_eq!(
+            value["cameraDefaults"],
+            serde_json::to_value(CameraDefaults::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn metadata_advisory_failure_preserves_literal_null() {
+        let temp = tempfile::tempdir().unwrap();
+        let missing_raw = temp.path().join("missing.RAF");
+        let metadata = ImageMetadata {
+            adjustments: Value::Null,
+            ..ImageMetadata::default()
+        };
+        let value = serde_json::to_value(metadata_result_for_path(metadata, &missing_raw)).unwrap();
+        assert!(value["adjustments"].is_null());
+        assert_eq!(
+            value["cameraDefaults"],
+            serde_json::to_value(CameraDefaults::default()).unwrap()
         );
     }
 

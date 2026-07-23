@@ -74,6 +74,7 @@ dependencies = [
  "webkit2gtk",
  "webp",
  "wgpu",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

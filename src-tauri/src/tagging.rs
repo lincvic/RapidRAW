@@ -17,7 +17,6 @@ use walkdir::WalkDir;
 use crate::file_management::{self, parse_virtual_path};
 use crate::formats::is_supported_image_file;
 use crate::hierarchy::TAG_HIERARCHY;
-use crate::image_processing::ImageMetadata;
 use crate::{AppState, candidates::TAG_CANDIDATES};
 
 pub const COLOR_TAG_PREFIX: &str = "color:";
@@ -332,7 +331,7 @@ pub async fn start_background_indexing(
                     let path_str = path.to_string_lossy().to_string();
                     let (_, sidecar_path) = parse_virtual_path(&path_str);
 
-                    let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
+                    let metadata = crate::exif_processing::load_sidecar(&sidecar_path);
 
                     let should_generate_tags = match &metadata.tags {
                         None => true,
@@ -357,23 +356,23 @@ pub async fn start_background_indexing(
                                 ) {
                                     println!("Found AI tags for {}: {:?}", path_str, ai_tags);
 
-                                    let mut existing_tags: HashSet<String> =
-                                        metadata.tags.unwrap_or_default().into_iter().collect();
-
-                                    for tag in ai_tags {
-                                        existing_tags.insert(tag);
-                                    }
-
-                                    let mut final_tags: Vec<String> =
-                                        existing_tags.into_iter().collect();
-                                    final_tags.sort_unstable();
-
-                                    metadata.tags = Some(final_tags);
-
-                                    if let Ok(json_string) = serde_json::to_string_pretty(&metadata)
-                                    {
-                                        let _ = fs::write(sidecar_path, json_string);
-                                    }
+                                    let _ = crate::exif_processing::update_sidecar(
+                                        &sidecar_path,
+                                        |metadata| {
+                                            let mut existing_tags: HashSet<String> = metadata
+                                                .tags
+                                                .take()
+                                                .unwrap_or_default()
+                                                .into_iter()
+                                                .collect();
+                                            existing_tags.extend(ai_tags);
+                                            let mut final_tags =
+                                                existing_tags.into_iter().collect::<Vec<_>>();
+                                            final_tags.sort_unstable();
+                                            metadata.tags = Some(final_tags);
+                                            Ok(())
+                                        },
+                                    );
                                 }
                             }
                             Err(e) => {
@@ -419,22 +418,16 @@ fn modify_tags_for_path(
 ) -> Result<(), String> {
     let (_, sidecar_path) = parse_virtual_path(path_str);
 
-    let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-    let mut tags = metadata.tags.unwrap_or_default();
-    modify_fn(&mut tags);
-
-    tags.sort_unstable();
-    tags.dedup();
-
-    if tags.is_empty() {
-        metadata.tags = None;
-    } else {
-        metadata.tags = Some(tags);
-    }
-
-    let json_string = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
-    fs::write(sidecar_path, json_string).map_err(|e| e.to_string())
+    crate::exif_processing::update_sidecar(&sidecar_path, |metadata| {
+        let mut tags = metadata.tags.take().unwrap_or_default();
+        modify_fn(&mut tags);
+        tags.sort_unstable();
+        tags.dedup();
+        metadata.tags = (!tags.is_empty()).then_some(tags);
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|error| error.to_string())
 }
 
 #[tauri::command]
@@ -476,27 +469,24 @@ pub fn clear_ai_tags(root_path: String) -> Result<usize, String> {
 
     for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file()
-            && path.extension().and_then(|s| s.to_str()) == Some("rrdata")
-            && let Ok(content) = fs::read_to_string(path)
-            && let Ok(mut metadata) = serde_json::from_str::<ImageMetadata>(&content)
-            && let Some(tags) = &mut metadata.tags
-        {
-            let original_len = tags.len();
-            // Keep color tags and user tags, remove others (AI tags)
-            tags.retain(|tag| {
-                tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX)
-            });
-
-            if tags.len() < original_len {
-                if tags.is_empty() {
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rrdata") {
+            let mut changed = false;
+            let result = crate::exif_processing::update_sidecar_if(path, |metadata| {
+                let Some(tags) = &mut metadata.tags else {
+                    return Ok(false);
+                };
+                let original_len = tags.len();
+                tags.retain(|tag| {
+                    tag.starts_with(COLOR_TAG_PREFIX) || tag.starts_with(USER_TAG_PREFIX)
+                });
+                changed = tags.len() < original_len;
+                if changed && tags.is_empty() {
                     metadata.tags = None;
                 }
-                if let Ok(json_string) = serde_json::to_string_pretty(&metadata)
-                    && fs::write(path, json_string).is_ok()
-                {
-                    updated_count += 1;
-                }
+                Ok(changed)
+            });
+            if changed && result.is_ok() {
+                updated_count += 1;
             }
         }
     }
@@ -514,25 +504,22 @@ pub fn clear_all_tags(root_path: String) -> Result<usize, String> {
 
     for entry in walker.filter_map(|e| e.ok()) {
         let path = entry.path();
-        if path.is_file()
-            && path.extension().and_then(|s| s.to_str()) == Some("rrdata")
-            && let Ok(content) = fs::read_to_string(path)
-            && let Ok(mut metadata) = serde_json::from_str::<ImageMetadata>(&content)
-            && let Some(tags) = &mut metadata.tags
-        {
-            let original_len = tags.len();
-            // Keep only color tags, remove AI and user tags
-            tags.retain(|tag| tag.starts_with(COLOR_TAG_PREFIX));
-
-            if tags.len() < original_len {
-                if tags.is_empty() {
+        if path.is_file() && path.extension().and_then(|s| s.to_str()) == Some("rrdata") {
+            let mut changed = false;
+            let result = crate::exif_processing::update_sidecar_if(path, |metadata| {
+                let Some(tags) = &mut metadata.tags else {
+                    return Ok(false);
+                };
+                let original_len = tags.len();
+                tags.retain(|tag| tag.starts_with(COLOR_TAG_PREFIX));
+                changed = tags.len() < original_len;
+                if changed && tags.is_empty() {
                     metadata.tags = None;
                 }
-                if let Ok(json_string) = serde_json::to_string_pretty(&metadata)
-                    && fs::write(path, json_string).is_ok()
-                {
-                    updated_count += 1;
-                }
+                Ok(changed)
+            });
+            if changed && result.is_ok() {
+                updated_count += 1;
             }
         }
     }

@@ -36,6 +36,7 @@ mod preset_converter;
 #[cfg(test)]
 mod raf_fixture_tests;
 mod raw_processing;
+mod sidecar_io;
 mod tagging;
 mod tagging_utils;
 mod window_customizer;

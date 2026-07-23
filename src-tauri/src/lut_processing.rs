@@ -4,10 +4,10 @@ use crate::android_integration::{
     resolve_android_content_uri_name,
 };
 use anyhow::anyhow;
-use image::{DynamicImage, GenericImageView, Rgb, Rgb32FImage};
+use image::{DynamicImage, GenericImageView, ImageReader, Limits, Rgb, Rgb32FImage};
 use serde::Serialize;
 use std::fs::{copy, create_dir_all, read_dir};
-use std::io::{BufRead, BufReader, Cursor};
+use std::io::{BufRead, BufReader, Cursor, Read};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 
@@ -21,6 +21,15 @@ use crate::image_processing::{
     RenderRequest, get_all_adjustments_from_json, process_and_get_dynamic_image,
     resolve_tonemapper_override_from_handle,
 };
+
+const MAX_LUT_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+const MAX_LUT_EDGE: u32 = 65;
+const LUT_CHANNELS: usize = 3;
+const MAX_LUT_ENTRIES: usize =
+    (MAX_LUT_EDGE as usize) * (MAX_LUT_EDGE as usize) * (MAX_LUT_EDGE as usize);
+const MAX_LUT_VALUES: usize = MAX_LUT_ENTRIES * LUT_CHANNELS;
+// floor(sqrt(65^3)); valid square HALD images top out at 512x512 (edge 64).
+const MAX_HALD_IMAGE_DIMENSION: u32 = 524;
 
 #[derive(Debug, Clone)]
 pub struct Lut {
@@ -146,6 +155,7 @@ fn import_android_lut(source: &str) -> anyhow::Result<()> {
         .to_lowercase();
     let bytes = read_android_content_uri(source)
         .map_err(|e| anyhow!("Failed to read content URI: {}", e))?;
+    validate_lut_snapshot_size(bytes.len() as u64)?;
 
     let cache_path = get_android_cached_lut_path(source, &extension)?;
     let cache_dir = cache_path
@@ -157,8 +167,71 @@ fn import_android_lut(source: &str) -> anyhow::Result<()> {
     Ok(())
 }
 
+fn validate_lut_snapshot_size(byte_len: u64) -> anyhow::Result<()> {
+    if byte_len > MAX_LUT_SNAPSHOT_BYTES as u64 {
+        return Err(anyhow!(
+            "LUT snapshot is {} bytes; the maximum allowed size is 32 MiB ({} bytes)",
+            byte_len,
+            MAX_LUT_SNAPSHOT_BYTES
+        ));
+    }
+    Ok(())
+}
+
+fn checked_lut_counts(edge: u32, format: &str) -> anyhow::Result<(usize, usize)> {
+    if edge == 0 {
+        return Err(anyhow!("{} LUT edge must be at least 1", format));
+    }
+    if edge > MAX_LUT_EDGE {
+        return Err(anyhow!(
+            "{} LUT edge {} is unsupported; the maximum supported edge is {}",
+            format,
+            edge,
+            MAX_LUT_EDGE
+        ));
+    }
+
+    let edge = usize::try_from(edge)
+        .map_err(|_| anyhow!("{} LUT edge cannot be represented on this platform", format))?;
+    let entries = edge
+        .checked_mul(edge)
+        .and_then(|count| count.checked_mul(edge))
+        .ok_or_else(|| anyhow!("{} LUT entry count overflowed", format))?;
+    let values = entries
+        .checked_mul(LUT_CHANNELS)
+        .ok_or_else(|| anyhow!("{} LUT value count overflowed", format))?;
+    Ok((entries, values))
+}
+
+fn reserve_lut_triplet(
+    data: &mut Vec<f32>,
+    maximum_values: usize,
+    format: &str,
+) -> anyhow::Result<()> {
+    let required = data
+        .len()
+        .checked_add(LUT_CHANNELS)
+        .ok_or_else(|| anyhow!("{} LUT value count overflowed", format))?;
+    if required > maximum_values {
+        return Err(anyhow!("{} LUT contains more data than allowed", format));
+    }
+
+    if required > data.capacity() {
+        let target_capacity = data
+            .capacity()
+            .checked_mul(2)
+            .unwrap_or(maximum_values)
+            .max(required)
+            .min(maximum_values);
+        data.try_reserve_exact(target_capacity - data.len())
+            .map_err(|error| anyhow!("Failed to allocate {} LUT table: {}", format, error))?;
+    }
+    Ok(())
+}
+
 fn parse_cube(reader: impl BufRead) -> anyhow::Result<Lut> {
     let mut size: Option<u32> = None;
+    let mut expected_values: Option<usize> = None;
     let mut data: Vec<f32> = Vec::new();
     let mut line_num = 0;
 
@@ -187,17 +260,27 @@ fn parse_cube(reader: impl BufRead) -> anyhow::Result<Lut> {
                         line
                     ));
                 }
-                size = Some(parts[1].parse().map_err(|e| {
+                let parsed_size = parts[1].parse().map_err(|e| {
                     anyhow!(
                         "Failed to parse LUT_3D_SIZE on line {}: '{}'. Error: {}",
                         line_num,
                         line,
                         e
                     )
-                })?);
+                })?;
+                let (_, parsed_values) = checked_lut_counts(parsed_size, ".cube")?;
+                if data.len() > parsed_values {
+                    return Err(anyhow!(
+                        ".cube LUT already contains {} values, which exceeds the declared edge {}",
+                        data.len(),
+                        parsed_size
+                    ));
+                }
+                size = Some(parsed_size);
+                expected_values = Some(parsed_values);
             }
             _ => {
-                if size.is_some() {
+                if let Some(maximum_values) = expected_values {
                     if parts.len() < 3 {
                         return Err(anyhow!(
                             "Invalid data line on line {}: '{}'. Expected 3 float values, found {}",
@@ -206,6 +289,13 @@ fn parse_cube(reader: impl BufRead) -> anyhow::Result<Lut> {
                             parts.len()
                         ));
                     }
+                    if data.len() == maximum_values {
+                        return Err(anyhow!(
+                            ".cube LUT contains more data than declared for edge {}",
+                            size.unwrap_or_default()
+                        ));
+                    }
+                    reserve_lut_triplet(&mut data, maximum_values, ".cube")?;
                     let r: f32 = parts[0].parse().map_err(|e| {
                         anyhow!(
                             "Failed to parse R value on line {}: '{}'. Error: {}",
@@ -239,7 +329,8 @@ fn parse_cube(reader: impl BufRead) -> anyhow::Result<Lut> {
     }
 
     let lut_size = size.ok_or(anyhow!("LUT_3D_SIZE not found in .cube file"))?;
-    let expected_len = (lut_size * lut_size * lut_size * 3) as usize;
+    let expected_len = expected_values
+        .ok_or_else(|| anyhow!("LUT_3D_SIZE did not produce a valid .cube table size"))?;
     if data.len() != expected_len {
         return Err(anyhow!(
             "LUT data size mismatch. Expected {} float values (for size {}), but found {}. The file may be corrupt or incomplete.",
@@ -266,6 +357,14 @@ fn parse_3dl(reader: impl BufRead) -> anyhow::Result<Lut> {
         }
         let parts: Vec<&str> = trimmed.split_whitespace().collect();
         if parts.len() == 3 {
+            if data.len() == MAX_LUT_VALUES {
+                return Err(anyhow!(
+                    "3DL LUT has more than {} entries; the maximum supported edge is {}",
+                    MAX_LUT_ENTRIES,
+                    MAX_LUT_EDGE
+                ));
+            }
+            reserve_lut_triplet(&mut data, MAX_LUT_VALUES, "3DL")?;
             let r: f32 = parts[0].parse()?;
             let g: f32 = parts[1].parse()?;
             let b: f32 = parts[2].parse()?;
@@ -280,20 +379,30 @@ fn parse_3dl(reader: impl BufRead) -> anyhow::Result<Lut> {
         return Err(anyhow!("No data found in 3DL file"));
     }
     let num_entries = total_values / 3;
-    let size = (num_entries as f64).cbrt().round() as u32;
-
-    if size * size * size != num_entries as u32 {
-        return Err(anyhow!(
-            "Invalid 3DL LUT data size: the number of entries ({}) is not a perfect cube.",
-            num_entries
-        ));
-    }
+    let size = (1..=MAX_LUT_EDGE)
+        .find(|candidate| {
+            let edge = *candidate as usize;
+            edge * edge * edge == num_entries
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Invalid 3DL LUT data size: the number of entries ({}) is not a perfect cube.",
+                num_entries
+            )
+        })?;
 
     Ok(Lut { size, data })
 }
 
 fn parse_hald(image: DynamicImage) -> anyhow::Result<Lut> {
     let (width, height) = image.dimensions();
+    if width == 0 || height == 0 {
+        return Err(anyhow!(
+            "HALD image dimensions must be non-zero, found {}x{}",
+            width,
+            height
+        ));
+    }
     if width != height {
         return Err(anyhow!(
             "HALD image must be square, but dimensions are {}x{}",
@@ -302,18 +411,36 @@ fn parse_hald(image: DynamicImage) -> anyhow::Result<Lut> {
         ));
     }
 
-    let total_pixels = width * height;
-    let size = (total_pixels as f64).cbrt().round() as u32;
-
-    if size * size * size != total_pixels {
+    let total_pixels = u64::from(width)
+        .checked_mul(u64::from(height))
+        .ok_or_else(|| anyhow!("HALD image pixel count overflowed"))?;
+    if total_pixels > MAX_LUT_ENTRIES as u64 {
         return Err(anyhow!(
-            "Invalid HALD image dimensions: total pixels ({}) is not a perfect cube.",
-            total_pixels
+            "HALD image has {} pixels; the maximum supported LUT edge is {} ({} pixels)",
+            total_pixels,
+            MAX_LUT_EDGE,
+            MAX_LUT_ENTRIES
         ));
     }
+    let total_pixels = usize::try_from(total_pixels)
+        .map_err(|_| anyhow!("HALD image pixel count cannot be represented on this platform"))?;
+    let size = (1..=MAX_LUT_EDGE)
+        .find(|candidate| {
+            let edge = *candidate as usize;
+            edge * edge * edge == total_pixels
+        })
+        .ok_or_else(|| {
+            anyhow!(
+                "Invalid HALD image dimensions: total pixels ({}) is not a perfect cube.",
+                total_pixels
+            )
+        })?;
+    let (_, value_count) = checked_lut_counts(size, "HALD")?;
 
-    let mut data = Vec::with_capacity((total_pixels * 3) as usize);
     let rgb_image = image.to_rgb8();
+    let mut data = Vec::new();
+    data.try_reserve_exact(value_count)
+        .map_err(|error| anyhow!("Failed to allocate HALD LUT table: {}", error))?;
 
     for pixel in rgb_image.pixels() {
         data.push(pixel[0] as f32 / 255.0);
@@ -378,9 +505,65 @@ fn parse_lut_bytes(extension: &str, bytes: &[u8]) -> anyhow::Result<Lut> {
     match extension {
         "cube" => parse_cube(BufReader::new(Cursor::new(bytes))),
         "3dl" => parse_3dl(BufReader::new(Cursor::new(bytes))),
-        "png" | "jpg" | "jpeg" | "tiff" => parse_hald(image::load_from_memory(bytes)?),
+        "png" | "jpg" | "jpeg" | "tiff" => {
+            let mut reader = ImageReader::new(Cursor::new(bytes)).with_guessed_format()?;
+            let mut limits = Limits::default();
+            limits.max_image_width = Some(MAX_HALD_IMAGE_DIMENSION);
+            limits.max_image_height = Some(MAX_HALD_IMAGE_DIMENSION);
+            limits.max_alloc = Some(MAX_LUT_SNAPSHOT_BYTES as u64);
+            reader.limits(limits);
+            let image = reader.decode().map_err(|error| {
+                anyhow!(
+                    "Failed to decode HALD LUT; the maximum supported HALD dimension is {}x{} and decoder allocation is limited to 32 MiB: {}",
+                    MAX_HALD_IMAGE_DIMENSION,
+                    MAX_HALD_IMAGE_DIMENSION,
+                    error
+                )
+            })?;
+            parse_hald(image)
+        }
         _ => Err(anyhow!("Unsupported LUT file format: {}", extension)),
     }
+}
+
+fn read_lut_file_bounded(path: &str) -> anyhow::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    let metadata_len = file.metadata()?.len();
+    validate_lut_snapshot_size(metadata_len)?;
+
+    let initial_capacity = usize::try_from(metadata_len)
+        .map_err(|_| anyhow!("LUT file size cannot be represented on this platform"))?;
+    let mut bytes = Vec::new();
+    bytes
+        .try_reserve_exact(initial_capacity)
+        .map_err(|error| anyhow!("Failed to allocate LUT snapshot: {}", error))?;
+    let mut chunk = [0_u8; 8192];
+
+    while bytes.len() <= MAX_LUT_SNAPSHOT_BYTES {
+        let remaining = MAX_LUT_SNAPSHOT_BYTES + 1 - bytes.len();
+        let read_len = remaining.min(chunk.len());
+        let bytes_read = file.read(&mut chunk[..read_len])?;
+        if bytes_read == 0 {
+            break;
+        }
+        let required = bytes.len() + bytes_read;
+        if required > bytes.capacity() {
+            let maximum_capacity = MAX_LUT_SNAPSHOT_BYTES + 1;
+            let target_capacity = bytes
+                .capacity()
+                .checked_mul(2)
+                .unwrap_or(maximum_capacity)
+                .max(required)
+                .min(maximum_capacity);
+            bytes
+                .try_reserve_exact(target_capacity - bytes.len())
+                .map_err(|error| anyhow!("Failed to grow LUT snapshot: {}", error))?;
+        }
+        bytes.extend_from_slice(&chunk[..bytes_read]);
+    }
+
+    validate_lut_snapshot_size(bytes.len() as u64)?;
+    Ok(bytes)
 }
 
 pub(crate) fn load_lut_snapshot_with<F>(
@@ -394,6 +577,7 @@ where
     let extension = lut_extension(path_str);
     validate_lut_extension(&extension)?;
     let bytes = read_bytes(path_str)?;
+    validate_lut_snapshot_size(bytes.len() as u64)?;
     let content_blake3 = blake3::hash(&bytes).to_hex().to_string();
     let lut = parse_lut_bytes(&extension, &bytes)?;
 
@@ -407,10 +591,12 @@ pub(crate) fn load_lut_snapshot(path_str: &str) -> anyhow::Result<LutSnapshot> {
     load_lut_snapshot_with(path_str, |path| {
         #[cfg(target_os = "android")]
         if is_android_content_uri(path) {
-            return read_android_content_uri(path).map_err(|error| anyhow!("{}", error));
+            let bytes = read_android_content_uri(path).map_err(|error| anyhow!("{}", error))?;
+            validate_lut_snapshot_size(bytes.len() as u64)?;
+            return Ok(bytes);
         }
 
-        Ok(std::fs::read(path)?)
+        read_lut_file_bounded(path)
     })
 }
 
@@ -705,6 +891,31 @@ mod tests {
     use super::*;
     use std::fs;
 
+    const EXPECTED_MAX_LUT_SNAPSHOT_BYTES: usize = 32 * 1024 * 1024;
+    const EXPECTED_MAX_LUT_EDGE: u32 = 65;
+
+    fn constant_lut_rows(edge: u32, include_cube_header: bool) -> Vec<u8> {
+        let entries = usize::try_from(edge).unwrap().pow(3);
+        let mut bytes = if include_cube_header {
+            format!("LUT_3D_SIZE {edge}\n").into_bytes()
+        } else {
+            Vec::new()
+        };
+        bytes.reserve(entries * 6);
+        for _ in 0..entries {
+            bytes.extend_from_slice(b"0 0 0\n");
+        }
+        bytes
+    }
+
+    fn cube_declaration_error(declared_size: &str) -> String {
+        let bytes = format!("LUT_3D_SIZE {declared_size}\n");
+        std::panic::catch_unwind(|| parse_cube(BufReader::new(Cursor::new(bytes))))
+            .expect("invalid LUT dimensions must return an error instead of panicking")
+            .unwrap_err()
+            .to_string()
+    }
+
     fn test_cube(last_blue: f32) -> Vec<u8> {
         format!(
             "LUT_3D_SIZE 2\n\
@@ -739,5 +950,130 @@ mod tests {
         assert_eq!(snapshot.content_blake3, expected_digest);
         assert_eq!(snapshot.lut.data.last().copied(), Some(1.0));
         assert_eq!(fs::read(path).unwrap(), replacement_bytes);
+    }
+
+    #[test]
+    fn injected_lut_snapshot_reader_rejects_bytes_above_limit() {
+        let error = load_lut_snapshot_with("oversized.cube", |_| {
+            Ok(vec![0; EXPECTED_MAX_LUT_SNAPSHOT_BYTES + 1])
+        })
+        .unwrap_err();
+
+        assert!(
+            error.to_string().contains("32 MiB"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn desktop_lut_snapshot_rejects_oversized_sparse_file() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("oversized.cube");
+        let file = fs::File::create(&path).unwrap();
+        file.set_len((EXPECTED_MAX_LUT_SNAPSHOT_BYTES + 1) as u64)
+            .unwrap();
+        drop(file);
+
+        let error = load_lut_snapshot(path.to_str().unwrap()).unwrap_err();
+
+        assert!(
+            error.to_string().contains("32 MiB"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn cube_rejects_zero_declared_edge() {
+        let error = cube_declaration_error("0");
+
+        assert!(
+            error.contains("must be at least 1"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cube_rejects_declared_edge_above_supported_maximum() {
+        let error = cube_declaration_error("66");
+
+        assert!(
+            error.contains("maximum supported edge is 65"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cube_declared_edge_arithmetic_cannot_overflow() {
+        let error = cube_declaration_error(&u32::MAX.to_string());
+
+        assert!(
+            error.contains("maximum supported edge is 65"),
+            "unexpected error: {error}"
+        );
+    }
+
+    #[test]
+    fn cube_accepts_maximum_supported_edge() {
+        let bytes = constant_lut_rows(EXPECTED_MAX_LUT_EDGE, true);
+
+        let lut = load_lut_snapshot_with("maximum.cube", |_| Ok(bytes))
+            .unwrap()
+            .lut;
+
+        assert_eq!(lut.size, EXPECTED_MAX_LUT_EDGE);
+        assert_eq!(lut.data.len(), (EXPECTED_MAX_LUT_EDGE as usize).pow(3) * 3);
+    }
+
+    #[test]
+    fn three_dl_accepts_maximum_supported_edge() {
+        let bytes = constant_lut_rows(EXPECTED_MAX_LUT_EDGE, false);
+
+        let lut = load_lut_snapshot_with("maximum.3dl", |_| Ok(bytes))
+            .unwrap()
+            .lut;
+
+        assert_eq!(lut.size, EXPECTED_MAX_LUT_EDGE);
+        assert_eq!(lut.data.len(), (EXPECTED_MAX_LUT_EDGE as usize).pow(3) * 3);
+    }
+
+    #[test]
+    fn three_dl_rejects_entries_above_supported_maximum() {
+        let mut bytes = constant_lut_rows(EXPECTED_MAX_LUT_EDGE, false);
+        bytes.extend_from_slice(b"0 0 0\n");
+
+        let error = parse_3dl(BufReader::new(Cursor::new(bytes))).unwrap_err();
+
+        assert!(
+            error.to_string().contains("maximum supported edge is 65"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn hald_decode_rejects_dimensions_above_bounded_limit() {
+        let image = DynamicImage::new_rgb8(525, 525);
+        let mut encoded = Cursor::new(Vec::new());
+        image
+            .write_to(&mut encoded, image::ImageFormat::Png)
+            .unwrap();
+
+        let error = parse_lut_bytes("png", encoded.get_ref()).unwrap_err();
+
+        assert!(
+            error
+                .to_string()
+                .contains("maximum supported HALD dimension is 524x524"),
+            "unexpected error: {error:#}"
+        );
+    }
+
+    #[test]
+    fn hald_rejects_zero_dimensions() {
+        let error = parse_hald(DynamicImage::new_rgb8(0, 0)).unwrap_err();
+
+        assert!(
+            error.to_string().contains("dimensions must be non-zero"),
+            "unexpected error: {error:#}"
+        );
     }
 }

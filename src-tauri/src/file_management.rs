@@ -3556,6 +3556,11 @@ pub async fn apply_adjustments_to_paths(
     Ok(())
 }
 
+pub(crate) fn metadata_with_reset_adjustments(mut metadata: ImageMetadata) -> ImageMetadata {
+    metadata.adjustments = Value::Null;
+    metadata
+}
+
 #[tauri::command]
 pub async fn reset_adjustments_for_paths(
     paths: Vec<String>,
@@ -3572,9 +3577,9 @@ pub async fn reset_adjustments_for_paths(
         paths.par_iter().for_each(|path| {
             let (_, sidecar_path) = parse_virtual_path(path);
 
-            let mut existing_metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-            existing_metadata.adjustments = serde_json::json!({});
+            let existing_metadata = metadata_with_reset_adjustments(
+                crate::exif_processing::load_sidecar(&sidecar_path),
+            );
 
             if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
                 let _ = std::fs::write(&sidecar_path, json_string);
@@ -6540,5 +6545,52 @@ mod tests {
 
         assert_eq!(serde_json::to_value(result.metadata).unwrap(), expected);
         assert_eq!(result.camera_defaults, CameraDefaults::default());
+    }
+
+    #[test]
+    fn reset_metadata_restores_null_camera_default_baseline() {
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: json!({ "exposure": 1.0 }),
+            tags: Some(vec!["keep".into()]),
+            exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+        };
+
+        let reset = metadata_with_reset_adjustments(metadata);
+
+        assert!(reset.adjustments.is_null());
+        assert_eq!(reset.version, 7);
+        assert_eq!(reset.rating, 4);
+        assert_eq!(reset.tags, Some(vec!["keep".into()]));
+        assert_eq!(
+            reset
+                .exif
+                .as_ref()
+                .and_then(|exif| exif.get("Model"))
+                .map(String::as_str),
+            Some("GFX100RF")
+        );
+
+        let defaults = CameraDefaults {
+            crop: Some(Crop {
+                x: 2.0,
+                y: 2.0,
+                width: 4.0,
+                height: 2.0,
+            }),
+            aspect_ratio: Some(2.0),
+            canvas_width: Some(8),
+            canvas_height: Some(6),
+        };
+        let effective = crate::camera_defaults::effective_adjustments(
+            &reset.adjustments,
+            &defaults,
+            ImageSourceKind::DevelopedRaw,
+            8,
+            6,
+        );
+        let crop: Crop = serde_json::from_value(effective["crop"].clone()).unwrap();
+        assert_eq!(crop.width, 4.0);
     }
 }

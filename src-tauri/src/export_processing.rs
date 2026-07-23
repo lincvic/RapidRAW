@@ -15,13 +15,17 @@ use tauri::Emitter;
 use tauri::Manager;
 
 use crate::AppState;
+use crate::app_state::LoadedImage;
+use crate::camera_defaults::{
+    CameraDefaults, ImageSourceKind, ResolvedRenderInput, camera_defaults_for_path,
+};
 use crate::exif_processing;
 use crate::file_management::{
     generate_filename_from_template, parse_virtual_path, read_file_mapped,
 };
 use crate::formats::is_raw_file;
 use crate::image_loader::{
-    composite_patches_on_image, load_and_composite, load_base_image_from_bytes,
+    LoadedBaseImage, composite_patches_on_image, load_base_image_with_metadata_from_bytes,
 };
 use crate::image_processing::{
     AllAdjustments, Crop, GpuContext, RenderRequest, downscale_f32_image,
@@ -38,6 +42,233 @@ use crate::{
     apply_all_transformations, generate_transformed_preview, get_cached_or_generate_mask,
     hydrate_adjustments, load_settings, resolve_warped_image_for_masks,
 };
+
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub(crate) struct FastEstimateScale {
+    pub crop_x: f64,
+    pub crop_y: f64,
+    pub masks: f32,
+    pub output_x: f32,
+    pub output_y: f32,
+}
+
+impl FastEstimateScale {
+    fn identity() -> Self {
+        Self {
+            crop_x: 1.0,
+            crop_y: 1.0,
+            masks: 1.0,
+            output_x: 1.0,
+            output_y: 1.0,
+        }
+    }
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub(crate) enum GeometryOrigin {
+    CameraDefault,
+    PersistedFullResolution,
+    CurrentEditor,
+}
+
+#[derive(Clone, Debug)]
+pub(crate) struct PreparedEstimateInput {
+    pub render: ResolvedRenderInput,
+    pub mask_scale: f32,
+    pub output_scale: (f32, f32),
+}
+
+pub(crate) trait ExportRenderSource {
+    fn image(&self) -> &DynamicImage;
+    fn source_kind(&self) -> ImageSourceKind;
+}
+
+impl ExportRenderSource for LoadedBaseImage {
+    fn image(&self) -> &DynamicImage {
+        &self.image
+    }
+
+    fn source_kind(&self) -> ImageSourceKind {
+        self.source_kind
+    }
+}
+
+impl ExportRenderSource for LoadedImage {
+    fn image(&self) -> &DynamicImage {
+        self.image.as_ref()
+    }
+
+    fn source_kind(&self) -> ImageSourceKind {
+        self.source_kind
+    }
+}
+
+fn valid_scale_f32(scale: f32) -> f32 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+fn valid_scale_f64(scale: f64) -> f64 {
+    if scale.is_finite() && scale > 0.0 {
+        scale
+    } else {
+        1.0
+    }
+}
+
+fn current_editor_adjustments_for_path<'a>(
+    image_path: &str,
+    current_edit_path: Option<&str>,
+    current_edit_adjustments: Option<&'a Value>,
+) -> Option<&'a Value> {
+    if current_edit_path == Some(image_path) {
+        current_edit_adjustments
+    } else {
+        None
+    }
+}
+
+pub(crate) fn prepare_export_render_input<T: ExportRenderSource + ?Sized>(
+    persisted: &Value,
+    explicit: Option<&Value>,
+    defaults: &CameraDefaults,
+    loaded: &T,
+) -> ResolvedRenderInput {
+    let (width, height) = loaded.image().dimensions();
+    ResolvedRenderInput::from_dimensions(
+        explicit.unwrap_or(persisted),
+        defaults,
+        loaded.source_kind(),
+        width,
+        height,
+    )
+}
+
+fn scale_persisted_crop(adjustments: &mut Value, crop_x: f64, crop_y: f64) {
+    let Some(crop_value) = adjustments.get_mut("crop") else {
+        return;
+    };
+    let Ok(crop) = serde_json::from_value::<Crop>(crop_value.clone()) else {
+        return;
+    };
+    *crop_value = serde_json::to_value(Crop {
+        x: crop.x * crop_x,
+        y: crop.y * crop_y,
+        width: crop.width * crop_x,
+        height: crop.height * crop_y,
+    })
+    .unwrap_or(Value::Null);
+}
+
+pub(crate) fn prepare_export_estimate_input<T: ExportRenderSource + ?Sized>(
+    persisted: &Value,
+    explicit: Option<&Value>,
+    defaults: &CameraDefaults,
+    loaded: &T,
+    geometry_origin: GeometryOrigin,
+    fast_scale: FastEstimateScale,
+) -> PreparedEstimateInput {
+    prepare_export_estimate_from_render(
+        prepare_export_render_input(persisted, explicit, defaults, loaded),
+        geometry_origin,
+        fast_scale,
+    )
+}
+
+fn prepare_export_estimate_from_render(
+    mut render: ResolvedRenderInput,
+    geometry_origin: GeometryOrigin,
+    fast_scale: FastEstimateScale,
+) -> PreparedEstimateInput {
+    let crop_x = valid_scale_f64(fast_scale.crop_x);
+    let crop_y = valid_scale_f64(fast_scale.crop_y);
+    let masks = valid_scale_f32(fast_scale.masks);
+    let output_x = valid_scale_f32(fast_scale.output_x);
+    let output_y = valid_scale_f32(fast_scale.output_y);
+
+    match geometry_origin {
+        GeometryOrigin::CameraDefault => PreparedEstimateInput {
+            render,
+            mask_scale: masks,
+            output_scale: (output_x, output_y),
+        },
+        GeometryOrigin::PersistedFullResolution => {
+            scale_persisted_crop(&mut render.effective_adjustments, crop_x, crop_y);
+            PreparedEstimateInput {
+                render,
+                mask_scale: masks,
+                output_scale: (output_x, output_y),
+            }
+        }
+        GeometryOrigin::CurrentEditor => PreparedEstimateInput {
+            render,
+            mask_scale: 1.0,
+            output_scale: (1.0, 1.0),
+        },
+    }
+}
+
+pub(crate) fn render_export_geometry<'a, T: ExportRenderSource + ?Sized>(
+    loaded: &'a T,
+    render: &ResolvedRenderInput,
+) -> (Cow<'a, DynamicImage>, (f32, f32)) {
+    apply_all_transformations(Cow::Borrowed(loaded.image()), &render.effective_adjustments)
+}
+
+pub(crate) fn render_export_estimate_geometry<'a, T: ExportRenderSource + ?Sized>(
+    loaded: &'a T,
+    prepared: &PreparedEstimateInput,
+) -> (Cow<'a, DynamicImage>, (f32, f32)) {
+    apply_all_transformations(
+        Cow::Borrowed(loaded.image()),
+        &prepared.render.effective_adjustments,
+    )
+}
+
+fn estimate_geometry_origin(
+    is_current_editor: bool,
+    render: &ResolvedRenderInput,
+) -> GeometryOrigin {
+    if is_current_editor {
+        GeometryOrigin::CurrentEditor
+    } else if render.persisted_is_null && render.source_kind == ImageSourceKind::DevelopedRaw {
+        GeometryOrigin::CameraDefault
+    } else {
+        GeometryOrigin::PersistedFullResolution
+    }
+}
+
+fn fast_estimate_scale_for_loaded(
+    path: &str,
+    loaded: &LoadedBaseImage,
+    developed_raw_scale: f32,
+) -> FastEstimateScale {
+    if is_raw_file(path) && loaded.source_kind == ImageSourceKind::DevelopedRaw {
+        let scale = valid_scale_f32(developed_raw_scale);
+        FastEstimateScale {
+            crop_x: f64::from(scale),
+            crop_y: f64::from(scale),
+            masks: scale,
+            output_x: scale,
+            output_y: scale,
+        }
+    } else {
+        FastEstimateScale::identity()
+    }
+}
+
+fn extrapolated_dimension(dimension: u32, scale: f32) -> u32 {
+    let scale = valid_scale_f32(scale);
+    let extrapolated = f64::from(dimension) / f64::from(scale);
+    if !extrapolated.is_finite() || extrapolated < 0.0 {
+        dimension
+    } else {
+        extrapolated.round().min(f64::from(u32::MAX)) as u32
+    }
+}
 
 #[derive(Serialize, Deserialize, Debug, Clone)]
 #[serde(rename_all = "camelCase")]
@@ -276,7 +507,8 @@ fn apply_export_resize_and_watermark(
 #[allow(clippy::too_many_arguments)]
 fn process_image_for_export_pipeline(
     path: &str,
-    base_image: &DynamicImage,
+    transformed_image: &DynamicImage,
+    unscaled_crop_offset: (f32, f32),
     js_adjustments: &Value,
     context: &GpuContext,
     state: &tauri::State<AppState>,
@@ -284,8 +516,6 @@ fn process_image_for_export_pipeline(
     debug_tag: &str,
     app_handle: &tauri::AppHandle,
 ) -> Result<DynamicImage, String> {
-    let (transformed_image, unscaled_crop_offset) =
-        apply_all_transformations(Cow::Borrowed(base_image), js_adjustments);
     let (img_w, img_h) = transformed_image.dimensions();
 
     let mask_definitions: Vec<MaskDefinition> = js_adjustments
@@ -320,7 +550,7 @@ fn process_image_for_export_pipeline(
     process_and_get_dynamic_image(
         context,
         state,
-        transformed_image.as_ref(),
+        transformed_image,
         unique_hash,
         RenderRequest {
             adjustments: all_adjustments,
@@ -401,7 +631,8 @@ pub fn mime_type_for_extension(extension: &str) -> &'static str {
 #[allow(clippy::too_many_arguments)]
 fn process_image_for_export(
     path: &str,
-    base_image: &DynamicImage,
+    transformed_image: &DynamicImage,
+    unscaled_crop_offset: (f32, f32),
     js_adjustments: &Value,
     export_settings: &ExportSettings,
     context: &GpuContext,
@@ -411,7 +642,8 @@ fn process_image_for_export(
 ) -> Result<DynamicImage, String> {
     let processed_image = process_image_for_export_pipeline(
         path,
-        base_image,
+        transformed_image,
+        unscaled_crop_offset,
         js_adjustments,
         context,
         state,
@@ -533,7 +765,8 @@ fn encode_image_to_bytes(
 
 #[allow(clippy::too_many_arguments)]
 fn export_masks_for_image(
-    base_image: &DynamicImage,
+    transformed_image: &DynamicImage,
+    unscaled_crop_offset: (f32, f32),
     js_adjustments: &Value,
     export_settings: &ExportSettings,
     output_path_obj: &std::path::Path,
@@ -543,8 +776,6 @@ fn export_masks_for_image(
     is_raw: bool,
     app_handle: &tauri::AppHandle,
 ) -> Result<(), String> {
-    let (transformed_image, unscaled_crop_offset) =
-        apply_all_transformations(Cow::Borrowed(base_image), js_adjustments);
     let (img_w, img_h) = transformed_image.dimensions();
     let mask_definitions: Vec<MaskDefinition> = js_adjustments
         .get("masks")
@@ -590,7 +821,7 @@ fn export_masks_for_image(
             let processed = process_and_get_dynamic_image(
                 context,
                 state,
-                transformed_image.as_ref(),
+                transformed_image,
                 unique_hash,
                 RenderRequest {
                     adjustments: single_adjustments,
@@ -832,17 +1063,21 @@ pub async fn export_images(
                 let state = app_handle_clone.state::<AppState>();
                 let (source_path, sidecar_path) = parse_virtual_path(&image_path_str);
                 let source_path_str = source_path.to_string_lossy().to_string();
-                let is_current_edit = Some(&source_path_str) == current_edit_path.as_ref();
+                let mut persisted_adjustments =
+                    crate::exif_processing::load_sidecar(&sidecar_path).adjustments;
+                let mut explicit_adjustments = current_editor_adjustments_for_path(
+                    &image_path_str,
+                    current_edit_path.as_deref(),
+                    current_edit_adjustments.as_ref(),
+                )
+                .cloned();
+                let is_current_edit = explicit_adjustments.is_some();
 
-                let mut js_adjustments = match (is_current_edit, current_edit_adjustments) {
-                    (true, Some(adjustments)) => adjustments,
-                    _ => {
-                        let metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-                        metadata.adjustments
-                    }
-                };
-
-                hydrate_adjustments(&state, &mut js_adjustments);
+                if let Some(adjustments) = explicit_adjustments.as_mut() {
+                    hydrate_adjustments(&state, adjustments);
+                } else {
+                    hydrate_adjustments(&state, &mut persisted_adjustments);
+                }
                 let is_raw = is_raw_file(&source_path_str);
                 let original_path = std::path::Path::new(&source_path_str);
                 let file_date = exif_processing::get_creation_date_from_path(original_path);
@@ -889,9 +1124,12 @@ pub async fn export_images(
                 let extension = output_format.to_lowercase();
 
                 let result: Result<(), String> = (|| {
+                    let selected_adjustments = explicit_adjustments
+                        .as_ref()
+                        .unwrap_or(&persisted_adjustments);
                     if extension == "cube" {
                         let cube_bytes = export_adjustments_as_lut(
-                            &js_adjustments,
+                            selected_adjustments,
                             &source_path_str,
                             &context_clone,
                             &state,
@@ -914,32 +1152,55 @@ pub async fn export_images(
                         return Ok(());
                     }
 
-                    let base_image = if is_current_edit {
-                        match crate::get_original_image(&state) {
-                            Ok((orig_data_arc, _)) => {
-                                composite_patches_on_image(&orig_data_arc, &js_adjustments)
-                                    .map_err(|e| format!("Failed to composite AI patches: {}", e))?
+                    let defaults = camera_defaults_for_path(&source_path);
+                    let (mut loaded, render, patches_composited) = if is_current_edit {
+                        match state.original_image.lock().unwrap().clone() {
+                            Some(current) => {
+                                let render = prepare_export_render_input(
+                                    &persisted_adjustments,
+                                    explicit_adjustments.as_ref(),
+                                    &defaults,
+                                    &current,
+                                );
+                                let image = composite_patches_on_image(
+                                    &current.image,
+                                    &render.effective_adjustments,
+                                )
+                                .map_err(|e| format!("Failed to composite AI patches: {}", e))?;
+                                (
+                                    LoadedBaseImage {
+                                        image,
+                                        source_kind: current.source_kind,
+                                    },
+                                    render,
+                                    true,
+                                )
                             }
-                            Err(_) => {
+                            None => {
                                 let bytes =
                                     fs::read(&source_path_str).map_err(|e| e.to_string())?;
-                                load_and_composite(
+                                let loaded = load_base_image_with_metadata_from_bytes(
                                     &bytes,
                                     &source_path_str,
-                                    &js_adjustments,
                                     false,
                                     &settings,
                                     None,
                                 )
-                                .map_err(|e| format!("Failed to load fallback image: {}", e))?
+                                .map_err(|e| format!("Failed to load fallback image: {}", e))?;
+                                let render = prepare_export_render_input(
+                                    &persisted_adjustments,
+                                    explicit_adjustments.as_ref(),
+                                    &defaults,
+                                    &loaded,
+                                );
+                                (loaded, render, false)
                             }
                         }
                     } else {
-                        match read_file_mapped(Path::new(&source_path_str)) {
-                            Ok(mmap) => load_and_composite(
+                        let loaded = match read_file_mapped(Path::new(&source_path_str)) {
+                            Ok(mmap) => load_base_image_with_metadata_from_bytes(
                                 &mmap,
                                 &source_path_str,
-                                &js_adjustments,
                                 false,
                                 &settings,
                                 None,
@@ -948,20 +1209,36 @@ pub async fn export_images(
                             Err(_) => {
                                 let bytes =
                                     fs::read(&source_path_str).map_err(|e| e.to_string())?;
-                                load_and_composite(
+                                load_base_image_with_metadata_from_bytes(
                                     &bytes,
                                     &source_path_str,
-                                    &js_adjustments,
                                     false,
                                     &settings,
                                     None,
                                 )
                                 .map_err(|e| format!("Failed to load from bytes: {}", e))?
                             }
-                        }
+                        };
+                        let render = prepare_export_render_input(
+                            &persisted_adjustments,
+                            explicit_adjustments.as_ref(),
+                            &defaults,
+                            &loaded,
+                        );
+                        (loaded, render, false)
                     };
 
-                    let mut main_export_adjustments = js_adjustments.clone();
+                    let effective_adjustments = &render.effective_adjustments;
+                    if !patches_composited {
+                        loaded.image =
+                            composite_patches_on_image(&loaded.image, effective_adjustments)
+                                .map_err(|e| format!("Failed to composite AI patches: {}", e))?;
+                    }
+
+                    let (transformed_image, unscaled_crop_offset) =
+                        render_export_geometry(&loaded, &render);
+
+                    let mut main_export_adjustments = effective_adjustments.clone();
                     if export_settings.export_masks
                         && let Some(obj) = main_export_adjustments.as_object_mut()
                     {
@@ -970,7 +1247,8 @@ pub async fn export_images(
 
                     let final_image = process_image_for_export(
                         &source_path_str,
-                        &base_image,
+                        transformed_image.as_ref(),
+                        unscaled_crop_offset,
                         &main_export_adjustments,
                         &export_settings,
                         &context_clone,
@@ -991,8 +1269,9 @@ pub async fn export_images(
 
                     if export_settings.export_masks {
                         export_masks_for_image(
-                            &base_image,
-                            &js_adjustments,
+                            transformed_image.as_ref(),
+                            unscaled_crop_offset,
+                            effective_adjustments,
                             &export_settings,
                             &output_path,
                             &source_path_str,
@@ -1094,26 +1373,45 @@ pub async fn estimate_export_sizes(
         return Ok(0);
     }
 
-    let first_path = &paths[0];
-    let (source_path, sidecar_path) = parse_virtual_path(first_path);
+    let image_path_str = &paths[0];
+    let (source_path, sidecar_path) = parse_virtual_path(image_path_str);
     let source_path_str = source_path.to_string_lossy().to_string();
 
     let context = get_or_init_gpu_context(&state, &app_handle)?;
-    let is_current_edit = Some(&source_path_str) == current_edit_path.as_ref();
     let is_raw = is_raw_file(&source_path_str);
     let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    let mut persisted_adjustments = crate::exif_processing::load_sidecar(&sidecar_path).adjustments;
+    let mut explicit_adjustments = current_editor_adjustments_for_path(
+        image_path_str,
+        current_edit_path.as_deref(),
+        current_edit_adjustments.as_ref(),
+    )
+    .cloned();
+    let is_current_edit = explicit_adjustments.is_some();
 
-    let single_image_extrapolated_size: usize = if is_current_edit
-        && current_edit_adjustments.is_some()
-    {
+    if let Some(adjustments) = explicit_adjustments.as_mut() {
+        hydrate_adjustments(&state, adjustments);
+    } else {
+        hydrate_adjustments(&state, &mut persisted_adjustments);
+    }
+
+    let single_image_extrapolated_size: usize = if is_current_edit {
         let loaded_image = state
             .original_image
             .lock()
             .unwrap()
             .clone()
             .ok_or("No original image loaded")?;
-        let mut adjustments_clone = current_edit_adjustments.clone().unwrap();
-        hydrate_adjustments(&state, &mut adjustments_clone);
+        let defaults = camera_defaults_for_path(&source_path);
+        let prepared = prepare_export_estimate_input(
+            &persisted_adjustments,
+            explicit_adjustments.as_ref(),
+            &defaults,
+            &loaded_image,
+            GeometryOrigin::CurrentEditor,
+            FastEstimateScale::identity(),
+        );
+        let adjustments_clone = prepared.render.effective_adjustments.clone();
 
         let new_transform_hash = calculate_transform_hash(&adjustments_clone);
         let cached_preview_lock = state.cached_preview.lock().unwrap();
@@ -1162,7 +1460,7 @@ pub async fn estimate_export_sizes(
                     def,
                     img_w,
                     img_h,
-                    scale,
+                    scale * prepared.mask_scale,
                     scaled_crop_offset,
                     &adjustments_clone,
                 )
@@ -1178,7 +1476,7 @@ pub async fn estimate_export_sizes(
             .as_str()
             .and_then(|p| get_or_load_lut(&state, p).ok());
         let unique_hash =
-            calculate_full_job_hash(&loaded_image.path, &adjustments_clone).wrapping_add(1);
+            calculate_full_job_hash(image_path_str, &adjustments_clone).wrapping_add(1);
 
         let processed_preview = process_and_get_dynamic_image(
             &context,
@@ -1201,8 +1499,7 @@ pub async fn estimate_export_sizes(
         )?;
         let preview_byte_size = preview_bytes.len();
 
-        let (transformed_full_res, _) =
-            apply_all_transformations(&loaded_image.image, &adjustments_clone);
+        let (transformed_full_res, _) = render_export_estimate_geometry(&loaded_image, &prepared);
         let (full_w, full_h) = transformed_full_res.dimensions();
 
         let (final_full_w, final_full_h) = if let Some(resize_opts) = &export_settings.resize {
@@ -1221,9 +1518,6 @@ pub async fn estimate_export_sizes(
 
         (preview_byte_size as f64 * pixel_ratio) as usize
     } else {
-        let metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-        let mut js_adjustments = metadata.adjustments;
-
         const ESTIMATE_DIM: u32 = 1280;
 
         let file_slice: Vec<u8>;
@@ -1239,35 +1533,44 @@ pub async fn estimate_export_sizes(
             }
         };
 
-        let original_image =
-            load_base_image_from_bytes(file_data, &source_path_str, true, &settings, None)
-                .map_err(|e| e.to_string())?;
+        let mut loaded = load_base_image_with_metadata_from_bytes(
+            file_data,
+            &source_path_str,
+            true,
+            &settings,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
 
         let raw_scale_factor = if is_raw {
             crate::raw_processing::get_fast_demosaic_scale_factor(
                 file_data,
-                original_image.width(),
-                original_image.height(),
+                loaded.image.width(),
+                loaded.image.height(),
             )
         } else {
             1.0
         };
-
-        if let Some(crop_val) = js_adjustments.get_mut("crop")
-            && let Ok(c) = serde_json::from_value::<Crop>(crop_val.clone())
-        {
-            *crop_val = serde_json::to_value(Crop {
-                x: c.x * raw_scale_factor as f64,
-                y: c.y * raw_scale_factor as f64,
-                width: c.width * raw_scale_factor as f64,
-                height: c.height * raw_scale_factor as f64,
-            })
-            .unwrap_or(serde_json::Value::Null);
-        }
-
+        let fast_scale =
+            fast_estimate_scale_for_loaded(&source_path_str, &loaded, raw_scale_factor);
+        let defaults = camera_defaults_for_path(&source_path);
+        let render_for_origin =
+            prepare_export_render_input(&persisted_adjustments, None, &defaults, &loaded);
+        let prepared = prepare_export_estimate_input(
+            &persisted_adjustments,
+            None,
+            &defaults,
+            &loaded,
+            estimate_geometry_origin(false, &render_for_origin),
+            fast_scale,
+        );
+        loaded.image =
+            composite_patches_on_image(&loaded.image, &prepared.render.effective_adjustments)
+                .map_err(|e| format!("Failed to composite AI patches: {}", e))?;
         let (transformed_shrunk_res, unscaled_crop_offset) =
-            apply_all_transformations(Cow::Borrowed(&original_image), &js_adjustments);
+            render_export_estimate_geometry(&loaded, &prepared);
         let (shrunk_w, shrunk_h) = transformed_shrunk_res.dimensions();
+        let effective_adjustments = &prepared.render.effective_adjustments;
 
         let preview_base = if shrunk_w > ESTIMATE_DIM || shrunk_h > ESTIMATE_DIM {
             downscale_f32_image(transformed_shrunk_res.as_ref(), ESTIMATE_DIM, ESTIMATE_DIM)
@@ -1281,9 +1584,9 @@ pub async fn estimate_export_sizes(
         } else {
             1.0
         };
-        let total_scale = gpu_scale * raw_scale_factor;
+        let total_scale = gpu_scale * prepared.mask_scale;
 
-        let mask_definitions: Vec<MaskDefinition> = js_adjustments
+        let mask_definitions: Vec<MaskDefinition> = effective_adjustments
             .get("masks")
             .and_then(|m| serde_json::from_value(m.clone()).ok())
             .unwrap_or_default();
@@ -1302,21 +1605,21 @@ pub async fn estimate_export_sizes(
                     preview_h,
                     total_scale,
                     scaled_crop_offset,
-                    &js_adjustments,
+                    effective_adjustments,
                 )
             })
             .collect();
 
         let tm_override = resolve_tonemapper_override_from_handle(&app_handle, is_raw);
         let mut all_adjustments =
-            get_all_adjustments_from_json(&js_adjustments, is_raw, tm_override);
+            get_all_adjustments_from_json(effective_adjustments, is_raw, tm_override);
         all_adjustments.global.show_clipping = 0;
 
-        let lut = js_adjustments["lutPath"]
+        let lut = effective_adjustments["lutPath"]
             .as_str()
             .and_then(|p| get_or_load_lut(&state, p).ok());
         let unique_hash =
-            calculate_full_job_hash(&source_path_str, &js_adjustments).wrapping_add(1);
+            calculate_full_job_hash(image_path_str, effective_adjustments).wrapping_add(1);
 
         let processed_preview = process_and_get_dynamic_image(
             &context,
@@ -1339,8 +1642,8 @@ pub async fn estimate_export_sizes(
         )?;
         let single_image_estimated_size = preview_bytes.len();
 
-        let full_w = (shrunk_w as f32 / raw_scale_factor).round() as u32;
-        let full_h = (shrunk_h as f32 / raw_scale_factor).round() as u32;
+        let full_w = extrapolated_dimension(shrunk_w, prepared.output_scale.0);
+        let full_h = extrapolated_dimension(shrunk_h, prepared.output_scale.1);
 
         let (final_full_w, final_full_h) = if let Some(resize_opts) = &export_settings.resize {
             calculate_resize_target(full_w, full_h, resize_opts)
@@ -1360,4 +1663,253 @@ pub async fn estimate_export_sizes(
     };
 
     Ok(single_image_extrapolated_size * paths.len())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera_defaults::{CameraDefaults, ImageSourceKind};
+    use crate::image_loader::LoadedBaseImage;
+    use serde_json::json;
+
+    fn loaded(width: u32, height: u32, source_kind: ImageSourceKind) -> LoadedBaseImage {
+        LoadedBaseImage {
+            image: DynamicImage::new_rgb8(width, height),
+            source_kind,
+        }
+    }
+
+    fn camera_defaults() -> CameraDefaults {
+        CameraDefaults {
+            crop: Some(Crop {
+                x: 2.0,
+                y: 2.0,
+                width: 4.0,
+                height: 2.0,
+            }),
+            aspect_ratio: Some(2.0),
+            canvas_width: Some(8),
+            canvas_height: Some(6),
+        }
+    }
+
+    fn crop_from(adjustments: &Value) -> Crop {
+        serde_json::from_value(adjustments["crop"].clone()).expect("expected a valid crop")
+    }
+
+    #[test]
+    fn raf_unopened_camera_crop_reaches_export() {
+        let loaded = loaded(8, 6, ImageSourceKind::DevelopedRaw);
+        let render = prepare_export_render_input(&Value::Null, None, &camera_defaults(), &loaded);
+
+        let (image, offset) = render_export_geometry(&loaded, &render);
+
+        assert_eq!(image.dimensions(), (4, 2));
+        assert_eq!(offset, (2.0, 2.0));
+        assert_eq!(
+            crop_from(&render.effective_adjustments),
+            Crop {
+                x: 2.0,
+                y: 2.0,
+                width: 4.0,
+                height: 2.0,
+            }
+        );
+    }
+
+    #[test]
+    fn raf_embedded_preview_stays_full_in_export() {
+        let loaded = loaded(8, 6, ImageSourceKind::EmbeddedPreview);
+        let render = prepare_export_render_input(&Value::Null, None, &camera_defaults(), &loaded);
+
+        let (image, offset) = render_export_geometry(&loaded, &render);
+
+        assert_eq!(image.dimensions(), (8, 6));
+        assert_eq!(offset, (0.0, 0.0));
+        assert!(render.effective_adjustments.is_null());
+    }
+
+    #[test]
+    fn raf_fast_camera_crop_scales_once() {
+        let loaded = loaded(4, 3, ImageSourceKind::DevelopedRaw);
+        let prepared = prepare_export_estimate_input(
+            &Value::Null,
+            None,
+            &camera_defaults(),
+            &loaded,
+            GeometryOrigin::CameraDefault,
+            FastEstimateScale {
+                crop_x: 0.5,
+                crop_y: 0.5,
+                masks: 0.5,
+                output_x: 0.5,
+                output_y: 0.5,
+            },
+        );
+
+        let (image, offset) = render_export_estimate_geometry(&loaded, &prepared);
+
+        assert_eq!(image.dimensions(), (2, 1));
+        assert_eq!(offset, (1.0, 1.0));
+        assert_eq!(
+            crop_from(&prepared.render.effective_adjustments),
+            Crop {
+                x: 1.0,
+                y: 1.0,
+                width: 2.0,
+                height: 1.0,
+            }
+        );
+        assert_eq!(prepared.mask_scale, 0.5);
+        assert_eq!(prepared.output_scale, (0.5, 0.5));
+    }
+
+    #[test]
+    fn raf_fast_persisted_geometry_scales_crop_masks_and_output_axes() {
+        let persisted = json!({
+            "crop": { "x": 4.0, "y": 8.0, "width": 12.0, "height": 8.0 },
+            "masks": [{ "id": "keep-mask" }],
+        });
+        let loaded = loaded(8, 6, ImageSourceKind::DevelopedRaw);
+        let prepared = prepare_export_estimate_input(
+            &persisted,
+            None,
+            &CameraDefaults::default(),
+            &loaded,
+            GeometryOrigin::PersistedFullResolution,
+            FastEstimateScale {
+                crop_x: 0.5,
+                crop_y: 0.25,
+                masks: 0.375,
+                output_x: 0.5,
+                output_y: 0.25,
+            },
+        );
+
+        let (image, offset) = render_export_estimate_geometry(&loaded, &prepared);
+
+        assert_eq!(image.dimensions(), (6, 2));
+        assert_eq!(offset, (2.0, 2.0));
+        assert_eq!(
+            crop_from(&prepared.render.effective_adjustments),
+            Crop {
+                x: 2.0,
+                y: 2.0,
+                width: 6.0,
+                height: 2.0,
+            }
+        );
+        assert_eq!(
+            prepared.render.effective_adjustments["masks"],
+            persisted["masks"]
+        );
+        assert_eq!(prepared.mask_scale, 0.375);
+        assert_eq!(prepared.output_scale, (0.5, 0.25));
+
+        let invalid = prepare_export_estimate_input(
+            &persisted,
+            None,
+            &CameraDefaults::default(),
+            &loaded,
+            GeometryOrigin::PersistedFullResolution,
+            FastEstimateScale {
+                crop_x: f64::NAN,
+                crop_y: 0.0,
+                masks: f32::INFINITY,
+                output_x: -1.0,
+                output_y: f32::NAN,
+            },
+        );
+        assert_eq!(
+            crop_from(&invalid.render.effective_adjustments),
+            crop_from(&persisted)
+        );
+        assert_eq!(invalid.mask_scale, 1.0);
+        assert_eq!(invalid.output_scale, (1.0, 1.0));
+    }
+
+    #[test]
+    fn raf_virtual_copy_current_edit_matching_is_exact() {
+        let persisted = json!({ "exposure": -1.0 });
+        let current = json!({ "exposure": 1.0 });
+        let loaded = loaded(8, 6, ImageSourceKind::DevelopedRaw);
+
+        let matching = current_editor_adjustments_for_path(
+            "/photos/image.raf?vc=2",
+            Some("/photos/image.raf?vc=2"),
+            Some(&current),
+        );
+        let render =
+            prepare_export_render_input(&persisted, matching, &CameraDefaults::default(), &loaded);
+        assert_eq!(render.effective_adjustments["exposure"], 1.0);
+
+        let physical_path_only = current_editor_adjustments_for_path(
+            "/photos/image.raf?vc=2",
+            Some("/photos/image.raf"),
+            Some(&current),
+        );
+        let render = prepare_export_render_input(
+            &persisted,
+            physical_path_only,
+            &CameraDefaults::default(),
+            &loaded,
+        );
+        assert_eq!(render.effective_adjustments["exposure"], -1.0);
+    }
+
+    #[test]
+    fn raf_current_editor_estimate_ignores_nonidentity_fast_scales() {
+        let current = json!({
+            "crop": { "x": 1.0, "y": 1.0, "width": 5.0, "height": 3.0 },
+            "masks": [{ "id": "current-mask" }],
+        });
+        let loaded = loaded(8, 6, ImageSourceKind::DevelopedRaw);
+        let prepared = prepare_export_estimate_input(
+            &Value::Null,
+            Some(&current),
+            &camera_defaults(),
+            &loaded,
+            GeometryOrigin::CurrentEditor,
+            FastEstimateScale {
+                crop_x: 0.25,
+                crop_y: 0.5,
+                masks: 0.25,
+                output_x: 0.25,
+                output_y: 0.5,
+            },
+        );
+
+        let (image, offset) = render_export_estimate_geometry(&loaded, &prepared);
+
+        assert_eq!(image.dimensions(), (5, 3));
+        assert_eq!(offset, (1.0, 1.0));
+        assert_eq!(
+            crop_from(&prepared.render.effective_adjustments),
+            crop_from(&current)
+        );
+        assert_eq!(prepared.mask_scale, 1.0);
+        assert_eq!(prepared.output_scale, (1.0, 1.0));
+    }
+
+    #[test]
+    fn raf_embedded_preview_raw_extension_estimate_uses_identity_output_scaling() {
+        let loaded = loaded(8, 6, ImageSourceKind::EmbeddedPreview);
+        let scale = fast_estimate_scale_for_loaded("/photos/image.raf", &loaded, 0.25);
+        let render = prepare_export_render_input(&Value::Null, None, &camera_defaults(), &loaded);
+        let prepared = prepare_export_estimate_input(
+            &Value::Null,
+            None,
+            &camera_defaults(),
+            &loaded,
+            estimate_geometry_origin(false, &render),
+            scale,
+        );
+
+        let (image, offset) = render_export_estimate_geometry(&loaded, &prepared);
+
+        assert_eq!(image.dimensions(), (8, 6));
+        assert_eq!(offset, (0.0, 0.0));
+        assert_eq!(prepared.mask_scale, 1.0);
+        assert_eq!(prepared.output_scale, (1.0, 1.0));
+    }
 }

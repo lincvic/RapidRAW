@@ -37,13 +37,13 @@ pub fn truncate_large_exif(value: &str) -> String {
     value.to_string()
 }
 
-pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
-    if !sidecar_path.exists() {
-        return ImageMetadata::default();
-    }
-
-    let Ok(content) = fs::read_to_string(sidecar_path) else {
-        return ImageMetadata::default();
+pub(crate) fn read_sidecar_unlocked(sidecar_path: &Path) -> std::io::Result<ImageMetadata> {
+    let content = match fs::read_to_string(sidecar_path) {
+        Ok(content) => content,
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => {
+            return Ok(ImageMetadata::default());
+        }
+        Err(error) => return Err(error),
     };
 
     let mut meta = serde_json::from_str::<ImageMetadata>(&content).unwrap_or_default();
@@ -58,15 +58,52 @@ pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
         }
     }
 
-    if healed && let Ok(json) = serde_json::to_string_pretty(&meta) {
-        let _ = fs::write(sidecar_path, json);
+    if healed && let Ok(json) = serde_json::to_vec_pretty(&meta) {
+        let _ = crate::sidecar_io::atomic_replace(sidecar_path, &json);
         log::info!(
             "Auto-healed bloated sidecar for: {}",
             sidecar_path.display()
         );
     }
 
-    meta
+    Ok(meta)
+}
+
+pub fn load_sidecar(sidecar_path: &Path) -> ImageMetadata {
+    crate::sidecar_io::with_locked_paths(&[sidecar_path.to_path_buf()], |paths| {
+        read_sidecar_unlocked(&paths[0])
+    })
+    .unwrap_or_else(|error| {
+        log::warn!(
+            "Failed to inspect sidecar '{}': {error}",
+            sidecar_path.display()
+        );
+        ImageMetadata::default()
+    })
+}
+
+pub(crate) fn update_sidecar<F>(sidecar_path: &Path, update: F) -> std::io::Result<ImageMetadata>
+where
+    F: FnOnce(&mut ImageMetadata) -> std::io::Result<()>,
+{
+    update_sidecar_if(sidecar_path, |metadata| {
+        update(metadata)?;
+        Ok(true)
+    })
+}
+
+pub(crate) fn update_sidecar_if<F>(sidecar_path: &Path, update: F) -> std::io::Result<ImageMetadata>
+where
+    F: FnOnce(&mut ImageMetadata) -> std::io::Result<bool>,
+{
+    crate::sidecar_io::with_locked_paths(&[sidecar_path.to_path_buf()], |paths| {
+        let mut metadata = read_sidecar_unlocked(&paths[0])?;
+        if update(&mut metadata)? {
+            let json = serde_json::to_vec_pretty(&metadata).map_err(std::io::Error::other)?;
+            crate::sidecar_io::atomic_replace(&paths[0], &json)?;
+        }
+        Ok(metadata)
+    })
 }
 
 fn to_ur64(val: &exif::Rational) -> uR64 {
@@ -1216,12 +1253,6 @@ fn load_primary_metadata(image_path: &Path) -> ImageMetadata {
     load_sidecar(&primary)
 }
 
-fn save_primary_metadata(image_path: &Path, metadata: &ImageMetadata) -> std::io::Result<()> {
-    let primary = get_primary_sidecar_path(image_path);
-    let json = serde_json::to_string_pretty(metadata).map_err(std::io::Error::other)?;
-    fs::write(&primary, json)
-}
-
 pub fn read_rrexif_sidecar(image_path: &Path) -> Option<HashMap<String, String>> {
     let metadata = load_primary_metadata(image_path);
     if let Some(exif) = metadata.exif {
@@ -1233,10 +1264,17 @@ pub fn read_rrexif_sidecar(image_path: &Path) -> Option<HashMap<String, String>>
         && let Ok(content) = fs::read_to_string(&legacy)
         && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&content)
     {
-        let mut migrated = load_primary_metadata(image_path);
-        migrated.exif = Some(map.clone());
-        if save_primary_metadata(image_path, &migrated).is_ok() {
+        let primary = get_primary_sidecar_path(image_path);
+        if let Ok(metadata) = update_sidecar_if(&primary, |metadata| {
+            if metadata.exif.is_none() {
+                metadata.exif = Some(map.clone());
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        }) {
             let _ = fs::remove_file(&legacy);
+            return metadata.exif.or(Some(map));
         }
         return Some(map);
     }
@@ -1273,19 +1311,36 @@ pub fn read_exif_data_from_bytes(path: &str, file_bytes: &[u8]) -> HashMap<Strin
     exif_data
 }
 
-pub fn read_exif_data(path: &str, file_bytes: &[u8]) -> HashMap<String, String> {
+fn read_exif_data_with<F>(path: &str, file_bytes: &[u8], extractor: F) -> HashMap<String, String>
+where
+    F: FnOnce(&str, &[u8]) -> HashMap<String, String>,
+{
     let source_path = Path::new(path);
     if let Some(sidecar_exif) = read_rrexif_sidecar(source_path) {
         return sidecar_exif;
     }
 
-    let exif_map = read_exif_data_from_bytes(path, file_bytes);
-    if !exif_map.is_empty() {
-        let mut metadata = load_primary_metadata(source_path);
-        metadata.exif = Some(exif_map.clone());
-        let _ = save_primary_metadata(source_path, &metadata);
+    let exif_map = extractor(path, file_bytes);
+    if exif_map.is_empty() {
+        return exif_map;
     }
-    exif_map
+
+    let primary = get_primary_sidecar_path(source_path);
+    match update_sidecar_if(&primary, |metadata| {
+        if metadata.exif.is_none() {
+            metadata.exif = Some(exif_map.clone());
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    }) {
+        Ok(metadata) => metadata.exif.unwrap_or(exif_map),
+        Err(_) => exif_map,
+    }
+}
+
+pub fn read_exif_data(path: &str, file_bytes: &[u8]) -> HashMap<String, String> {
+    read_exif_data_with(path, file_bytes, read_exif_data_from_bytes)
 }
 
 pub fn persist_exif_if_missing(source_path: &Path, source_path_str: &str, file_bytes: &[u8]) {
@@ -1301,9 +1356,17 @@ pub fn persist_exif_if_missing(source_path: &Path, source_path_str: &str, file_b
         && let Ok(content) = fs::read_to_string(&legacy)
         && let Ok(map) = serde_json::from_str::<HashMap<String, String>>(&content)
     {
-        let mut metadata = load_primary_metadata(source_path);
-        metadata.exif = Some(map);
-        if save_primary_metadata(source_path, &metadata).is_ok() {
+        let primary = get_primary_sidecar_path(source_path);
+        if update_sidecar_if(&primary, |metadata| {
+            if metadata.exif.is_none() {
+                metadata.exif = Some(map);
+                Ok(true)
+            } else {
+                Ok(false)
+            }
+        })
+        .is_ok()
+        {
             let _ = fs::remove_file(&legacy);
         }
         return;
@@ -1314,12 +1377,15 @@ pub fn persist_exif_if_missing(source_path: &Path, source_path_str: &str, file_b
         return;
     }
 
-    let mut metadata = load_primary_metadata(source_path);
-
-    if metadata.exif.is_none() {
-        metadata.exif = Some(exif_map);
-        let _ = save_primary_metadata(source_path, &metadata);
-    }
+    let primary = get_primary_sidecar_path(source_path);
+    let _ = update_sidecar_if(&primary, |metadata| {
+        if metadata.exif.is_none() {
+            metadata.exif = Some(exif_map);
+            Ok(true)
+        } else {
+            Ok(false)
+        }
+    });
 }
 
 pub fn write_rrexif_sidecar(source_path_str: &str, target_image_path: &Path) -> Result<(), String> {
@@ -1337,8 +1403,107 @@ pub fn write_rrexif_sidecar(source_path_str: &str, target_image_path: &Path) -> 
         return Ok(());
     }
 
-    let mut metadata = load_primary_metadata(target_image_path);
-    metadata.exif = Some(exif_data);
-    save_primary_metadata(target_image_path, &metadata)
-        .map_err(|e| format!("Failed to write sidecar: {}", e))
+    let primary = get_primary_sidecar_path(target_image_path);
+    update_sidecar(&primary, |metadata| {
+        metadata.exif = Some(exif_data);
+        Ok(())
+    })
+    .map(|_| ())
+    .map_err(|e| format!("Failed to write sidecar: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn exif_cache_fill_preserves_primary_exif_published_during_extraction() {
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("concurrent.RAF");
+        let image_path_str = image_path.to_string_lossy().into_owned();
+        let primary_path = get_primary_sidecar_path(&image_path);
+        let extracted_exif = HashMap::from([("Source".to_string(), "embedded".to_string())]);
+        let primary_exif = HashMap::from([("Source".to_string(), "primary".to_string())]);
+
+        let primary_for_update = primary_path.clone();
+        let primary_for_thread = primary_exif.clone();
+        let returned = read_exif_data_with(&image_path_str, b"synthetic", move |_, _| {
+            std::thread::spawn(move || {
+                update_sidecar(&primary_for_update, |metadata| {
+                    metadata.exif = Some(primary_for_thread);
+                    Ok(())
+                })
+                .unwrap();
+            })
+            .join()
+            .unwrap();
+            extracted_exif
+        });
+
+        assert_eq!(returned, primary_exif);
+        assert_eq!(load_sidecar(&primary_path).exif, Some(primary_exif));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn legacy_migration_returns_primary_exif_published_during_legacy_read() {
+        use std::fs::OpenOptions;
+        use std::io::Write;
+        use std::os::unix::fs::MetadataExt;
+        use std::process::Command;
+        use std::sync::mpsc;
+        use std::thread;
+        use std::time::Duration;
+
+        let temp = tempfile::tempdir().unwrap();
+        let image_path = temp.path().join("concurrent.RAF");
+        let legacy_path = get_rrexif_path(&image_path);
+        assert!(
+            Command::new("mkfifo")
+                .arg(&legacy_path)
+                .status()
+                .unwrap()
+                .success()
+        );
+
+        let legacy_exif = HashMap::from([("Source".to_string(), "legacy".to_string())]);
+        let primary_exif = HashMap::from([("Source".to_string(), "primary".to_string())]);
+        let legacy_json = serde_json::to_vec(&legacy_exif).unwrap();
+
+        let image_for_reader = image_path.clone();
+        let reader = thread::spawn(move || read_rrexif_sidecar(&image_for_reader));
+
+        let legacy_for_writer = legacy_path.clone();
+        let (writer_ready_tx, writer_ready_rx) = mpsc::channel();
+        let (write_tx, write_rx) = mpsc::channel();
+        let writer = thread::spawn(move || {
+            let mut legacy = OpenOptions::new()
+                .write(true)
+                .open(legacy_for_writer)
+                .unwrap();
+            writer_ready_tx.send(()).unwrap();
+            write_rx.recv().unwrap();
+            legacy.write_all(&legacy_json).unwrap();
+        });
+
+        writer_ready_rx
+            .recv_timeout(Duration::from_secs(5))
+            .expect("legacy reader did not reach the FIFO");
+        let primary_path = get_primary_sidecar_path(&image_path);
+        update_sidecar(&primary_path, |metadata| {
+            metadata.exif = Some(primary_exif.clone());
+            Ok(())
+        })
+        .unwrap();
+        let primary_inode = fs::metadata(&primary_path).unwrap().ino();
+        write_tx.send(()).unwrap();
+
+        writer.join().unwrap();
+        let returned = reader.join().unwrap().unwrap();
+
+        assert_eq!(returned, primary_exif);
+        assert_eq!(load_sidecar(&primary_path).exif, Some(primary_exif));
+        assert_eq!(fs::metadata(&primary_path).unwrap().ino(), primary_inode);
+        assert!(!legacy_path.exists());
+    }
 }

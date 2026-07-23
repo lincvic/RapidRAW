@@ -291,6 +291,15 @@ pub fn camera_defaults_for_path(path: &Path) -> CameraDefaults {
     })
 }
 
+pub fn camera_defaults_for_bytes(bytes: &[u8], path_hint: &Path) -> CameraDefaults {
+    camera_defaults_for_path_with(path_hint, |_| {
+        let source = RawSource::new_from_slice(bytes).with_path(path_hint);
+        let decoder = rawler::get_decoder(&source)?;
+        let metadata = decoder.raw_metadata(&source, &RawDecodeParams::default())?;
+        Ok(camera_defaults_from_raw(&metadata))
+    })
+}
+
 pub fn metadata_result_for_path(metadata: ImageMetadata, source_path: &Path) -> LoadMetadataResult {
     let camera_defaults = if is_raw_file(source_path) {
         camera_defaults_for_path(source_path)
@@ -903,6 +912,18 @@ mod tests {
             camera_defaults_for_path(&invalid_path),
             CameraDefaults::default()
         );
+    }
+
+    #[test]
+    fn camera_defaults_for_bytes_is_non_failing_without_reading_path_hint() {
+        let temp_dir = tempfile::tempdir().unwrap();
+        let missing_path = temp_dir.path().join("missing.RAF");
+
+        assert_eq!(
+            camera_defaults_for_bytes(b"not a valid RAF", &missing_path),
+            CameraDefaults::default()
+        );
+        assert!(!missing_path.exists());
     }
 
     #[test]

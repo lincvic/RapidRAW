@@ -5,10 +5,10 @@ use std::collections::{HashMap, HashSet};
 use std::fmt;
 use std::fs;
 use std::hash::{Hash, Hasher};
-use std::io::{Cursor, Write};
+use std::io::{Cursor, Read, Write};
 use std::path::{Path, PathBuf};
 use std::process::Command;
-use std::sync::{Arc, LazyLock};
+use std::sync::{Arc, LazyLock, Mutex};
 use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
@@ -34,7 +34,7 @@ use crate::app_settings::*;
 use crate::cache_utils::calculate_geometry_hash;
 use crate::camera_defaults::{
     CameraDefaults, ImageSourceKind, LoadMetadataResult, ResolvedRenderInput,
-    camera_defaults_for_path, metadata_result_for_path,
+    camera_defaults_for_bytes, camera_defaults_for_path, metadata_result_for_path,
 };
 use crate::exif_processing;
 use crate::formats::{is_raw_file, is_supported_image_file};
@@ -49,6 +49,10 @@ use crate::image_processing::{
 };
 use crate::mask_generation::MaskDefinition;
 use crate::preset_converter;
+use crate::sidecar_io::{
+    ConditionalUpdateOutcome, FileIdentity, TargetExpectation, TargetReplacement, TargetSnapshot,
+    file_identity, inspect_target as inspect_sidecar_target,
+};
 use crate::tagging::COLOR_TAG_PREFIX;
 
 pub(crate) const THUMBNAIL_RENDER_VERSION: &str = "raf-render-metadata-v2";
@@ -957,14 +961,14 @@ fn resolve_image_metadata(
     enable_xmp_sync: bool,
     settings: &AppSettings,
 ) -> (bool, Option<Vec<String>>, u8) {
-    let mut metadata = crate::exif_processing::load_sidecar(sidecar_path);
-
-    if enable_xmp_sync
-        && sync_metadata_from_xmp(image_path, &mut metadata)
-        && let Ok(json) = serde_json::to_string_pretty(&metadata)
-    {
-        let _ = fs::write(sidecar_path, json);
-    }
+    let metadata = if enable_xmp_sync {
+        crate::exif_processing::update_sidecar_if(sidecar_path, |metadata| {
+            Ok(sync_metadata_from_xmp(image_path, metadata))
+        })
+        .unwrap_or_else(|_| crate::exif_processing::load_sidecar(sidecar_path))
+    } else {
+        crate::exif_processing::load_sidecar(sidecar_path)
+    };
 
     let is_raw = crate::formats::is_raw_file(image_path);
     let tm_override = crate::image_processing::resolve_tonemapper_override(settings, is_raw);
@@ -1223,35 +1227,31 @@ pub async fn update_exif_fields(
         paths.par_iter().for_each(|path| {
             let original_path = Path::new(&path);
             let primary_path = crate::exif_processing::get_primary_sidecar_path(original_path);
-            let temp_metadata = crate::exif_processing::load_sidecar(&primary_path);
+            let fallback_exif = if let Some(existing) =
+                crate::exif_processing::read_rrexif_sidecar(original_path)
+            {
+                existing
+            } else if let Ok(mmap) = read_file_mapped(original_path) {
+                crate::exif_processing::read_exif_data_from_bytes(path, &mmap)
+            } else if let Ok(bytes) = fs::read(original_path) {
+                crate::exif_processing::read_exif_data_from_bytes(path, &bytes)
+            } else {
+                HashMap::new()
+            };
 
-            let mut exif_data = temp_metadata.exif.unwrap_or_else(|| {
-                if let Some(existing) = crate::exif_processing::read_rrexif_sidecar(original_path) {
-                    existing
-                } else if let Ok(mmap) = read_file_mapped(original_path) {
-                    crate::exif_processing::read_exif_data_from_bytes(path, &mmap)
-                } else if let Ok(bytes) = fs::read(original_path) {
-                    crate::exif_processing::read_exif_data_from_bytes(path, &bytes)
-                } else {
-                    HashMap::new()
+            let _ = crate::exif_processing::update_sidecar(&primary_path, |metadata| {
+                let mut exif_data = metadata.exif.clone().unwrap_or(fallback_exif);
+                for (key, value) in &updates {
+                    let trimmed = value.trim();
+                    if trimmed.is_empty() {
+                        exif_data.remove(key);
+                    } else {
+                        exif_data.insert(key.clone(), trimmed.to_string());
+                    }
                 }
+                metadata.exif = Some(exif_data);
+                Ok(())
             });
-
-            for (k, v) in &updates {
-                let trimmed = v.trim();
-                if trimmed.is_empty() {
-                    exif_data.remove(k);
-                } else {
-                    exif_data.insert(k.clone(), trimmed.to_string());
-                }
-            }
-
-            let mut final_metadata = crate::exif_processing::load_sidecar(&primary_path);
-
-            final_metadata.exif = Some(exif_data);
-            if let Ok(json) = serde_json::to_string_pretty(&final_metadata) {
-                let _ = std::fs::write(&primary_path, json);
-            }
         });
         Ok(())
     })
@@ -3362,6 +3362,22 @@ pub fn move_files(
     Ok(())
 }
 
+fn write_adjustments_sidecar(
+    sidecar_path: &Path,
+    mut adjustments: Value,
+    lens_db: Option<&crate::lens_correction::LensDatabase>,
+) -> Result<ImageMetadata, String> {
+    crate::sidecar_io::with_locked_paths(&[sidecar_path.to_path_buf()], |paths| {
+        let mut metadata = crate::exif_processing::read_sidecar_unlocked(&paths[0])?;
+        resolve_lens_params_in_adjustments(&mut adjustments, &metadata.exif, lens_db);
+        metadata.adjustments = adjustments;
+        let json = serde_json::to_vec_pretty(&metadata).map_err(std::io::Error::other)?;
+        crate::sidecar_io::atomic_replace(&paths[0], &json)?;
+        Ok(metadata)
+    })
+    .map_err(|error| error.to_string())
+}
+
 #[tauri::command]
 pub fn save_metadata_and_update_thumbnail(
     path: String,
@@ -3370,23 +3386,8 @@ pub fn save_metadata_and_update_thumbnail(
     state: tauri::State<AppState>,
 ) -> Result<(), String> {
     let (source_path, sidecar_path) = parse_virtual_path(&path);
-
-    let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-    let mut final_adjustments = adjustments;
-    {
-        let lens_db_guard = state.lens_db.lock().unwrap();
-        resolve_lens_params_in_adjustments(
-            &mut final_adjustments,
-            &metadata.exif,
-            lens_db_guard.as_deref(),
-        );
-    }
-
-    metadata.adjustments = final_adjustments;
-
-    let json_string = serde_json::to_string_pretty(&metadata).map_err(|e| e.to_string())?;
-    std::fs::write(&sidecar_path, json_string).map_err(|e| e.to_string())?;
+    let lens_db = state.lens_db.lock().unwrap().clone();
+    let metadata = write_adjustments_sidecar(&sidecar_path, adjustments, lens_db.as_deref())?;
 
     if let Ok(settings) = load_settings(app_handle.clone())
         && settings.enable_xmp_sync.unwrap_or(false)
@@ -3483,37 +3484,32 @@ pub async fn apply_adjustments_to_paths(
 
         paths.par_iter().for_each(|path| {
             let (_, sidecar_path) = parse_virtual_path(path);
-
-            let mut existing_metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-            let mut new_adjustments = existing_metadata.adjustments;
-            if new_adjustments.is_null() {
-                new_adjustments = serde_json::json!({});
-            }
-
-            if let (Some(new_map), Some(pasted_map)) =
-                (new_adjustments.as_object_mut(), adjustments.as_object())
-            {
-                for (k, v) in pasted_map {
-                    new_map.insert(k.clone(), v.clone());
+            let updated = crate::exif_processing::update_sidecar(&sidecar_path, |metadata| {
+                let mut new_adjustments = metadata.adjustments.clone();
+                if new_adjustments.is_null() {
+                    new_adjustments = serde_json::json!({});
                 }
-            }
 
-            resolve_lens_params_in_adjustments(
-                &mut new_adjustments,
-                &existing_metadata.exif,
-                lens_db.as_deref(),
-            );
+                if let (Some(new_map), Some(pasted_map)) =
+                    (new_adjustments.as_object_mut(), adjustments.as_object())
+                {
+                    for (key, value) in pasted_map {
+                        new_map.insert(key.clone(), value.clone());
+                    }
+                }
 
-            existing_metadata.adjustments = new_adjustments;
+                resolve_lens_params_in_adjustments(
+                    &mut new_adjustments,
+                    &metadata.exif,
+                    lens_db.as_deref(),
+                );
+                metadata.adjustments = new_adjustments;
+                Ok(())
+            });
 
-            if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
-                let _ = std::fs::write(&sidecar_path, json_string);
-            }
-
-            if enable_xmp_sync {
+            if enable_xmp_sync && let Ok(metadata) = updated {
                 let source_path = parse_virtual_path(path).0;
-                sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
+                sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
             }
         });
 
@@ -3556,6 +3552,7 @@ pub async fn apply_adjustments_to_paths(
     Ok(())
 }
 
+#[cfg(test)]
 pub(crate) fn metadata_with_reset_adjustments(mut metadata: ImageMetadata) -> ImageMetadata {
     metadata.adjustments = Value::Null;
     metadata
@@ -3576,18 +3573,14 @@ pub async fn reset_adjustments_for_paths(
 
         paths.par_iter().for_each(|path| {
             let (_, sidecar_path) = parse_virtual_path(path);
+            let updated = crate::exif_processing::update_sidecar(&sidecar_path, |metadata| {
+                metadata.adjustments = Value::Null;
+                Ok(())
+            });
 
-            let existing_metadata = metadata_with_reset_adjustments(
-                crate::exif_processing::load_sidecar(&sidecar_path),
-            );
-
-            if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
-                let _ = std::fs::write(&sidecar_path, json_string);
-            }
-
-            if enable_xmp_sync {
+            if enable_xmp_sync && let Ok(metadata) = updated {
                 let source_path = parse_virtual_path(path).0;
-                sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
+                sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
             }
         });
 
@@ -3630,28 +3623,929 @@ pub async fn reset_adjustments_for_paths(
     Ok(())
 }
 
-#[tauri::command]
-pub async fn apply_auto_adjustments_to_paths(
+#[derive(Debug, PartialEq, Eq)]
+enum AutoAdjustmentOriginalSidecar {
+    Absent,
+    Bytes(Vec<u8>),
+}
+
+#[derive(Debug)]
+struct AutoAdjustmentSidecarSnapshot {
+    original: AutoAdjustmentOriginalSidecar,
+    metadata: ImageMetadata,
+}
+
+#[derive(Debug)]
+struct PreparedAutoAdjustmentMetadata {
+    original: AutoAdjustmentOriginalSidecar,
+    updated_metadata: ImageMetadata,
+    serialized_metadata: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct AutoAdjustmentPreparedSidecar {
+    path: String,
+    source_path: PathBuf,
+    sidecar_path: PathBuf,
+    original: AutoAdjustmentOriginalSidecar,
+    updated_metadata: ImageMetadata,
+    serialized_metadata: Vec<u8>,
+}
+
+#[derive(Debug)]
+struct AutoAdjustmentAnalyzedSource {
+    path: String,
+    source_path: PathBuf,
+    sidecar_path: PathBuf,
+    source_revision: SourceRevision,
+    camera_defaults: CameraDefaults,
+    source_kind: ImageSourceKind,
+    developed_width: u32,
+    developed_height: u32,
+    auto_adjustments: Value,
+}
+
+#[derive(Debug)]
+struct AutoAdjustmentCommit {
+    sidecars: Vec<AutoAdjustmentPreparedSidecar>,
+    requested_paths: Vec<String>,
+}
+
+struct AutoAdjustmentMetadataPhase {
+    settings: AppSettings,
+    paths: Vec<String>,
+}
+
+static RAW_AUTO_ANALYSIS_LOCK: Mutex<()> = Mutex::new(());
+const MAX_SOURCE_SNAPSHOT_ATTEMPTS: usize = 8;
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+struct SourceRevision {
+    resolved_path: PathBuf,
+    identity: FileIdentity,
+    digest: blake3::Hash,
+}
+
+#[derive(Debug)]
+struct SourceSnapshot {
+    bytes: Vec<u8>,
+    revision: SourceRevision,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum SourceSnapshotStage {
+    AfterResolve,
+    AfterOpen,
+}
+
+fn with_raw_auto_analysis_limit<T>(analysis: impl FnOnce() -> T) -> T {
+    let _guard = RAW_AUTO_ANALYSIS_LOCK
+        .lock()
+        .unwrap_or_else(|error| error.into_inner());
+    analysis()
+}
+
+fn source_digest_for_bytes(bytes: &[u8]) -> blake3::Hash {
+    blake3::hash(bytes)
+}
+
+fn source_snapshot_for_path(path: &Path) -> std::io::Result<SourceSnapshot> {
+    source_snapshot_with(path, |_, _| Ok(()))
+}
+
+fn source_snapshot_with<F>(path: &Path, after_stage: F) -> std::io::Result<SourceSnapshot>
+where
+    F: FnMut(SourceSnapshotStage, &Path) -> std::io::Result<()>,
+{
+    let (bytes, revision) = stable_source_revision_with(
+        path,
+        |source| {
+            let mut bytes = Vec::new();
+            source.read_to_end(&mut bytes)?;
+            let digest = source_digest_for_bytes(&bytes);
+            Ok((bytes, digest))
+        },
+        after_stage,
+    )?;
+    Ok(SourceSnapshot { bytes, revision })
+}
+
+fn source_revision_for_path(path: &Path) -> std::io::Result<SourceRevision> {
+    source_revision_with(path, |_, _| Ok(()))
+}
+
+fn source_revision_with<F>(path: &Path, after_stage: F) -> std::io::Result<SourceRevision>
+where
+    F: FnMut(SourceSnapshotStage, &Path) -> std::io::Result<()>,
+{
+    let (_, revision) = stable_source_revision_with(
+        path,
+        |source| {
+            let mut hasher = blake3::Hasher::new();
+            let mut buffer = vec![0_u8; 256 * 1_024];
+            loop {
+                let count = source.read(&mut buffer)?;
+                if count == 0 {
+                    break;
+                }
+                hasher.update(&buffer[..count]);
+            }
+            Ok(((), hasher.finalize()))
+        },
+        after_stage,
+    )?;
+    Ok(revision)
+}
+
+fn stable_source_revision_with<T, R, F>(
+    path: &Path,
+    mut read_source: R,
+    mut after_stage: F,
+) -> std::io::Result<(T, SourceRevision)>
+where
+    R: FnMut(&mut fs::File) -> std::io::Result<(T, blake3::Hash)>,
+    F: FnMut(SourceSnapshotStage, &Path) -> std::io::Result<()>,
+{
+    for _ in 0..MAX_SOURCE_SNAPSHOT_ATTEMPTS {
+        let resolved_path = fs::canonicalize(path)?;
+        after_stage(SourceSnapshotStage::AfterResolve, path)?;
+
+        let mut source = fs::File::open(path)?;
+        let identity = file_identity(&source)?;
+        after_stage(SourceSnapshotStage::AfterOpen, path)?;
+
+        let (value, digest) = read_source(&mut source)?;
+
+        let current_resolved_path = fs::canonicalize(path)?;
+        let current_source = fs::File::open(path)?;
+        let current_identity = file_identity(&current_source)?;
+        let final_resolved_path = fs::canonicalize(path)?;
+        if resolved_path != current_resolved_path
+            || current_resolved_path != final_resolved_path
+            || identity != current_identity
+        {
+            continue;
+        }
+
+        return Ok((
+            value,
+            SourceRevision {
+                resolved_path,
+                identity,
+                digest,
+            },
+        ));
+    }
+
+    Err(std::io::Error::new(
+        std::io::ErrorKind::WouldBlock,
+        format!(
+            "source image '{}' changed while capturing a stable revision",
+            path.display()
+        ),
+    ))
+}
+
+fn revalidate_auto_adjustment_sources_with<R>(
+    analyzed: &[AutoAdjustmentAnalyzedSource],
+    mut revision_for_path: R,
+) -> Result<(), String>
+where
+    R: FnMut(&Path) -> std::io::Result<SourceRevision>,
+{
+    let mut unique_sources = Vec::new();
+    let mut source_indices = HashMap::new();
+
+    for item in analyzed {
+        if let Some(index) = source_indices.get(&item.source_path).copied() {
+            let first: &&AutoAdjustmentAnalyzedSource = &unique_sources[index];
+            if first.source_revision != item.source_revision {
+                return Err(format!(
+                    "Failed to apply auto adjustments to '{}': source image '{}' changed during analysis",
+                    first.path,
+                    first.source_path.display()
+                ));
+            }
+        } else {
+            source_indices.insert(item.source_path.clone(), unique_sources.len());
+            unique_sources.push(item);
+        }
+    }
+
+    for item in unique_sources {
+        let current_revision = revision_for_path(&item.source_path).map_err(|error| {
+            auto_adjustment_path_error(
+                &item.path,
+                format!("revalidate source image '{}'", item.source_path.display()),
+                error,
+            )
+        })?;
+        if current_revision.resolved_path != item.source_revision.resolved_path {
+            return Err(format!(
+                "Failed to apply auto adjustments to '{}': source image '{}' resolved identity changed during analysis",
+                item.path,
+                item.source_path.display()
+            ));
+        }
+        if current_revision != item.source_revision {
+            return Err(format!(
+                "Failed to apply auto adjustments to '{}': source image '{}' changed during analysis",
+                item.path,
+                item.source_path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn analyze_auto_adjustment_source_with<S, D, L>(
+    path: String,
+    settings: &AppSettings,
+    source_snapshotter: S,
+    defaults_extractor: D,
+    loader: L,
+) -> Result<AutoAdjustmentAnalyzedSource, String>
+where
+    S: FnOnce(&Path) -> std::io::Result<SourceSnapshot>,
+    D: FnOnce(&[u8], &Path) -> CameraDefaults,
+    L: FnOnce(&[u8], &str, &AppSettings) -> anyhow::Result<LoadedBaseImage>,
+{
+    let (source_path, sidecar_path) = parse_virtual_path(&path);
+    let source_path_str = source_path.to_string_lossy().to_string();
+    let raw = is_raw_file(&source_path);
+
+    let analyze = || {
+        let source_snapshot = source_snapshotter(&source_path).map_err(|error| {
+            auto_adjustment_path_error(
+                &path,
+                format!("snapshot source image '{}'", source_path.display()),
+                error,
+            )
+        })?;
+        let sidecar_path = resolved_auto_adjustment_sidecar_path(&sidecar_path);
+        let SourceSnapshot {
+            bytes: file_bytes,
+            revision: source_revision,
+        } = source_snapshot;
+        let camera_defaults = if raw {
+            defaults_extractor(&file_bytes, &source_path)
+        } else {
+            CameraDefaults::default()
+        };
+        let loaded = loader(&file_bytes, &source_path_str, settings).map_err(|error| {
+            auto_adjustment_path_error(
+                &path,
+                format!("decode source image '{}'", source_path.display()),
+                error,
+            )
+        })?;
+        drop(file_bytes);
+
+        let auto_results = perform_auto_analysis(&loaded.image);
+        let auto_adjustments = auto_results_to_json(&auto_results);
+        let (developed_width, developed_height) = loaded.image.dimensions();
+        let source_kind = loaded.source_kind;
+        drop(loaded);
+
+        Ok(AutoAdjustmentAnalyzedSource {
+            path,
+            source_path,
+            sidecar_path,
+            source_revision,
+            camera_defaults,
+            source_kind,
+            developed_width,
+            developed_height,
+            auto_adjustments,
+        })
+    };
+
+    if raw {
+        with_raw_auto_analysis_limit(analyze)
+    } else {
+        analyze()
+    }
+}
+
+fn auto_adjustment_path_error(
+    path: &str,
+    operation: impl fmt::Display,
+    error: impl fmt::Display,
+) -> String {
+    format!("Failed to apply auto adjustments to '{path}': {operation}: {error}")
+}
+
+fn auto_adjustment_path_context(paths: &[String]) -> String {
+    match paths {
+        [path] => format!("'{path}'"),
+        _ => format!(
+            "{} requested paths [{}]",
+            paths.len(),
+            paths
+                .iter()
+                .map(|path| format!("'{path}'"))
+                .collect::<Vec<_>>()
+                .join(", ")
+        ),
+    }
+}
+
+async fn run_auto_adjustment_phases_with<T, W, S>(
+    paths: Vec<String>,
+    write_phase: W,
+    start_thumbnail_phase: S,
+) -> Result<(), String>
+where
+    T: Send + 'static,
+    W: FnOnce() -> Result<T, String> + Send + 'static,
+    S: FnOnce(T) + Send + 'static,
+{
+    let path_context = auto_adjustment_path_context(&paths);
+    let prepared = tokio::task::spawn_blocking(write_phase)
+        .await
+        .map_err(|error| {
+            let outcome = if error.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            format!(
+                "Failed to apply auto adjustments to {path_context}: blocking metadata phase {outcome}"
+            )
+        })??;
+
+    start_thumbnail_phase(prepared);
+    Ok(())
+}
+
+fn merge_auto_adjustments(metadata: &mut ImageMetadata, auto_adjustments: &Value) {
+    if metadata.adjustments.is_null() {
+        metadata.adjustments = serde_json::json!({});
+    }
+
+    if let (Some(existing_map), Some(auto_map)) = (
+        metadata.adjustments.as_object_mut(),
+        auto_adjustments.as_object(),
+    ) {
+        for (key, value) in auto_map {
+            if key == "sectionVisibility" {
+                if let Some(existing_visibility_value) = existing_map.get_mut(key) {
+                    if let (Some(existing_visibility), Some(auto_visibility)) =
+                        (existing_visibility_value.as_object_mut(), value.as_object())
+                    {
+                        for (visibility_key, visibility_value) in auto_visibility {
+                            existing_visibility
+                                .insert(visibility_key.clone(), visibility_value.clone());
+                        }
+                    }
+                } else {
+                    existing_map.insert(key.clone(), value.clone());
+                }
+            } else {
+                existing_map.insert(key.clone(), value.clone());
+            }
+        }
+    }
+}
+
+fn read_auto_adjustment_sidecar_with<R>(
+    path: &str,
+    sidecar_path: &Path,
+    reader: R,
+) -> Result<AutoAdjustmentSidecarSnapshot, String>
+where
+    R: FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+{
+    let (metadata, original) = match reader(sidecar_path) {
+        Ok(bytes) => {
+            let metadata = serde_json::from_slice(&bytes).map_err(|error| {
+                auto_adjustment_path_error(
+                    path,
+                    format!("parse sidecar '{}'", sidecar_path.display()),
+                    error,
+                )
+            })?;
+            (metadata, AutoAdjustmentOriginalSidecar::Bytes(bytes))
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => (
+            ImageMetadata::default(),
+            AutoAdjustmentOriginalSidecar::Absent,
+        ),
+        Err(error) => {
+            return Err(auto_adjustment_path_error(
+                path,
+                format!("read sidecar '{}'", sidecar_path.display()),
+                error,
+            ));
+        }
+    };
+
+    Ok(AutoAdjustmentSidecarSnapshot { original, metadata })
+}
+
+#[allow(clippy::too_many_arguments)]
+fn prepare_auto_adjustment_metadata_from_snapshot(
+    snapshot: AutoAdjustmentSidecarSnapshot,
+    path: &str,
+    sidecar_path: &Path,
+    auto_adjustments: &Value,
+    camera_defaults: &CameraDefaults,
+    source_kind: ImageSourceKind,
+    developed_width: u32,
+    developed_height: u32,
+) -> Result<PreparedAutoAdjustmentMetadata, String> {
+    let AutoAdjustmentSidecarSnapshot {
+        original,
+        mut metadata,
+    } = snapshot;
+
+    metadata.adjustments = crate::camera_defaults::effective_adjustments(
+        &metadata.adjustments,
+        camera_defaults,
+        source_kind,
+        developed_width,
+        developed_height,
+    );
+    merge_auto_adjustments(&mut metadata, auto_adjustments);
+
+    let serialized_metadata = serde_json::to_vec_pretty(&metadata).map_err(|error| {
+        auto_adjustment_path_error(
+            path,
+            format!("serialize sidecar '{}'", sidecar_path.display()),
+            error,
+        )
+    })?;
+
+    Ok(PreparedAutoAdjustmentMetadata {
+        original,
+        updated_metadata: metadata,
+        serialized_metadata,
+    })
+}
+
+#[cfg(test)]
+#[allow(clippy::too_many_arguments)]
+fn prepare_auto_adjustment_metadata_with<R>(
+    path: &str,
+    sidecar_path: &Path,
+    auto_adjustments: &Value,
+    camera_defaults: &CameraDefaults,
+    source_kind: ImageSourceKind,
+    developed_width: u32,
+    developed_height: u32,
+    reader: R,
+) -> Result<PreparedAutoAdjustmentMetadata, String>
+where
+    R: FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+{
+    let snapshot = read_auto_adjustment_sidecar_with(path, sidecar_path, reader)?;
+    prepare_auto_adjustment_metadata_from_snapshot(
+        snapshot,
+        path,
+        sidecar_path,
+        auto_adjustments,
+        camera_defaults,
+        source_kind,
+        developed_width,
+        developed_height,
+    )
+}
+
+fn resolved_auto_adjustment_sidecar_path(sidecar_path: &Path) -> PathBuf {
+    let parent = sidecar_path
+        .parent()
+        .filter(|parent| !parent.as_os_str().is_empty())
+        .unwrap_or_else(|| Path::new("."));
+    let Some(file_name) = sidecar_path.file_name() else {
+        return sidecar_path.to_path_buf();
+    };
+
+    fs::canonicalize(parent)
+        .map(|resolved_parent| resolved_parent.join(file_name))
+        .unwrap_or_else(|_| sidecar_path.to_path_buf())
+}
+
+fn auto_adjustment_original_expectation(
+    original: &AutoAdjustmentOriginalSidecar,
+) -> TargetExpectation<'_> {
+    match original {
+        AutoAdjustmentOriginalSidecar::Absent => TargetExpectation::Absent,
+        AutoAdjustmentOriginalSidecar::Bytes(bytes) => TargetExpectation::Bytes(bytes),
+    }
+}
+
+fn auto_adjustment_original_replacement(
+    original: &AutoAdjustmentOriginalSidecar,
+) -> TargetReplacement<'_> {
+    match original {
+        AutoAdjustmentOriginalSidecar::Absent => TargetReplacement::Absent,
+        AutoAdjustmentOriginalSidecar::Bytes(bytes) => TargetReplacement::Bytes(bytes),
+    }
+}
+
+fn target_snapshot_matches_original(
+    snapshot: &TargetSnapshot,
+    original: &AutoAdjustmentOriginalSidecar,
+) -> bool {
+    match (snapshot, original) {
+        (TargetSnapshot::Absent, AutoAdjustmentOriginalSidecar::Absent) => true,
+        (TargetSnapshot::Bytes(current), AutoAdjustmentOriginalSidecar::Bytes(original)) => {
+            current == original
+        }
+        _ => false,
+    }
+}
+
+fn rollback_auto_adjustment_sidecar_with<U>(
+    attempted: &AutoAdjustmentPreparedSidecar,
+    transition: &mut U,
+) -> Result<(), String>
+where
+    U: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+{
+    let action = match attempted.original {
+        AutoAdjustmentOriginalSidecar::Absent => "remove",
+        AutoAdjustmentOriginalSidecar::Bytes(_) => "restore",
+    };
+    match transition(
+        &attempted.sidecar_path,
+        TargetExpectation::Bytes(&attempted.serialized_metadata),
+        auto_adjustment_original_replacement(&attempted.original),
+    ) {
+        Ok(ConditionalUpdateOutcome::Applied) => Ok(()),
+        Ok(ConditionalUpdateOutcome::Conflict(observed))
+            if target_snapshot_matches_original(&observed, &attempted.original) =>
+        {
+            Ok(())
+        }
+        Ok(ConditionalUpdateOutcome::Conflict(_)) => Err(format!(
+            "sidecar '{}' no longer contains transaction-published bytes",
+            attempted.sidecar_path.display()
+        )),
+        Err(error) => Err(format!(
+            "{action} sidecar '{}': {error}",
+            attempted.sidecar_path.display()
+        )),
+    }
+}
+
+fn rollback_auto_adjustment_sidecars_with<U>(
+    attempted: &[AutoAdjustmentPreparedSidecar],
+    transition: &mut U,
+) -> Vec<String>
+where
+    U: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+{
+    attempted
+        .iter()
+        .rev()
+        .filter_map(|attempted| rollback_auto_adjustment_sidecar_with(attempted, transition).err())
+        .collect()
+}
+
+fn append_auto_adjustment_rollback_status(
+    mut error: String,
+    rollback_errors: Vec<String>,
+) -> String {
+    if rollback_errors.is_empty() {
+        error.push_str("; rollback succeeded");
+    } else {
+        error.push_str("; rollback failed: ");
+        error.push_str(&rollback_errors.join(" | "));
+    }
+    error
+}
+
+fn commit_auto_adjustment_preflight_with<P, U>(
+    preflight_results: Vec<Result<AutoAdjustmentPreparedSidecar, String>>,
+    mut publisher: P,
+    mut rollback_transition: U,
+) -> Result<AutoAdjustmentCommit, String>
+where
+    P: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+    U: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+{
+    let mut prepared = preflight_results
+        .into_iter()
+        .collect::<Result<Vec<_>, _>>()?;
+    let mut seen_paths = HashSet::new();
+    let mut requested_paths = Vec::with_capacity(prepared.len());
+    for item in &prepared {
+        if seen_paths.insert(item.path.clone()) {
+            requested_paths.push(item.path.clone());
+        }
+    }
+    prepared.sort_by(|left, right| left.sidecar_path.cmp(&right.sidecar_path));
+
+    let mut deduplicated = Vec::with_capacity(prepared.len());
+    for item in prepared {
+        if deduplicated
+            .last()
+            .is_some_and(|previous: &AutoAdjustmentPreparedSidecar| {
+                previous.sidecar_path == item.sidecar_path
+            })
+        {
+            continue;
+        }
+        deduplicated.push(item);
+    }
+    let prepared = deduplicated;
+
+    for index in 0..prepared.len() {
+        let item = &prepared[index];
+        match publisher(
+            &item.sidecar_path,
+            auto_adjustment_original_expectation(&item.original),
+            TargetReplacement::Bytes(&item.serialized_metadata),
+        ) {
+            Ok(ConditionalUpdateOutcome::Applied) => {}
+            Ok(ConditionalUpdateOutcome::Conflict(_)) => {
+                let rollback_errors = rollback_auto_adjustment_sidecars_with(
+                    &prepared[..index],
+                    &mut rollback_transition,
+                );
+                let error = format!(
+                    "Failed to apply auto adjustments to '{}': sidecar '{}' changed before publication",
+                    item.path,
+                    item.sidecar_path.display()
+                );
+                return Err(append_auto_adjustment_rollback_status(
+                    error,
+                    rollback_errors,
+                ));
+            }
+            Err(write_error) => {
+                let rollback_errors = rollback_auto_adjustment_sidecars_with(
+                    &prepared[..=index],
+                    &mut rollback_transition,
+                );
+                let error = auto_adjustment_path_error(
+                    &item.path,
+                    format!("write sidecar '{}'", item.sidecar_path.display()),
+                    write_error,
+                );
+                return Err(append_auto_adjustment_rollback_status(
+                    error,
+                    rollback_errors,
+                ));
+            }
+        }
+    }
+
+    Ok(AutoAdjustmentCommit {
+        sidecars: prepared,
+        requested_paths,
+    })
+}
+
+fn revalidate_auto_adjustment_sidecars_with<R>(
+    prepared: &[AutoAdjustmentPreparedSidecar],
+    reader: &mut R,
+) -> Result<(), String>
+where
+    R: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+{
+    for item in prepared {
+        let current = reader(&item.sidecar_path);
+        let unchanged = match (&item.original, current) {
+            (AutoAdjustmentOriginalSidecar::Absent, Err(error))
+                if error.kind() == std::io::ErrorKind::NotFound =>
+            {
+                true
+            }
+            (AutoAdjustmentOriginalSidecar::Bytes(original), Ok(current)) => current == *original,
+            (_, Err(error)) if error.kind() != std::io::ErrorKind::NotFound => {
+                return Err(auto_adjustment_path_error(
+                    &item.path,
+                    format!("revalidate sidecar '{}'", item.sidecar_path.display()),
+                    error,
+                ));
+            }
+            _ => false,
+        };
+
+        if !unchanged {
+            return Err(format!(
+                "Failed to apply auto adjustments to '{}': sidecar '{}' changed before commit",
+                item.path,
+                item.sidecar_path.display()
+            ));
+        }
+    }
+
+    Ok(())
+}
+
+fn commit_analyzed_auto_adjustments_with<S, R, P, U>(
+    analyzed: Vec<AutoAdjustmentAnalyzedSource>,
+    source_revision_reader: S,
+    mut sidecar_reader: R,
+    publisher: P,
+    rollback_transition: U,
+) -> Result<AutoAdjustmentCommit, String>
+where
+    S: FnMut(&Path) -> std::io::Result<SourceRevision>,
+    R: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+    P: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+    U: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+{
+    let mut seen_requested_paths = HashSet::new();
+    let requested_paths = analyzed
+        .iter()
+        .filter_map(|item| {
+            seen_requested_paths
+                .insert(item.path.clone())
+                .then(|| item.path.clone())
+        })
+        .collect::<Vec<_>>();
+    let mut seen_sidecars = HashSet::new();
+    let mut prepared = Vec::with_capacity(analyzed.len());
+
+    for item in &analyzed {
+        if !seen_sidecars.insert(item.sidecar_path.clone()) {
+            continue;
+        }
+        let snapshot = read_auto_adjustment_sidecar_with(&item.path, &item.sidecar_path, |path| {
+            sidecar_reader(path)
+        })?;
+        let metadata = prepare_auto_adjustment_metadata_from_snapshot(
+            snapshot,
+            &item.path,
+            &item.sidecar_path,
+            &item.auto_adjustments,
+            &item.camera_defaults,
+            item.source_kind,
+            item.developed_width,
+            item.developed_height,
+        )?;
+        prepared.push(AutoAdjustmentPreparedSidecar {
+            path: item.path.clone(),
+            source_path: item.source_path.clone(),
+            sidecar_path: item.sidecar_path.clone(),
+            original: metadata.original,
+            updated_metadata: metadata.updated_metadata,
+            serialized_metadata: metadata.serialized_metadata,
+        });
+    }
+
+    revalidate_auto_adjustment_sources_with(&analyzed, source_revision_reader)?;
+    revalidate_auto_adjustment_sidecars_with(&prepared, &mut sidecar_reader)?;
+
+    let mut committed = commit_auto_adjustment_preflight_with(
+        prepared.into_iter().map(Ok).collect(),
+        publisher,
+        rollback_transition,
+    )?;
+    committed.requested_paths = requested_paths;
+    Ok(committed)
+}
+
+fn read_validated_auto_adjustment_sidecar(path: &Path) -> std::io::Result<Vec<u8>> {
+    match inspect_sidecar_target(path)? {
+        crate::sidecar_io::TargetState::Absent => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("sidecar '{}' does not exist", path.display()),
+        )),
+        crate::sidecar_io::TargetState::RegularFile => fs::read(path),
+    }
+}
+
+fn analyze_auto_adjustment_paths(
+    paths: Vec<String>,
+    settings: &AppSettings,
+) -> Result<Vec<AutoAdjustmentAnalyzedSource>, String> {
+    let mut raw_jobs = Vec::new();
+    let mut non_raw_jobs = Vec::new();
+    for (index, path) in paths.into_iter().enumerate() {
+        let job = (index, path);
+        if is_raw_file(&parse_virtual_path(&job.1).0) {
+            raw_jobs.push(job);
+        } else {
+            non_raw_jobs.push(job);
+        }
+    }
+
+    let analyze = |(index, path)| {
+        let result = analyze_auto_adjustment_source_with(
+            path,
+            settings,
+            source_snapshot_for_path,
+            camera_defaults_for_bytes,
+            |bytes, source_path, settings| {
+                image_loader::load_base_image_for_analysis_from_bytes(
+                    bytes,
+                    source_path,
+                    true,
+                    settings,
+                    None,
+                )
+            },
+        );
+        (index, result)
+    };
+
+    let mut analyzed = raw_jobs.into_iter().map(&analyze).collect::<Vec<_>>();
+    analyzed.extend(
+        non_raw_jobs
+            .into_par_iter()
+            .map(analyze)
+            .collect::<Vec<_>>(),
+    );
+    analyzed.sort_by_key(|(index, _)| *index);
+    analyzed.into_iter().map(|(_, result)| result).collect()
+}
+
+fn apply_auto_adjustment_metadata_phase(
     paths: Vec<String>,
     app_handle: AppHandle,
-) -> Result<(), String> {
+) -> Result<AutoAdjustmentMetadataPhase, String> {
+    let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
+    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+
+    let analyzed = analyze_auto_adjustment_paths(paths, &settings)?;
+    let requested_paths = analyzed
+        .iter()
+        .map(|item| item.path.clone())
+        .collect::<Vec<_>>();
+    let sidecar_paths = analyzed
+        .iter()
+        .map(|item| item.sidecar_path.clone())
+        .collect::<Vec<_>>();
+    let path_context = auto_adjustment_path_context(&requested_paths);
+    let committed = crate::sidecar_io::with_locked_paths(&sidecar_paths, |_| {
+        Ok(commit_analyzed_auto_adjustments_with(
+            analyzed,
+            source_revision_for_path,
+            read_validated_auto_adjustment_sidecar,
+            crate::sidecar_io::atomic_update_if_matches,
+            crate::sidecar_io::atomic_update_if_matches,
+        ))
+    })
+    .map_err(|error| {
+        format!(
+            "Failed to apply auto adjustments to {path_context}: lock sidecars for commit: {error}"
+        )
+    })??;
+
+    if enable_xmp_sync {
+        for item in &committed.sidecars {
+            sync_metadata_to_xmp(
+                &item.source_path,
+                &item.updated_metadata,
+                create_xmp_if_missing,
+            );
+        }
+    }
+
+    Ok(AutoAdjustmentMetadataPhase {
+        settings,
+        paths: committed.requested_paths,
+    })
+}
+
+fn start_auto_adjustment_thumbnail_phase(
+    phase: AutoAdjustmentMetadataPhase,
+    app_handle: AppHandle,
+) {
     let state = app_handle.state::<AppState>();
-    add_to_thumbnail_queue(&state, paths.len(), &app_handle);
+    add_to_thumbnail_queue(&state, phase.paths.len(), &app_handle);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let settings = load_settings(app_handle.clone()).unwrap_or_default();
-        let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-        let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-
         let state = app_handle.state::<AppState>();
         let thumb_cache_dir = match resolve_thumbnail_cache_dir(&app_handle) {
             Ok(dir) => dir,
-            Err(e) => {
-                log::warn!("Unable to initialize thumbnail cache directory: {}", e);
-                for path in &paths {
-                    emit_thumbnail_cache_setup_error(&app_handle, path, &e);
+            Err(error) => {
+                log::warn!("Unable to initialize thumbnail cache directory: {error}");
+                for path in &phase.paths {
+                    emit_thumbnail_cache_setup_error(&app_handle, path, &error);
                 }
-                for _ in 0..paths.len() {
+                for _ in 0..phase.paths.len() {
                     increment_thumbnail_progress(&state, &app_handle);
                 }
                 return;
@@ -3660,87 +4554,40 @@ pub async fn apply_auto_adjustments_to_paths(
 
         let gpu_context = gpu_processing::get_or_init_gpu_context(&state, &app_handle).ok();
 
-        paths.par_iter().for_each(|path| {
-            let loaded_image: Option<LoadedBaseImage> = (|| -> Result<LoadedBaseImage, String> {
-                let (source_path, sidecar_path) = parse_virtual_path(path);
-                let source_path_str = source_path.to_string_lossy().to_string();
-
-                let file_bytes = fs::read(&source_path).map_err(|e| e.to_string())?;
-                let loaded = image_loader::load_base_image_with_metadata_from_bytes(
-                    &file_bytes,
-                    &source_path_str,
-                    true,
-                    &settings,
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
-
-                let auto_results = perform_auto_analysis(&loaded.image);
-                let auto_adjustments_json = auto_results_to_json(&auto_results);
-
-                let mut existing_metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-                if existing_metadata.adjustments.is_null() {
-                    existing_metadata.adjustments = serde_json::json!({});
-                }
-
-                if let (Some(existing_map), Some(auto_map)) = (
-                    existing_metadata.adjustments.as_object_mut(),
-                    auto_adjustments_json.as_object(),
-                ) {
-                    for (k, v) in auto_map {
-                        if k == "sectionVisibility" {
-                            if let Some(existing_vis_val) = existing_map.get_mut(k) {
-                                if let (Some(existing_vis), Some(auto_vis)) =
-                                    (existing_vis_val.as_object_mut(), v.as_object())
-                                {
-                                    for (vis_k, vis_v) in auto_vis {
-                                        existing_vis.insert(vis_k.clone(), vis_v.clone());
-                                    }
-                                }
-                            } else {
-                                existing_map.insert(k.clone(), v.clone());
-                            }
-                        } else {
-                            existing_map.insert(k.clone(), v.clone());
-                        }
-                    }
-                }
-
-                if let Ok(json_string) = serde_json::to_string_pretty(&existing_metadata) {
-                    let _ = std::fs::write(&sidecar_path, json_string);
-                }
-
-                if enable_xmp_sync {
-                    sync_metadata_to_xmp(&source_path, &existing_metadata, create_xmp_if_missing);
-                }
-                Ok(loaded)
-            })()
-            .map_err(|e| eprintln!("Failed to apply auto adjustments to {}: {}", path, e))
-            .ok();
-
+        phase.paths.into_par_iter().for_each(|path| {
             let result = generate_single_thumbnail_and_cache(
-                path,
+                &path,
                 &thumb_cache_dir,
                 gpu_context.as_ref(),
-                loaded_image.map(|loaded| ThumbnailPreloadedImage {
-                    image: Arc::new(loaded.image),
-                    source_kind: loaded.source_kind,
-                }),
+                None,
                 true,
                 &app_handle,
-                &settings,
+                &phase.settings,
             );
 
             if let Some((thumbnail_path, rating, is_edited)) = result {
-                emit_thumbnail_generated(&app_handle, path, &thumbnail_path, rating, is_edited);
+                emit_thumbnail_generated(&app_handle, &path, &thumbnail_path, rating, is_edited);
             }
 
             increment_thumbnail_progress(&state, &app_handle);
         });
     });
+}
 
-    Ok(())
+#[tauri::command]
+pub async fn apply_auto_adjustments_to_paths(
+    paths: Vec<String>,
+    app_handle: AppHandle,
+) -> Result<(), String> {
+    let paths_for_metadata = paths.clone();
+    let app_handle_for_metadata = app_handle.clone();
+
+    run_auto_adjustment_phases_with(
+        paths,
+        move || apply_auto_adjustment_metadata_phase(paths_for_metadata, app_handle_for_metadata),
+        move |phase| start_auto_adjustment_thumbnail_phase(phase, app_handle),
+    )
+    .await
 }
 
 #[tauri::command]
@@ -3755,29 +4602,20 @@ pub fn set_color_label_for_paths(
 
     paths.par_iter().for_each(|path| {
         let (_, sidecar_path) = parse_virtual_path(path);
+        let updated = crate::exif_processing::update_sidecar(&sidecar_path, |metadata| {
+            let mut tags = metadata.tags.take().unwrap_or_default();
+            tags.retain(|tag| !tag.starts_with(COLOR_TAG_PREFIX));
 
-        let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
+            if let Some(color) = &color
+                && !color.is_empty()
+            {
+                tags.push(format!("{COLOR_TAG_PREFIX}{color}"));
+            }
+            metadata.tags = (!tags.is_empty()).then_some(tags);
+            Ok(())
+        });
 
-        let mut tags = metadata.tags.unwrap_or_default();
-        tags.retain(|tag| !tag.starts_with(COLOR_TAG_PREFIX));
-
-        if let Some(c) = &color
-            && !c.is_empty()
-        {
-            tags.push(format!("{}{}", COLOR_TAG_PREFIX, c));
-        }
-
-        if tags.is_empty() {
-            metadata.tags = None;
-        } else {
-            metadata.tags = Some(tags);
-        }
-
-        if let Ok(json_string) = serde_json::to_string_pretty(&metadata) {
-            let _ = std::fs::write(&sidecar_path, json_string);
-        }
-
-        if enable_xmp_sync {
+        if enable_xmp_sync && let Ok(metadata) = updated {
             let source_path = parse_virtual_path(path).0;
             sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
         }
@@ -3798,16 +4636,12 @@ pub fn set_rating_for_paths(
 
     paths.par_iter().for_each(|path| {
         let (_, sidecar_path) = parse_virtual_path(path);
+        let updated = crate::exif_processing::update_sidecar(&sidecar_path, |metadata| {
+            metadata.rating = rating;
+            Ok(())
+        });
 
-        let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-        metadata.rating = rating;
-
-        if let Ok(json_string) = serde_json::to_string_pretty(&metadata) {
-            let _ = std::fs::write(&sidecar_path, json_string);
-        }
-
-        if enable_xmp_sync {
+        if enable_xmp_sync && let Ok(metadata) = updated {
             let source_path = parse_virtual_path(path).0;
             sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
         }
@@ -3871,14 +4705,14 @@ pub async fn load_metadata(
     let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
 
     let (source_path, sidecar_path) = parse_virtual_path(&path);
-    let mut metadata = crate::exif_processing::load_sidecar(&sidecar_path);
-
-    if enable_xmp_sync
-        && sync_metadata_from_xmp(&source_path, &mut metadata)
-        && let Ok(json) = serde_json::to_string_pretty(&metadata)
-    {
-        let _ = fs::write(&sidecar_path, json);
-    }
+    let metadata = if enable_xmp_sync {
+        crate::exif_processing::update_sidecar_if(&sidecar_path, |metadata| {
+            Ok(sync_metadata_from_xmp(&source_path, metadata))
+        })
+        .unwrap_or_else(|_| crate::exif_processing::load_sidecar(&sidecar_path))
+    } else {
+        crate::exif_processing::load_sidecar(&sidecar_path)
+    };
 
     Ok(metadata_result_for_path_blocking_with(
         metadata,
@@ -5020,8 +5854,8 @@ mod tests {
     use std::{
         collections::HashMap,
         sync::{
-            Arc,
-            atomic::{AtomicUsize, Ordering},
+            Arc, Mutex,
+            atomic::{AtomicBool, AtomicUsize, Ordering},
         },
         time::Duration,
     };
@@ -5087,6 +5921,1978 @@ mod tests {
             &thumbnail_test_profile(),
             &ThumbnailLutRequest::NotRequested,
         )
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn auto_adjust_command_waits_for_writes_before_starting_thumbnails() {
+        let thumbnail_started = Arc::new(AtomicBool::new(false));
+        let thumbnail_started_for_phase = Arc::clone(&thumbnail_started);
+        let (write_started_sender, write_started_receiver) = tokio::sync::oneshot::channel();
+        let (release_write_sender, release_write_receiver) = std::sync::mpsc::channel();
+
+        let command = tokio::spawn(run_auto_adjustment_phases_with(
+            vec!["gated.RAF".to_string()],
+            move || {
+                write_started_sender.send(()).unwrap();
+                release_write_receiver.recv().unwrap();
+                Ok::<_, String>("prepared thumbnail")
+            },
+            move |prepared| {
+                assert_eq!(prepared, "prepared thumbnail");
+                thumbnail_started_for_phase.store(true, Ordering::SeqCst);
+            },
+        ));
+
+        write_started_receiver.await.unwrap();
+        assert!(!command.is_finished());
+        assert!(!thumbnail_started.load(Ordering::SeqCst));
+
+        release_write_sender.send(()).unwrap();
+        assert_eq!(command.await.unwrap(), Ok(()));
+        assert!(thumbnail_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn auto_adjust_command_propagates_mutation_error_without_starting_thumbnails() {
+        let thumbnail_started = Arc::new(AtomicBool::new(false));
+        let thumbnail_started_for_phase = Arc::clone(&thumbnail_started);
+        let expected = "synthetic mutation failure".to_string();
+        let expected_for_phase = expected.clone();
+
+        let result = run_auto_adjustment_phases_with(
+            vec!["failed.RAF".to_string()],
+            move || Err::<(), _>(expected_for_phase),
+            move |_| thumbnail_started_for_phase.store(true, Ordering::SeqCst),
+        )
+        .await;
+
+        assert_eq!(result, Err(expected));
+        assert!(!thumbnail_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn auto_adjust_command_reports_blocking_panic_without_starting_thumbnails() {
+        let thumbnail_started = Arc::new(AtomicBool::new(false));
+        let thumbnail_started_for_phase = Arc::clone(&thumbnail_started);
+
+        let result = run_auto_adjustment_phases_with(
+            vec!["panic.RAF".to_string()],
+            || -> Result<(), String> { panic!("synthetic blocking panic") },
+            move |_| thumbnail_started_for_phase.store(true, Ordering::SeqCst),
+        )
+        .await;
+
+        assert_eq!(
+            result,
+            Err(
+                "Failed to apply auto adjustments to 'panic.RAF': blocking metadata phase panicked"
+                    .to_string()
+            )
+        );
+        assert!(!thumbnail_started.load(Ordering::SeqCst));
+    }
+
+    fn auto_adjust_test_prepared_sidecar(
+        path: &str,
+        sidecar_path: &str,
+        original: AutoAdjustmentOriginalSidecar,
+        serialized_metadata: &[u8],
+    ) -> AutoAdjustmentPreparedSidecar {
+        AutoAdjustmentPreparedSidecar {
+            path: path.to_string(),
+            source_path: PathBuf::from(path),
+            sidecar_path: PathBuf::from(sidecar_path),
+            original,
+            updated_metadata: ImageMetadata::default(),
+            serialized_metadata: serialized_metadata.to_vec(),
+        }
+    }
+
+    fn auto_adjust_test_transition(
+        state: &Mutex<HashMap<PathBuf, Vec<u8>>>,
+        path: &Path,
+        expected: TargetExpectation<'_>,
+        replacement: TargetReplacement<'_>,
+    ) -> std::io::Result<ConditionalUpdateOutcome> {
+        let mut state = state.lock().unwrap();
+        let observed = state
+            .get(path)
+            .cloned()
+            .map(TargetSnapshot::Bytes)
+            .unwrap_or(TargetSnapshot::Absent);
+        let matches = match (&observed, expected) {
+            (TargetSnapshot::Absent, TargetExpectation::Absent) => true,
+            (TargetSnapshot::Bytes(current), TargetExpectation::Bytes(expected)) => {
+                current == expected
+            }
+            _ => false,
+        };
+        if !matches {
+            return Ok(ConditionalUpdateOutcome::Conflict(observed));
+        }
+
+        match replacement {
+            TargetReplacement::Absent => {
+                state.remove(path);
+            }
+            TargetReplacement::Bytes(bytes) => {
+                state.insert(path.to_path_buf(), bytes.to_vec());
+            }
+        }
+        Ok(ConditionalUpdateOutcome::Applied)
+    }
+
+    fn auto_adjust_test_analyzed_source(
+        path: &str,
+        source_path: &Path,
+        source_digest: blake3::Hash,
+    ) -> AutoAdjustmentAnalyzedSource {
+        AutoAdjustmentAnalyzedSource {
+            path: path.to_string(),
+            source_path: source_path.to_path_buf(),
+            sidecar_path: PathBuf::from(format!("{path}.rrdata")),
+            source_revision: auto_adjust_test_source_revision(source_path, source_digest),
+            camera_defaults: CameraDefaults::default(),
+            source_kind: ImageSourceKind::NonRaw,
+            developed_width: 8,
+            developed_height: 6,
+            auto_adjustments: json!({ "exposure": 0.25 }),
+        }
+    }
+
+    fn auto_adjust_test_source_revision(path: &Path, digest: blake3::Hash) -> SourceRevision {
+        SourceRevision {
+            resolved_path: path.to_path_buf(),
+            identity: FileIdentity::default(),
+            digest,
+        }
+    }
+
+    fn auto_adjust_test_source_snapshot(path: &Path, bytes: &[u8]) -> SourceSnapshot {
+        SourceSnapshot {
+            bytes: bytes.to_vec(),
+            revision: auto_adjust_test_source_revision(path, source_digest_for_bytes(bytes)),
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_inspection_rejects_dangling_symlink_without_modifying_it() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("dangling.RAF.rrdata");
+        let missing_target = temp.path().join("missing-target.rrdata");
+        symlink(&missing_target, &sidecar).unwrap();
+
+        let error = inspect_sidecar_target(&sidecar).unwrap_err();
+        let update_error = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            crate::sidecar_io::TargetExpectation::Absent,
+            crate::sidecar_io::TargetReplacement::Bytes(b"replacement"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(update_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(update_error.to_string().contains("symbolic link"));
+        assert!(
+            fs::symlink_metadata(&sidecar)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+        assert!(!missing_target.exists());
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn sidecar_inspection_rejects_live_symlink_without_modifying_target() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.rrdata");
+        let sidecar = temp.path().join("alias.RAF.rrdata");
+        fs::write(&target, b"target-bytes").unwrap();
+        symlink(&target, &sidecar).unwrap();
+
+        let error = inspect_sidecar_target(&sidecar).unwrap_err();
+        let update_error = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            crate::sidecar_io::TargetExpectation::Bytes(b"target-bytes"),
+            crate::sidecar_io::TargetReplacement::Bytes(b"replacement"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(update_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(update_error.to_string().contains("symbolic link"));
+        assert_eq!(fs::read(&target).unwrap(), b"target-bytes");
+        assert!(
+            fs::symlink_metadata(&sidecar)
+                .unwrap()
+                .file_type()
+                .is_symlink()
+        );
+    }
+
+    #[test]
+    fn sidecar_inspection_rejects_hard_link_without_modifying_aliases() {
+        let temp = tempfile::tempdir().unwrap();
+        let target = temp.path().join("target.rrdata");
+        let sidecar = temp.path().join("alias.RAF.rrdata");
+        fs::write(&target, b"shared-bytes").unwrap();
+        fs::hard_link(&target, &sidecar).unwrap();
+
+        let error = inspect_sidecar_target(&sidecar).unwrap_err();
+        let update_error = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            crate::sidecar_io::TargetExpectation::Bytes(b"shared-bytes"),
+            crate::sidecar_io::TargetReplacement::Absent,
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("hard links"));
+        assert_eq!(update_error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(update_error.to_string().contains("hard links"));
+        assert_eq!(fs::read(&target).unwrap(), b"shared-bytes");
+        assert_eq!(fs::read(&sidecar).unwrap(), b"shared-bytes");
+    }
+
+    #[test]
+    fn sidecar_conditional_update_rejects_directory_without_modifying_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("directory.RAF.rrdata");
+        fs::create_dir(&sidecar).unwrap();
+
+        let error = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            TargetExpectation::Absent,
+            TargetReplacement::Bytes(b"replacement"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind(), std::io::ErrorKind::InvalidInput);
+        assert!(error.to_string().contains("not a regular file"));
+        assert!(sidecar.is_dir());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sidecar_lock_preserves_concurrent_save_for_existing_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = Arc::new(temp.path().join("existing.RAF.rrdata"));
+        fs::write(&*sidecar, br#"{"initial":true}"#).unwrap();
+
+        let (snapshot_sender, snapshot_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (save_entered_sender, save_entered_receiver) = std::sync::mpsc::sync_channel(1);
+
+        let auto_sidecar = Arc::clone(&sidecar);
+        let auto_thread = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&[auto_sidecar.as_ref().clone()], |paths| {
+                let mut value: Value = serde_json::from_slice(&fs::read(&paths[0])?).unwrap();
+                snapshot_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                value["auto"] = json!(true);
+                fs::write(&paths[0], serde_json::to_vec(&value).unwrap())
+            })
+            .unwrap();
+        });
+
+        snapshot_receiver.recv().unwrap();
+        let save_sidecar = Arc::clone(&sidecar);
+        let save_thread = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&[save_sidecar.as_ref().clone()], |paths| {
+                save_entered_sender.send(()).unwrap();
+                let mut value: Value = serde_json::from_slice(&fs::read(&paths[0])?).unwrap();
+                value["save"] = json!(true);
+                fs::write(&paths[0], serde_json::to_vec(&value).unwrap())
+            })
+            .unwrap();
+        });
+
+        assert!(matches!(
+            save_entered_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_sender.send(()).unwrap();
+        auto_thread.join().unwrap();
+        save_thread.join().unwrap();
+
+        let final_value: Value = serde_json::from_slice(&fs::read(&*sidecar).unwrap()).unwrap();
+        assert_eq!(
+            final_value,
+            json!({ "initial": true, "auto": true, "save": true })
+        );
+    }
+
+    #[test]
+    fn sidecar_lock_preserves_concurrent_save_after_absent_sidecar_rollback() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = Arc::new(temp.path().join("absent.RAF.rrdata"));
+        let (published_sender, published_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (save_entered_sender, save_entered_receiver) = std::sync::mpsc::sync_channel(1);
+
+        let auto_sidecar = Arc::clone(&sidecar);
+        let auto_thread = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&[auto_sidecar.as_ref().clone()], |paths| {
+                assert!(!paths[0].exists());
+                fs::write(&paths[0], b"auto-published")?;
+                published_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                fs::remove_file(&paths[0])?;
+                Err::<(), _>(std::io::Error::other("synthetic later-path failure"))
+            })
+            .unwrap_err()
+        });
+
+        published_receiver.recv().unwrap();
+        let save_sidecar = Arc::clone(&sidecar);
+        let save_thread = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&[save_sidecar.as_ref().clone()], |paths| {
+                save_entered_sender.send(()).unwrap();
+                fs::write(&paths[0], b"concurrent-save")
+            })
+            .unwrap();
+        });
+
+        assert!(matches!(
+            save_entered_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_sender.send(()).unwrap();
+        assert_eq!(
+            auto_thread.join().unwrap().to_string(),
+            "synthetic later-path failure"
+        );
+        save_thread.join().unwrap();
+
+        assert_eq!(fs::read(&*sidecar).unwrap(), b"concurrent-save");
+    }
+
+    #[test]
+    fn sidecar_locks_are_acquired_in_one_order_for_reversed_batches() {
+        let temp = tempfile::tempdir().unwrap();
+        let first = temp.path().join("a.RAF.rrdata");
+        let second = temp.path().join("b.RAF.rrdata");
+        let start = Arc::new(std::sync::Barrier::new(3));
+
+        let first_start = Arc::clone(&start);
+        let first_paths = [first.clone(), second.clone()];
+        let first_thread = thread::spawn(move || {
+            first_start.wait();
+            crate::sidecar_io::with_locked_paths(&first_paths, |_| Ok(())).unwrap();
+        });
+
+        let second_start = Arc::clone(&start);
+        let second_paths = [second, first];
+        let second_thread = thread::spawn(move || {
+            second_start.wait();
+            crate::sidecar_io::with_locked_paths(&second_paths, |_| Ok(())).unwrap();
+        });
+
+        start.wait();
+        first_thread.join().unwrap();
+        second_thread.join().unwrap();
+    }
+
+    #[test]
+    fn sidecar_atomic_replace_replaces_existing_target_without_staging_artifacts() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("atomic.RAF.rrdata");
+        fs::write(&sidecar, b"before").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        crate::sidecar_io::atomic_replace(&sidecar, b"after").unwrap();
+
+        assert_eq!(fs::read(&sidecar).unwrap(), b"after");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        let remaining = fs::read_dir(temp.path())
+            .unwrap()
+            .map(|entry| entry.unwrap().file_name())
+            .collect::<Vec<_>>();
+        assert_eq!(remaining, vec![sidecar.file_name().unwrap()]);
+    }
+
+    #[test]
+    fn sidecar_conditional_update_replaces_exact_match_and_preserves_permissions() {
+        use crate::sidecar_io::{ConditionalUpdateOutcome, TargetExpectation, TargetReplacement};
+
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("conditional.RAF.rrdata");
+        fs::write(&sidecar, b"before").unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&sidecar, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+
+        let outcome = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            TargetExpectation::Bytes(b"before"),
+            TargetReplacement::Bytes(b"after"),
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ConditionalUpdateOutcome::Applied);
+        assert_eq!(fs::read(&sidecar).unwrap(), b"after");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&sidecar).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sidecar_conditional_update_preserves_conflicting_bytes() {
+        use crate::sidecar_io::{
+            ConditionalUpdateOutcome, TargetExpectation, TargetReplacement, TargetSnapshot,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("conflict.RAF.rrdata");
+        fs::write(&sidecar, b"external").unwrap();
+
+        let outcome = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            TargetExpectation::Bytes(b"expected"),
+            TargetReplacement::Bytes(b"replacement"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ConditionalUpdateOutcome::Conflict(TargetSnapshot::Bytes(b"external".to_vec()))
+        );
+        assert_eq!(fs::read(&sidecar).unwrap(), b"external");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sidecar_conditional_update_reports_absent_conflict_without_creation() {
+        use crate::sidecar_io::{
+            ConditionalUpdateOutcome, TargetExpectation, TargetReplacement, TargetSnapshot,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("absent-conflict.RAF.rrdata");
+
+        let outcome = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            TargetExpectation::Bytes(b"expected"),
+            TargetReplacement::Bytes(b"replacement"),
+        )
+        .unwrap();
+
+        assert_eq!(
+            outcome,
+            ConditionalUpdateOutcome::Conflict(TargetSnapshot::Absent)
+        );
+        assert!(!sidecar.exists());
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn sidecar_conditional_update_creates_only_when_absent() {
+        use crate::sidecar_io::{
+            ConditionalUpdateOutcome, TargetExpectation, TargetReplacement, TargetSnapshot,
+        };
+
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("created.RAF.rrdata");
+
+        let created = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            TargetExpectation::Absent,
+            TargetReplacement::Bytes(b"created"),
+        )
+        .unwrap();
+        let conflict = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            TargetExpectation::Absent,
+            TargetReplacement::Bytes(b"clobber"),
+        )
+        .unwrap();
+
+        assert_eq!(created, ConditionalUpdateOutcome::Applied);
+        assert_eq!(
+            conflict,
+            ConditionalUpdateOutcome::Conflict(TargetSnapshot::Bytes(b"created".to_vec()))
+        );
+        assert_eq!(fs::read(&sidecar).unwrap(), b"created");
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 1);
+    }
+
+    #[test]
+    fn sidecar_conditional_update_removes_exact_match() {
+        use crate::sidecar_io::{ConditionalUpdateOutcome, TargetExpectation, TargetReplacement};
+
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("removed.RAF.rrdata");
+        fs::write(&sidecar, b"transaction-published").unwrap();
+
+        let outcome = crate::sidecar_io::atomic_update_if_matches(
+            &sidecar,
+            TargetExpectation::Bytes(b"transaction-published"),
+            TargetReplacement::Absent,
+        )
+        .unwrap();
+
+        assert_eq!(outcome, ConditionalUpdateOutcome::Applied);
+        assert_eq!(
+            fs::symlink_metadata(&sidecar).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+        assert_eq!(fs::read_dir(temp.path()).unwrap().count(), 0);
+    }
+
+    #[test]
+    fn ordinary_save_uses_shared_sidecar_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = Arc::new(temp.path().join("save.RAF.rrdata"));
+        let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (saved_sender, saved_receiver) = std::sync::mpsc::sync_channel(1);
+
+        let held_sidecar = Arc::clone(&sidecar);
+        let holder = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&[held_sidecar.as_ref().clone()], |_| {
+                locked_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        locked_receiver.recv().unwrap();
+        let saved_sidecar = Arc::clone(&sidecar);
+        let saver = thread::spawn(move || {
+            write_adjustments_sidecar(&saved_sidecar, json!({ "save": true }), None).unwrap();
+            saved_sender.send(()).unwrap();
+        });
+
+        assert!(matches!(
+            saved_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_sender.send(()).unwrap();
+        holder.join().unwrap();
+        saver.join().unwrap();
+
+        let metadata: ImageMetadata =
+            serde_json::from_slice(&fs::read(&*sidecar).unwrap()).unwrap();
+        assert_eq!(metadata.adjustments, json!({ "save": true }));
+    }
+
+    #[test]
+    fn shared_metadata_updater_waits_for_existing_sidecar_lock() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = Arc::new(temp.path().join("metadata.RAF.rrdata"));
+        let (locked_sender, locked_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (updated_sender, updated_receiver) = std::sync::mpsc::sync_channel(1);
+
+        let held_sidecar = Arc::clone(&sidecar);
+        let holder = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&[held_sidecar.as_ref().clone()], |_| {
+                locked_sender.send(()).unwrap();
+                release_receiver.recv().unwrap();
+                Ok(())
+            })
+            .unwrap();
+        });
+
+        locked_receiver.recv().unwrap();
+        let updated_sidecar = Arc::clone(&sidecar);
+        let updater = thread::spawn(move || {
+            crate::exif_processing::update_sidecar(&updated_sidecar, |metadata| {
+                metadata.rating = 4;
+                Ok(())
+            })
+            .unwrap();
+            updated_sender.send(()).unwrap();
+        });
+
+        assert!(matches!(
+            updated_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_sender.send(()).unwrap();
+        holder.join().unwrap();
+        updater.join().unwrap();
+
+        let metadata: ImageMetadata =
+            serde_json::from_slice(&fs::read(&*sidecar).unwrap()).unwrap();
+        assert_eq!(metadata.rating, 4);
+    }
+
+    #[test]
+    fn raw_auto_analysis_has_one_global_worker_across_batches() {
+        let active = Arc::new(AtomicUsize::new(0));
+        let maximum = Arc::new(AtomicUsize::new(0));
+        let start = Arc::new(std::sync::Barrier::new(3));
+        let mut workers = Vec::new();
+
+        for _ in 0..2 {
+            let active = Arc::clone(&active);
+            let maximum = Arc::clone(&maximum);
+            let start = Arc::clone(&start);
+            workers.push(thread::spawn(move || {
+                start.wait();
+                for _ in 0..3 {
+                    with_raw_auto_analysis_limit(|| {
+                        let current = active.fetch_add(1, Ordering::SeqCst) + 1;
+                        maximum.fetch_max(current, Ordering::SeqCst);
+                        thread::sleep(Duration::from_millis(20));
+                        active.fetch_sub(1, Ordering::SeqCst);
+                    });
+                }
+            }));
+        }
+
+        start.wait();
+        for worker in workers {
+            worker.join().unwrap();
+        }
+
+        assert_eq!(maximum.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn source_digest_detects_same_size_same_mtime_replacement() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.RAF");
+        fs::write(&source, b"before").unwrap();
+        let original_mtime = fs::metadata(&source).unwrap().modified().unwrap();
+        let captured = source_digest_for_bytes(b"before");
+
+        fs::write(&source, b"change").unwrap();
+        filetime::set_file_mtime(
+            &source,
+            filetime::FileTime::from_system_time(original_mtime),
+        )
+        .unwrap();
+
+        assert_ne!(source_revision_for_path(&source).unwrap().digest, captured);
+        assert_eq!(
+            fs::metadata(&source).unwrap().modified().unwrap(),
+            original_mtime
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_adjust_analysis_retries_symlink_retarget_after_resolve_before_open() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first_source = temp.path().join("first.jpg");
+        let second_source = temp.path().join("second.jpg");
+        let linked_source = temp.path().join("active.jpg");
+        fs::write(&first_source, b"revision A").unwrap();
+        fs::write(&second_source, b"revision B").unwrap();
+        symlink(&first_source, &linked_source).unwrap();
+        let first_resolved = fs::canonicalize(&linked_source).unwrap();
+        let second_resolved = fs::canonicalize(&second_source).unwrap();
+        let second_for_snapshot = second_source.clone();
+
+        let analyzed = analyze_auto_adjustment_source_with(
+            linked_source.to_string_lossy().into_owned(),
+            &AppSettings::default(),
+            move |path| {
+                let mut retargeted = false;
+                source_snapshot_with(path, |stage, path| {
+                    if stage == SourceSnapshotStage::AfterResolve && !retargeted {
+                        fs::remove_file(path)?;
+                        symlink(&second_for_snapshot, path)?;
+                        retargeted = true;
+                    }
+                    Ok(())
+                })
+            },
+            |_, _| CameraDefaults::default(),
+            |bytes, _, _| {
+                assert_eq!(bytes, b"revision B");
+                Ok(LoadedBaseImage {
+                    image: DynamicImage::new_rgb8(8, 6),
+                    source_kind: ImageSourceKind::NonRaw,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_ne!(first_resolved, second_resolved);
+        assert_eq!(analyzed.source_revision.resolved_path, second_resolved);
+        assert_eq!(
+            analyzed.source_revision.digest,
+            source_digest_for_bytes(b"revision B")
+        );
+        assert_eq!(
+            analyzed.source_revision.identity,
+            file_identity(&fs::File::open(&second_source).unwrap()).unwrap()
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_adjust_revalidation_rejects_parent_and_final_symlink_retarget_with_identical_bytes() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let first_dir = temp.path().join("first");
+        let second_dir = temp.path().join("second");
+        fs::create_dir_all(&first_dir).unwrap();
+        fs::create_dir_all(&second_dir).unwrap();
+        let first_source = first_dir.join("same.jpg");
+        let second_source = second_dir.join("same.jpg");
+        fs::write(&first_source, b"identical source bytes").unwrap();
+        fs::write(&second_source, b"identical source bytes").unwrap();
+
+        let analyze = |source_path: &Path| {
+            analyze_auto_adjustment_source_with(
+                source_path.to_string_lossy().into_owned(),
+                &AppSettings::default(),
+                source_snapshot_for_path,
+                |_, _| CameraDefaults::default(),
+                |bytes, _, _| {
+                    assert_eq!(bytes, b"identical source bytes");
+                    Ok(LoadedBaseImage {
+                        image: DynamicImage::new_rgb8(8, 6),
+                        source_kind: ImageSourceKind::NonRaw,
+                    })
+                },
+            )
+            .unwrap()
+        };
+
+        let linked_parent = temp.path().join("active");
+        symlink(&first_dir, &linked_parent).unwrap();
+        let parent_link_source = linked_parent.join("same.jpg");
+        let parent_analyzed = analyze(&parent_link_source);
+        fs::remove_file(&linked_parent).unwrap();
+        symlink(&second_dir, &linked_parent).unwrap();
+
+        let parent_error =
+            revalidate_auto_adjustment_sources_with(&[parent_analyzed], source_revision_for_path)
+                .unwrap_err();
+        assert!(parent_error.contains("resolved identity changed during analysis"));
+
+        let final_link_source = temp.path().join("active.jpg");
+        symlink(&first_source, &final_link_source).unwrap();
+        let final_analyzed = analyze(&final_link_source);
+        fs::remove_file(&final_link_source).unwrap();
+        symlink(&second_source, &final_link_source).unwrap();
+
+        let final_error =
+            revalidate_auto_adjustment_sources_with(&[final_analyzed], source_revision_for_path)
+                .unwrap_err();
+        assert!(final_error.contains("resolved identity changed during analysis"));
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_adjust_commit_rejects_path_replaced_after_source_descriptor_opens() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("active.jpg");
+        let incoming = temp.path().join("incoming.jpg");
+        let displaced = temp.path().join("displaced.jpg");
+        fs::write(&source, b"revision A").unwrap();
+        fs::write(&incoming, b"revision B").unwrap();
+        let path = source.to_string_lossy().into_owned();
+
+        let analyzed = analyze_auto_adjustment_source_with(
+            path.clone(),
+            &AppSettings::default(),
+            source_snapshot_for_path,
+            |_, _| CameraDefaults::default(),
+            |bytes, _, _| {
+                assert_eq!(bytes, b"revision A");
+                Ok(LoadedBaseImage {
+                    image: DynamicImage::new_rgb8(8, 6),
+                    source_kind: ImageSourceKind::NonRaw,
+                })
+            },
+        )
+        .unwrap();
+
+        let incoming_for_revision = incoming.clone();
+        let displaced_for_revision = displaced.clone();
+        let publisher_called = Arc::new(AtomicBool::new(false));
+        let publisher_called_for_commit = Arc::clone(&publisher_called);
+        let result = commit_analyzed_auto_adjustments_with(
+            vec![analyzed],
+            move |path| {
+                let mut replaced = false;
+                source_revision_with(path, |stage, path| {
+                    if stage == SourceSnapshotStage::AfterOpen && !replaced {
+                        fs::rename(path, &displaced_for_revision)?;
+                        fs::rename(&incoming_for_revision, path)?;
+                        replaced = true;
+                    }
+                    Ok(())
+                })
+            },
+            |_| Err(std::io::Error::from(std::io::ErrorKind::NotFound)),
+            move |_, _, _| {
+                publisher_called_for_commit.store(true, Ordering::SeqCst);
+                Ok(ConditionalUpdateOutcome::Applied)
+            },
+            |_, _, _| Ok(ConditionalUpdateOutcome::Applied),
+        );
+
+        assert!(
+            result.is_err(),
+            "revision B must not receive adjustments analyzed from revision A"
+        );
+        assert!(!publisher_called.load(Ordering::SeqCst));
+        assert_eq!(fs::read(&source).unwrap(), b"revision B");
+        assert_eq!(fs::read(&displaced).unwrap(), b"revision A");
+        assert!(result.unwrap_err().contains("changed during analysis"));
+    }
+
+    #[test]
+    fn auto_adjust_analysis_uses_one_snapshot_for_defaults_and_pixels() {
+        let order = Arc::new(Mutex::new(Vec::new()));
+        let order_for_read = Arc::clone(&order);
+        let order_for_defaults = Arc::clone(&order);
+        let order_for_decode = Arc::clone(&order);
+        let expected_defaults = thumbnail_test_defaults();
+        let defaults_for_extract = expected_defaults.clone();
+
+        let analyzed = analyze_auto_adjustment_source_with(
+            "snapshot.RAF".to_string(),
+            &AppSettings::default(),
+            move |path| {
+                order_for_read.lock().unwrap().push("read");
+                Ok(auto_adjust_test_source_snapshot(path, b"captured-source"))
+            },
+            move |bytes, path| {
+                assert_eq!(bytes, b"captured-source");
+                assert_eq!(path, Path::new("snapshot.RAF"));
+                order_for_defaults.lock().unwrap().push("defaults");
+                defaults_for_extract
+            },
+            move |bytes, path, _| {
+                assert_eq!(bytes, b"captured-source");
+                assert_eq!(path, "snapshot.RAF");
+                order_for_decode.lock().unwrap().push("decode");
+                Ok(LoadedBaseImage {
+                    image: DynamicImage::new_rgb8(8, 6),
+                    source_kind: ImageSourceKind::DevelopedRaw,
+                })
+            },
+        )
+        .unwrap();
+
+        assert_eq!(*order.lock().unwrap(), vec!["read", "defaults", "decode"]);
+        assert_eq!(analyzed.camera_defaults, expected_defaults);
+        assert_eq!(
+            analyzed.source_revision.digest,
+            source_digest_for_bytes(b"captured-source")
+        );
+        assert_eq!(
+            (analyzed.developed_width, analyzed.developed_height),
+            (8, 6)
+        );
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn auto_adjust_analysis_preserves_final_sidecar_symlink_for_rejection() {
+        use std::os::unix::fs::symlink;
+
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("source.jpg");
+        let path = source.to_string_lossy().to_string();
+        let (_, sidecar) = parse_virtual_path(&path);
+        let target = temp.path().join("target.rrdata");
+        fs::write(&target, b"target").unwrap();
+        symlink(&target, &sidecar).unwrap();
+
+        let analyzed = analyze_auto_adjustment_source_with(
+            path,
+            &AppSettings::default(),
+            |path| Ok(auto_adjust_test_source_snapshot(path, b"source")),
+            |_, _| CameraDefaults::default(),
+            |_, _, _| {
+                Ok(LoadedBaseImage {
+                    image: DynamicImage::new_rgb8(8, 6),
+                    source_kind: ImageSourceKind::NonRaw,
+                })
+            },
+        )
+        .unwrap();
+
+        let error = inspect_sidecar_target(&analyzed.sidecar_path).unwrap_err();
+        assert!(error.to_string().contains("symbolic link"));
+        assert_eq!(fs::read(&target).unwrap(), b"target");
+    }
+
+    #[test]
+    fn auto_adjust_revalidation_rejects_source_replaced_during_analysis() {
+        let temp = tempfile::tempdir().unwrap();
+        let source = temp.path().join("during.jpg");
+        fs::write(&source, b"before").unwrap();
+        let path = source.to_string_lossy().to_string();
+        let source_for_loader = source.clone();
+
+        let analyzed = analyze_auto_adjustment_source_with(
+            path.clone(),
+            &AppSettings::default(),
+            source_snapshot_for_path,
+            |_, _| CameraDefaults::default(),
+            move |bytes, _, _| {
+                assert_eq!(bytes, b"before");
+                fs::write(&source_for_loader, b"change").unwrap();
+                Ok(LoadedBaseImage {
+                    image: DynamicImage::new_rgb8(8, 6),
+                    source_kind: ImageSourceKind::NonRaw,
+                })
+            },
+        )
+        .unwrap();
+
+        let error = revalidate_auto_adjustment_sources_with(&[analyzed], source_revision_for_path)
+            .unwrap_err();
+        assert_eq!(
+            error,
+            format!(
+                "Failed to apply auto adjustments to '{path}': source image '{}' changed during analysis",
+                source.display()
+            )
+        );
+    }
+
+    #[test]
+    fn auto_adjust_revalidation_hashes_virtual_alias_source_once() {
+        let source = PathBuf::from("same.RAF");
+        let captured = source_digest_for_bytes(b"same bytes");
+        let analyzed = vec![
+            auto_adjust_test_analyzed_source("same.RAF?vc=one", &source, captured),
+            auto_adjust_test_analyzed_source("same.RAF?vc=two", &source, captured),
+        ];
+        let calls = Arc::new(AtomicUsize::new(0));
+        let calls_for_digest = Arc::clone(&calls);
+
+        revalidate_auto_adjustment_sources_with(&analyzed, move |path| {
+            assert_eq!(path, Path::new("same.RAF"));
+            calls_for_digest.fetch_add(1, Ordering::SeqCst);
+            Ok(auto_adjust_test_source_revision(path, captured))
+        })
+        .unwrap();
+
+        assert_eq!(calls.load(Ordering::SeqCst), 1);
+    }
+
+    #[test]
+    fn auto_adjust_revalidation_rejects_different_alias_captures_before_rehash() {
+        let source = PathBuf::from("same.RAF");
+        let analyzed = vec![
+            auto_adjust_test_analyzed_source(
+                "same.RAF?vc=first",
+                &source,
+                source_digest_for_bytes(b"before"),
+            ),
+            auto_adjust_test_analyzed_source(
+                "same.RAF?vc=second",
+                &source,
+                source_digest_for_bytes(b"change"),
+            ),
+        ];
+        let rehashed = Arc::new(AtomicBool::new(false));
+        let rehashed_for_digest = Arc::clone(&rehashed);
+
+        let error = revalidate_auto_adjustment_sources_with(&analyzed, move |_| {
+            rehashed_for_digest.store(true, Ordering::SeqCst);
+            Ok(auto_adjust_test_source_revision(
+                Path::new("same.RAF"),
+                source_digest_for_bytes(b"change"),
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Failed to apply auto adjustments to 'same.RAF?vc=first': source image 'same.RAF' changed during analysis"
+        );
+        assert!(!rehashed.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn auto_adjust_transaction_rejects_sidecar_changed_after_snapshot_before_writing() {
+        let source = PathBuf::from("changed.jpg");
+        let sidecar = PathBuf::from("changed.jpg.rrdata");
+        let captured = source_digest_for_bytes(b"source");
+        let analyzed = auto_adjust_test_analyzed_source("changed.jpg", &source, captured);
+        let original = serde_json::to_vec(&ImageMetadata::default()).unwrap();
+        let reads = Arc::new(AtomicUsize::new(0));
+        let reads_for_sidecar = Arc::clone(&reads);
+        let writer_called = Arc::new(AtomicBool::new(false));
+        let writer_called_for_commit = Arc::clone(&writer_called);
+
+        let error = commit_analyzed_auto_adjustments_with(
+            vec![analyzed],
+            |path| Ok(auto_adjust_test_source_revision(path, captured)),
+            move |path| {
+                assert_eq!(path, sidecar);
+                let read = reads_for_sidecar.fetch_add(1, Ordering::SeqCst);
+                if read == 0 {
+                    Ok(original.clone())
+                } else {
+                    Ok(b"external replacement".to_vec())
+                }
+            },
+            move |_, _, _| {
+                writer_called_for_commit.store(true, Ordering::SeqCst);
+                Ok(ConditionalUpdateOutcome::Applied)
+            },
+            |_, _, _| Ok(ConditionalUpdateOutcome::Applied),
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            error,
+            "Failed to apply auto adjustments to 'changed.jpg': sidecar 'changed.jpg.rrdata' changed before commit"
+        );
+        assert_eq!(reads.load(Ordering::SeqCst), 2);
+        assert!(!writer_called.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn auto_adjust_transaction_retains_logical_paths_that_share_one_sidecar() {
+        let source = PathBuf::from("same.RAF");
+        let sidecar = PathBuf::from("same.RAF.shared.rrdata");
+        let captured = source_digest_for_bytes(b"source");
+        let mut first = auto_adjust_test_analyzed_source("same.RAF?vc=first", &source, captured);
+        first.sidecar_path = sidecar.clone();
+        let mut second = auto_adjust_test_analyzed_source("same.RAF?vc=second", &source, captured);
+        second.sidecar_path = sidecar;
+
+        let committed = commit_analyzed_auto_adjustments_with(
+            vec![first, second],
+            |path| Ok(auto_adjust_test_source_revision(path, captured)),
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "synthetic absence",
+                ))
+            },
+            |_, _, _| Ok(ConditionalUpdateOutcome::Applied),
+            |_, _, _| Ok(ConditionalUpdateOutcome::Applied),
+        )
+        .unwrap();
+
+        assert_eq!(committed.sidecars.len(), 1);
+        assert_eq!(
+            committed.requested_paths,
+            vec!["same.RAF?vc=first", "same.RAF?vc=second"]
+        );
+    }
+
+    #[test]
+    fn auto_adjust_rollback_preserves_external_replacement() {
+        let captured = source_digest_for_bytes(b"source");
+        let first = auto_adjust_test_analyzed_source("a.jpg", Path::new("a.jpg"), captured);
+        let second = auto_adjust_test_analyzed_source("b.jpg", Path::new("b.jpg"), captured);
+        let first_sidecar = first.sidecar_path.clone();
+        let second_sidecar = second.sidecar_path.clone();
+        let original = serde_json::to_vec(&ImageMetadata::default()).unwrap();
+        let external = b"external replacement".to_vec();
+        let state = Arc::new(Mutex::new(HashMap::from([
+            (first_sidecar.clone(), original.clone()),
+            (second_sidecar.clone(), original.clone()),
+        ])));
+        let state_for_reader = Arc::clone(&state);
+        let state_for_publisher = Arc::clone(&state);
+        let state_for_rollback = Arc::clone(&state);
+        let failing_sidecar = second_sidecar.clone();
+        let external_for_writer = external.clone();
+
+        let error = commit_analyzed_auto_adjustments_with(
+            vec![first, second],
+            |path| Ok(auto_adjust_test_source_revision(path, captured)),
+            move |path| {
+                state_for_reader
+                    .lock()
+                    .unwrap()
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            move |path, expected, replacement| {
+                let outcome =
+                    auto_adjust_test_transition(&state_for_publisher, path, expected, replacement)?;
+                if path == failing_sidecar {
+                    state_for_publisher
+                        .lock()
+                        .unwrap()
+                        .insert(path.to_path_buf(), external_for_writer.clone());
+                    return Err(std::io::Error::other("synthetic later failure"));
+                }
+                Ok(outcome)
+            },
+            move |path, expected, replacement| {
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+        )
+        .unwrap_err();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.get(&first_sidecar), Some(&original));
+        assert_eq!(state.get(&second_sidecar), Some(&external));
+        assert!(error.contains("rollback failed"));
+        assert!(error.contains("no longer contains transaction-published bytes"));
+    }
+
+    #[test]
+    fn auto_adjust_atomic_transaction_rolls_back_existing_and_absent_before_concurrent_save() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_source = temp.path().join("a.jpg");
+        let second_source = temp.path().join("b.jpg");
+        let first_path = first_source.to_string_lossy().to_string();
+        let second_path = second_source.to_string_lossy().to_string();
+        let captured = source_digest_for_bytes(b"source");
+        let mut first = auto_adjust_test_analyzed_source(&first_path, &first_source, captured);
+        let mut second = auto_adjust_test_analyzed_source(&second_path, &second_source, captured);
+        first.sidecar_path = temp.path().join("a.jpg.rrdata");
+        second.sidecar_path = temp.path().join("b.jpg.rrdata");
+        let first_sidecar = first.sidecar_path.clone();
+        let second_sidecar = second.sidecar_path.clone();
+
+        let original_metadata = ImageMetadata {
+            rating: 2,
+            tags: Some(vec!["original".to_string()]),
+            ..ImageMetadata::default()
+        };
+        let mut original_bytes = serde_json::to_vec_pretty(&original_metadata).unwrap();
+        original_bytes.push(b'\n');
+        fs::write(&first_sidecar, &original_bytes).unwrap();
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            fs::set_permissions(&first_sidecar, fs::Permissions::from_mode(0o640)).unwrap();
+        }
+        let saved_metadata = ImageMetadata {
+            rating: 5,
+            tags: Some(vec!["concurrent".to_string()]),
+            ..ImageMetadata::default()
+        };
+        let saved_bytes = serde_json::to_vec_pretty(&saved_metadata).unwrap();
+
+        let (published_sender, published_receiver) = std::sync::mpsc::sync_channel(0);
+        let (release_sender, release_receiver) = std::sync::mpsc::sync_channel(0);
+        let (observed_sender, observed_receiver) = std::sync::mpsc::sync_channel(1);
+        let auto_paths = vec![first_sidecar.clone(), second_sidecar.clone()];
+        let first_for_writer = first_sidecar.clone();
+        let mut published_sender = Some(published_sender);
+        let auto_thread = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&auto_paths, |_| {
+                Ok(commit_analyzed_auto_adjustments_with(
+                    vec![first, second],
+                    |path| Ok(auto_adjust_test_source_revision(path, captured)),
+                    read_validated_auto_adjustment_sidecar,
+                    move |path, expected, replacement| {
+                        let outcome = crate::sidecar_io::atomic_update_if_matches(
+                            path,
+                            expected,
+                            replacement,
+                        )?;
+                        if path == first_for_writer {
+                            published_sender.take().unwrap().send(()).unwrap();
+                            release_receiver.recv().unwrap();
+                            Ok(outcome)
+                        } else {
+                            Err(std::io::Error::other("synthetic later failure"))
+                        }
+                    },
+                    crate::sidecar_io::atomic_update_if_matches,
+                ))
+            })
+            .unwrap()
+            .unwrap_err()
+        });
+
+        published_receiver.recv().unwrap();
+        let save_sidecar = first_sidecar.clone();
+        let saved_bytes_for_thread = saved_bytes.clone();
+        let save_thread = thread::spawn(move || {
+            crate::sidecar_io::with_locked_paths(&[save_sidecar], |paths| {
+                observed_sender.send(fs::read(&paths[0])?).unwrap();
+                crate::sidecar_io::atomic_replace(&paths[0], &saved_bytes_for_thread)
+            })
+            .unwrap();
+        });
+
+        assert!(matches!(
+            observed_receiver.recv_timeout(Duration::from_millis(100)),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout)
+        ));
+        release_sender.send(()).unwrap();
+        let auto_error = auto_thread.join().unwrap();
+        assert!(auto_error.contains("rollback succeeded"));
+        assert_eq!(observed_receiver.recv().unwrap(), original_bytes);
+        save_thread.join().unwrap();
+
+        assert_eq!(fs::read(&first_sidecar).unwrap(), saved_bytes);
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt;
+
+            assert_eq!(
+                fs::metadata(&first_sidecar).unwrap().permissions().mode() & 0o777,
+                0o640
+            );
+        }
+        assert_eq!(
+            fs::symlink_metadata(&second_sidecar).unwrap_err().kind(),
+            std::io::ErrorKind::NotFound
+        );
+    }
+
+    #[test]
+    fn auto_adjust_preflight_merge_preserves_metadata_and_serializes_result() {
+        let tags = Some(vec!["landscape".to_string(), "favorite".to_string()]);
+        let exif = Some(HashMap::from([
+            ("Make".to_string(), "FUJIFILM".to_string()),
+            ("Model".to_string(), "GFX100RF".to_string()),
+        ]));
+        let null_metadata = ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: Value::Null,
+            tags: tags.clone(),
+            exif: exif.clone(),
+        };
+        let auto_adjustments = json!({
+            "exposure": 1.25,
+            "sectionVisibility": {
+                "basic": true,
+                "color": true,
+                "effects": true,
+            },
+        });
+        let null_metadata_bytes = serde_json::to_vec(&null_metadata).unwrap();
+
+        let prepared_from_null = prepare_auto_adjustment_metadata_with(
+            "null.RAF",
+            Path::new("null.RAF.rrdata"),
+            &auto_adjustments,
+            &CameraDefaults::default(),
+            ImageSourceKind::NonRaw,
+            8,
+            6,
+            move |_| Ok(null_metadata_bytes),
+        )
+        .unwrap();
+        let merged_from_null = prepared_from_null.updated_metadata;
+
+        assert_eq!(merged_from_null.version, 7);
+        assert_eq!(merged_from_null.rating, 4);
+        assert_eq!(merged_from_null.tags, tags);
+        assert_eq!(merged_from_null.exif, exif);
+        assert_eq!(merged_from_null.adjustments, auto_adjustments);
+        let serialized: ImageMetadata =
+            serde_json::from_slice(&prepared_from_null.serialized_metadata).unwrap();
+        assert_eq!(
+            serde_json::to_value(serialized).unwrap(),
+            serde_json::to_value(&merged_from_null).unwrap()
+        );
+
+        let existing = ImageMetadata {
+            adjustments: json!({
+                "exposure": -2.0,
+                "custom": "preserved",
+                "sectionVisibility": {
+                    "basic": false,
+                    "effects": false,
+                },
+            }),
+            ..merged_from_null
+        };
+        let existing_bytes = serde_json::to_vec(&existing).unwrap();
+        let prepared_existing = prepare_auto_adjustment_metadata_with(
+            "existing.RAF",
+            Path::new("existing.RAF.rrdata"),
+            &auto_adjustments,
+            &CameraDefaults::default(),
+            ImageSourceKind::NonRaw,
+            8,
+            6,
+            move |_| Ok(existing_bytes),
+        )
+        .unwrap();
+        let merged_existing = prepared_existing.updated_metadata;
+
+        assert_eq!(merged_existing.adjustments["exposure"], json!(1.25));
+        assert_eq!(merged_existing.adjustments["custom"], json!("preserved"));
+        assert_eq!(
+            merged_existing.adjustments["sectionVisibility"],
+            json!({
+                "basic": true,
+                "color": true,
+                "effects": true,
+            })
+        );
+    }
+
+    #[test]
+    fn auto_adjust_null_developed_raw_materializes_camera_framing_before_merge() {
+        let tags = Some(vec!["camera-default".to_string()]);
+        let exif = Some(HashMap::from([(
+            "Model".to_string(),
+            "GFX100RF".to_string(),
+        )]));
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 5,
+            adjustments: Value::Null,
+            tags: tags.clone(),
+            exif: exif.clone(),
+        };
+        let auto_adjustments = json!({
+            "exposure": 1.25,
+            "sectionVisibility": {
+                "basic": true,
+                "effects": true,
+            },
+        });
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+
+        let prepared = prepare_auto_adjustment_metadata_with(
+            "developed.RAF",
+            Path::new("developed.RAF.rrdata"),
+            &auto_adjustments,
+            &thumbnail_test_defaults(),
+            ImageSourceKind::DevelopedRaw,
+            8,
+            6,
+            move |_| Ok(metadata_bytes),
+        )
+        .unwrap();
+        let updated = prepared.updated_metadata;
+
+        assert_eq!(updated.version, 7);
+        assert_eq!(updated.rating, 5);
+        assert_eq!(updated.tags, tags);
+        assert_eq!(updated.exif, exif);
+        assert_eq!(updated.adjustments["exposure"], json!(1.25));
+        assert_eq!(
+            updated.adjustments["crop"],
+            json!({ "x": 2.0, "y": 2.0, "width": 4.0, "height": 2.0 })
+        );
+        assert_eq!(updated.adjustments["aspectRatio"], json!(2.0));
+        assert_eq!(
+            updated.adjustments["sectionVisibility"],
+            json!({ "basic": true, "effects": true })
+        );
+    }
+
+    #[test]
+    fn auto_adjust_null_fallback_sources_do_not_materialize_camera_framing() {
+        let auto_adjustments = json!({
+            "exposure": 0.75,
+            "sectionVisibility": { "basic": true },
+        });
+
+        for source_kind in [ImageSourceKind::EmbeddedPreview, ImageSourceKind::NonRaw] {
+            let metadata_bytes = serde_json::to_vec(&ImageMetadata::default()).unwrap();
+            let prepared = prepare_auto_adjustment_metadata_with(
+                "fallback.RAF",
+                Path::new("fallback.RAF.rrdata"),
+                &auto_adjustments,
+                &thumbnail_test_defaults(),
+                source_kind,
+                8,
+                6,
+                move |_| Ok(metadata_bytes),
+            )
+            .unwrap();
+            let updated = prepared.updated_metadata;
+
+            assert_eq!(updated.adjustments, auto_adjustments, "{source_kind:?}");
+            assert!(updated.adjustments.get("crop").is_none());
+            assert!(updated.adjustments.get("aspectRatio").is_none());
+        }
+    }
+
+    #[test]
+    fn auto_adjust_persisted_object_wins_camera_defaults_and_receives_merge() {
+        let metadata = ImageMetadata {
+            adjustments: json!({
+                "crop": { "x": 0.0, "y": 0.0, "width": 8.0, "height": 6.0 },
+                "aspectRatio": 1.3333333333333333,
+                "custom": "preserved",
+                "sectionVisibility": { "effects": false },
+            }),
+            ..ImageMetadata::default()
+        };
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+        let auto_adjustments = json!({
+            "exposure": 0.5,
+            "sectionVisibility": { "basic": true },
+        });
+
+        let prepared = prepare_auto_adjustment_metadata_with(
+            "persisted.RAF",
+            Path::new("persisted.RAF.rrdata"),
+            &auto_adjustments,
+            &thumbnail_test_defaults(),
+            ImageSourceKind::DevelopedRaw,
+            8,
+            6,
+            move |_| Ok(metadata_bytes),
+        )
+        .unwrap();
+        let updated = prepared.updated_metadata;
+
+        assert_eq!(
+            updated.adjustments["crop"],
+            json!({ "x": 0.0, "y": 0.0, "width": 8.0, "height": 6.0 })
+        );
+        assert_eq!(
+            updated.adjustments["aspectRatio"],
+            json!(1.3333333333333333)
+        );
+        assert_eq!(updated.adjustments["custom"], json!("preserved"));
+        assert_eq!(updated.adjustments["exposure"], json!(0.5));
+        assert_eq!(
+            updated.adjustments["sectionVisibility"],
+            json!({ "basic": true, "effects": false })
+        );
+    }
+
+    #[test]
+    fn auto_adjust_existing_sidecar_errors_stop_preflight() {
+        let malformed_path = Path::new("malformed.RAF.rrdata");
+
+        let malformed_error = prepare_auto_adjustment_metadata_with(
+            "malformed.RAF",
+            malformed_path,
+            &json!({ "exposure": 1.0 }),
+            &CameraDefaults::default(),
+            ImageSourceKind::DevelopedRaw,
+            8,
+            6,
+            |_| Ok(b"{not valid json".to_vec()),
+        )
+        .unwrap_err();
+
+        assert!(malformed_error.starts_with(&format!(
+            "Failed to apply auto adjustments to 'malformed.RAF': parse sidecar '{}':",
+            malformed_path.display()
+        )));
+
+        let unreadable_path = Path::new("unreadable.RAF.rrdata");
+        let unreadable_error = prepare_auto_adjustment_metadata_with(
+            "unreadable.RAF",
+            unreadable_path,
+            &json!({ "exposure": 1.0 }),
+            &CameraDefaults::default(),
+            ImageSourceKind::DevelopedRaw,
+            8,
+            6,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic read denial",
+                ))
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            unreadable_error,
+            format!(
+                "Failed to apply auto adjustments to 'unreadable.RAF': read sidecar '{}': synthetic read denial",
+                unreadable_path.display()
+            )
+        );
+    }
+
+    #[test]
+    fn auto_adjust_absent_sidecar_starts_from_default_metadata() {
+        let prepared = prepare_auto_adjustment_metadata_with(
+            "new.jpg",
+            Path::new("new.jpg.rrdata"),
+            &json!({ "exposure": 0.25 }),
+            &CameraDefaults::default(),
+            ImageSourceKind::NonRaw,
+            8,
+            6,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::NotFound,
+                    "synthetic absence",
+                ))
+            },
+        )
+        .unwrap();
+        let updated = prepared.updated_metadata;
+
+        assert_eq!(prepared.original, AutoAdjustmentOriginalSidecar::Absent);
+        assert_eq!(updated.version, 1);
+        assert_eq!(updated.rating, 0);
+        assert_eq!(updated.tags, None);
+        assert_eq!(updated.exif, None);
+        assert_eq!(updated.adjustments, json!({ "exposure": 0.25 }));
+    }
+
+    #[test]
+    fn auto_adjust_thumbnail_phase_retains_paths_without_decoded_images() {
+        let phase = AutoAdjustmentMetadataPhase {
+            settings: AppSettings::default(),
+            paths: vec!["current.RAF".to_string()],
+        };
+
+        assert_eq!(phase.paths, vec!["current.RAF"]);
+    }
+
+    #[test]
+    fn auto_adjust_preflight_failure_performs_zero_writes() {
+        let writer_invoked = Arc::new(AtomicBool::new(false));
+        let writer_invoked_for_commit = Arc::clone(&writer_invoked);
+        let result = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a.RAF",
+                    "a.RAF.rrdata",
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-a",
+                )),
+                Err("synthetic preflight failure".to_string()),
+            ],
+            move |_, _, _| {
+                writer_invoked_for_commit.store(true, Ordering::SeqCst);
+                Ok(ConditionalUpdateOutcome::Applied)
+            },
+            |_, _, _| Ok(ConditionalUpdateOutcome::Applied),
+        );
+
+        assert_eq!(result.unwrap_err(), "synthetic preflight failure");
+        assert!(!writer_invoked.load(Ordering::SeqCst));
+    }
+
+    #[test]
+    fn auto_adjust_commit_later_failure_restores_every_attempted_target() {
+        let a = PathBuf::from("a.RAF.rrdata");
+        let b = PathBuf::from("b.RAF.rrdata");
+        let state = Arc::new(Mutex::new(HashMap::from([
+            (a.clone(), b"old-a".to_vec()),
+            (b.clone(), b"old-b".to_vec()),
+        ])));
+        let write_order = Arc::new(Mutex::new(Vec::new()));
+        let state_for_writer = Arc::clone(&state);
+        let write_order_for_writer = Arc::clone(&write_order);
+        let state_for_rollback = Arc::clone(&state);
+        let failing_path = b.clone();
+
+        let error = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "b.RAF",
+                    b.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-b".to_vec()),
+                    b"new-b",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a.RAF",
+                    a.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-a".to_vec()),
+                    b"new-a",
+                )),
+            ],
+            move |path, expected, replacement| {
+                write_order_for_writer
+                    .lock()
+                    .unwrap()
+                    .push(path.to_path_buf());
+                let outcome =
+                    auto_adjust_test_transition(&state_for_writer, path, expected, replacement)?;
+                if path == failing_path {
+                    return Err(std::io::Error::other("synthetic later failure"));
+                }
+                Ok(outcome)
+            },
+            move |path, expected, replacement| {
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(*write_order.lock().unwrap(), vec![a.clone(), b.clone()]);
+        assert_eq!(state.lock().unwrap().get(&a).unwrap(), b"old-a");
+        assert_eq!(state.lock().unwrap().get(&b).unwrap(), b"old-b");
+        assert_eq!(
+            error,
+            "Failed to apply auto adjustments to 'b.RAF': write sidecar 'b.RAF.rrdata': synthetic later failure; rollback succeeded"
+        );
+    }
+
+    #[test]
+    fn auto_adjust_commit_revalidates_each_target_before_publication() {
+        let a = PathBuf::from("a.RAF.rrdata");
+        let b = PathBuf::from("b.RAF.rrdata");
+        let external_b = b"external-b".to_vec();
+        let state = Arc::new(Mutex::new(HashMap::from([
+            (a.clone(), b"old-a".to_vec()),
+            (b.clone(), b"old-b".to_vec()),
+        ])));
+        let b_replacement_applied = Arc::new(AtomicBool::new(false));
+        let state_for_publisher = Arc::clone(&state);
+        let state_for_rollback = Arc::clone(&state);
+        let b_replacement_applied_for_commit = Arc::clone(&b_replacement_applied);
+        let a_for_writer = a.clone();
+        let b_for_writer = b.clone();
+        let external_for_writer = external_b.clone();
+
+        let error = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a.RAF",
+                    a.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-a".to_vec()),
+                    b"new-a",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "b.RAF",
+                    b.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-b".to_vec()),
+                    b"new-b",
+                )),
+            ],
+            move |path, expected, replacement| {
+                let outcome =
+                    auto_adjust_test_transition(&state_for_publisher, path, expected, replacement)?;
+                if path == a_for_writer && matches!(&outcome, ConditionalUpdateOutcome::Applied) {
+                    state_for_publisher
+                        .lock()
+                        .unwrap()
+                        .insert(b_for_writer.clone(), external_for_writer.clone());
+                } else if path == b_for_writer
+                    && matches!(&outcome, ConditionalUpdateOutcome::Applied)
+                {
+                    b_replacement_applied_for_commit.store(true, Ordering::SeqCst);
+                }
+                Ok(outcome)
+            },
+            move |path, expected, replacement| {
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+        )
+        .unwrap_err();
+
+        let state = state.lock().unwrap();
+        assert_eq!(state.get(&a), Some(&b"old-a".to_vec()));
+        assert_eq!(state.get(&b), Some(&external_b));
+        assert!(!b_replacement_applied.load(Ordering::SeqCst));
+        assert!(error.contains("Failed to apply auto adjustments to 'b.RAF'"));
+        assert!(error.contains("changed before publication"));
+        assert!(error.ends_with("rollback succeeded"));
+    }
+
+    #[test]
+    fn auto_adjust_rollback_revalidates_target_at_restore_boundary() {
+        let a = PathBuf::from("a.RAF.rrdata");
+        let b = PathBuf::from("b.RAF.rrdata");
+        let external_a = b"external-a".to_vec();
+        let state = Arc::new(Mutex::new(HashMap::from([
+            (a.clone(), b"old-a".to_vec()),
+            (b.clone(), b"old-b".to_vec()),
+        ])));
+        let state_for_publisher = Arc::clone(&state);
+        let state_for_rollback = Arc::clone(&state);
+        let failing_path = b.clone();
+        let a_for_restorer = a.clone();
+        let external_for_restorer = external_a.clone();
+
+        let error = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a.RAF",
+                    a.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-a".to_vec()),
+                    b"new-a",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "b.RAF",
+                    b.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-b".to_vec()),
+                    b"new-b",
+                )),
+            ],
+            move |path, expected, replacement| {
+                if path == failing_path {
+                    return Err(std::io::Error::other("synthetic later failure"));
+                }
+                auto_adjust_test_transition(&state_for_publisher, path, expected, replacement)
+            },
+            move |path, expected, replacement| {
+                if path == a_for_restorer {
+                    state_for_rollback
+                        .lock()
+                        .unwrap()
+                        .insert(path.to_path_buf(), external_for_restorer.clone());
+                }
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(state.lock().unwrap().get(&a), Some(&external_a));
+        assert!(error.contains("rollback failed"));
+        assert!(error.contains("no longer contains transaction-published bytes"));
+    }
+
+    #[test]
+    fn auto_adjust_commit_removes_earlier_absent_sidecar_on_rollback() {
+        let a = PathBuf::from("a.RAF.rrdata");
+        let b = PathBuf::from("b.RAF.rrdata");
+        let state = Arc::new(Mutex::new(HashMap::from([(b.clone(), b"old-b".to_vec())])));
+        let state_for_publisher = Arc::clone(&state);
+        let state_for_rollback = Arc::clone(&state);
+        let failing_path = b.clone();
+
+        let error = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a.RAF",
+                    a.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-a",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "b.RAF",
+                    b.to_str().unwrap(),
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-b".to_vec()),
+                    b"new-b",
+                )),
+            ],
+            move |path, expected, replacement| {
+                let outcome =
+                    auto_adjust_test_transition(&state_for_publisher, path, expected, replacement)?;
+                if path == failing_path {
+                    return Err(std::io::Error::other("synthetic later failure"));
+                }
+                Ok(outcome)
+            },
+            move |path, expected, replacement| {
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.ends_with("rollback succeeded"));
+        assert!(!state.lock().unwrap().contains_key(&a));
+        assert_eq!(state.lock().unwrap().get(&b).unwrap(), b"old-b");
+    }
+
+    #[test]
+    fn auto_adjust_rollback_accepts_original_state_after_uncertain_publish() {
+        let sidecar = PathBuf::from("a.RAF.rrdata");
+        let state = Arc::new(Mutex::new(HashMap::from([(
+            sidecar.clone(),
+            b"old-a".to_vec(),
+        )])));
+        let state_for_rollback = Arc::clone(&state);
+
+        let error = commit_auto_adjustment_preflight_with(
+            vec![Ok(auto_adjust_test_prepared_sidecar(
+                "a.RAF",
+                sidecar.to_str().unwrap(),
+                AutoAdjustmentOriginalSidecar::Bytes(b"old-a".to_vec()),
+                b"new-a",
+            ))],
+            |_, _, _| Err(std::io::Error::other("synthetic uncertain publish")),
+            move |path, expected, replacement| {
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(
+            state.lock().unwrap().get(&sidecar),
+            Some(&b"old-a".to_vec())
+        );
+        assert!(error.ends_with("rollback succeeded"));
+    }
+
+    #[test]
+    fn auto_adjust_commit_reports_rollback_failure_and_attempts_every_restore() {
+        let restored = Arc::new(Mutex::new(Vec::new()));
+        let restored_for_commit = Arc::clone(&restored);
+        let result = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a.RAF",
+                    "a.RAF.rrdata",
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-a".to_vec()),
+                    b"new-a",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "b.RAF",
+                    "b.RAF.rrdata",
+                    AutoAdjustmentOriginalSidecar::Bytes(b"old-b".to_vec()),
+                    b"new-b",
+                )),
+            ],
+            |path, _, _| {
+                if path == Path::new("b.RAF.rrdata") {
+                    Err(std::io::Error::other("synthetic write failure"))
+                } else {
+                    Ok(ConditionalUpdateOutcome::Applied)
+                }
+            },
+            move |path, _, _| {
+                restored_for_commit.lock().unwrap().push(path.to_path_buf());
+                if path == Path::new("b.RAF.rrdata") {
+                    Err(std::io::Error::other("synthetic rollback failure"))
+                } else {
+                    Ok(ConditionalUpdateOutcome::Applied)
+                }
+            },
+        );
+
+        assert_eq!(
+            *restored.lock().unwrap(),
+            vec![PathBuf::from("b.RAF.rrdata"), PathBuf::from("a.RAF.rrdata")]
+        );
+        let error = result.unwrap_err();
+        assert!(error.contains("rollback failed"));
+        assert!(error.contains("b.RAF.rrdata"));
+        assert!(error.contains("synthetic rollback failure"));
+    }
+
+    #[test]
+    fn auto_adjust_commit_sorts_and_deduplicates_sidecar_targets() {
+        let write_log = Arc::new(Mutex::new(Vec::new()));
+        let write_log_for_commit = Arc::clone(&write_log);
+        let committed = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "b.RAF",
+                    "b.RAF.rrdata",
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-b",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a-first.RAF",
+                    "a.RAF.rrdata",
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-a-first",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "a-duplicate.RAF",
+                    "a.RAF.rrdata",
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-a-duplicate",
+                )),
+            ],
+            move |path, _, replacement| {
+                let TargetReplacement::Bytes(bytes) = replacement else {
+                    panic!("commit must publish replacement bytes");
+                };
+                write_log_for_commit
+                    .lock()
+                    .unwrap()
+                    .push((path.to_path_buf(), bytes.to_vec()));
+                Ok(ConditionalUpdateOutcome::Applied)
+            },
+            |_, _, _| Ok(ConditionalUpdateOutcome::Applied),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *write_log.lock().unwrap(),
+            vec![
+                (PathBuf::from("a.RAF.rrdata"), b"new-a-first".to_vec()),
+                (PathBuf::from("b.RAF.rrdata"), b"new-b".to_vec()),
+            ]
+        );
+        assert_eq!(committed.sidecars.len(), 2);
+        assert_eq!(committed.sidecars[0].path, "a-first.RAF");
+        assert_eq!(committed.sidecars[1].path, "b.RAF");
+        assert_eq!(
+            committed.requested_paths,
+            vec!["b.RAF", "a-first.RAF", "a-duplicate.RAF"]
+        );
+    }
+
+    #[test]
+    fn auto_adjust_aliases_share_one_write_and_retain_two_thumbnail_paths() {
+        let write_log = Arc::new(Mutex::new(Vec::new()));
+        let write_log_for_commit = Arc::clone(&write_log);
+        let committed = commit_auto_adjustment_preflight_with(
+            vec![
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "same.RAF?vc=alias-a",
+                    "same.RAF.shared.rrdata",
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-a",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "same.RAF?vc=alias-b",
+                    "same.RAF.shared.rrdata",
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-b",
+                )),
+                Ok(auto_adjust_test_prepared_sidecar(
+                    "same.RAF?vc=alias-a",
+                    "same.RAF.shared.rrdata",
+                    AutoAdjustmentOriginalSidecar::Absent,
+                    b"new-a-repeat",
+                )),
+            ],
+            move |path, _, _| {
+                write_log_for_commit
+                    .lock()
+                    .unwrap()
+                    .push(path.to_path_buf());
+                Ok(ConditionalUpdateOutcome::Applied)
+            },
+            |_, _, _| Ok(ConditionalUpdateOutcome::Applied),
+        )
+        .unwrap();
+
+        assert_eq!(
+            *write_log.lock().unwrap(),
+            vec![PathBuf::from("same.RAF.shared.rrdata")]
+        );
+        assert_eq!(committed.sidecars.len(), 1);
+        assert_eq!(
+            committed.requested_paths,
+            vec!["same.RAF?vc=alias-a", "same.RAF?vc=alias-b"]
+        );
+
+        let phase = AutoAdjustmentMetadataPhase {
+            settings: AppSettings::default(),
+            paths: committed.requested_paths,
+        };
+        assert_eq!(phase.paths.len(), 2);
     }
 
     fn thumbnail_test_identity(key: &ThumbnailManifestKey) -> ThumbnailCacheIdentity {

@@ -15,7 +15,9 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use exif::{Reader as ExifReader, Tag};
 use image::{DynamicImage, GenericImageView, ImageReader, imageops};
-use rawler::{Orientation, formats::tiff::SRational};
+use rawler::{
+    Orientation, decoders::RawDecodeParams, formats::tiff::SRational, rawsource::RawSource,
+};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -46,10 +48,41 @@ pub struct LoadedBaseImage {
     pub source_kind: ImageSourceKind,
 }
 
-#[derive(Clone, Copy)]
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum IntrinsicExposurePolicy {
     Apply,
+    #[cfg(test)]
     Skip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum ExifPersistencePolicy {
+    Persist,
+    Skip,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+struct BaseImageLoadPolicy {
+    intrinsic_exposure: IntrinsicExposurePolicy,
+    exif_persistence: ExifPersistencePolicy,
+}
+
+impl BaseImageLoadPolicy {
+    const DEFAULT: Self = Self {
+        intrinsic_exposure: IntrinsicExposurePolicy::Apply,
+        exif_persistence: ExifPersistencePolicy::Persist,
+    };
+
+    const ANALYSIS: Self = Self {
+        intrinsic_exposure: IntrinsicExposurePolicy::Apply,
+        exif_persistence: ExifPersistencePolicy::Skip,
+    };
+
+    #[cfg(test)]
+    const PRE_INTRINSIC_EXPOSURE: Self = Self {
+        intrinsic_exposure: IntrinsicExposurePolicy::Skip,
+        exif_persistence: ExifPersistencePolicy::Persist,
+    };
 }
 
 #[derive(Deserialize)]
@@ -156,14 +189,40 @@ pub fn load_base_image_with_metadata_from_bytes(
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<LoadedBaseImage> {
-    load_base_image_with_intrinsic_policy(
+    load_base_image_with_policy(
         bytes,
         path_for_ext_check,
         use_fast_raw_dev,
         settings,
         cancel_token,
-        IntrinsicExposurePolicy::Apply,
+        BaseImageLoadPolicy::DEFAULT,
     )
+}
+
+pub(crate) fn load_base_image_for_analysis_from_bytes(
+    bytes: &[u8],
+    path_for_ext_check: &str,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<LoadedBaseImage> {
+    load_base_image_for_analysis_with(|policy| {
+        load_base_image_with_policy(
+            bytes,
+            path_for_ext_check,
+            use_fast_raw_dev,
+            settings,
+            cancel_token,
+            policy,
+        )
+    })
+}
+
+fn load_base_image_for_analysis_with<F>(load: F) -> Result<LoadedBaseImage>
+where
+    F: FnOnce(BaseImageLoadPolicy) -> Result<LoadedBaseImage>,
+{
+    load(BaseImageLoadPolicy::ANALYSIS)
 }
 
 #[cfg(test)]
@@ -174,23 +233,32 @@ pub(crate) fn load_base_image_without_intrinsic_exposure_for_test(
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<LoadedBaseImage> {
-    load_base_image_with_intrinsic_policy(
+    load_base_image_with_policy(
         bytes,
         path_for_ext_check,
         use_fast_raw_dev,
         settings,
         cancel_token,
-        IntrinsicExposurePolicy::Skip,
+        BaseImageLoadPolicy::PRE_INTRINSIC_EXPOSURE,
     )
 }
 
-fn load_base_image_with_intrinsic_policy(
+fn run_exif_persistence_with<F>(policy: ExifPersistencePolicy, persist: F)
+where
+    F: FnOnce(),
+{
+    if matches!(policy, ExifPersistencePolicy::Persist) {
+        persist();
+    }
+}
+
+fn load_base_image_with_policy(
     bytes: &[u8],
     path_for_ext_check: &str,
     use_fast_raw_dev: bool,
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
-    intrinsic_exposure_policy: IntrinsicExposurePolicy,
+    policy: BaseImageLoadPolicy,
 ) -> Result<LoadedBaseImage> {
     let highlight_compression = settings.raw_highlight_compression.unwrap_or(2.5);
     let linear_mode = settings.linear_raw_mode.clone();
@@ -204,23 +272,30 @@ fn load_base_image_with_intrinsic_policy(
     let sharpening_amount = settings.raw_preprocessing_sharpening.unwrap_or(0.35);
     let apply_to_non_raws = settings.apply_preprocessing_to_non_raws.unwrap_or(false);
 
-    crate::exif_processing::persist_exif_if_missing(
-        Path::new(path_for_ext_check),
-        path_for_ext_check,
-        bytes,
-    );
+    run_exif_persistence_with(policy.exif_persistence, || {
+        crate::exif_processing::persist_exif_if_missing(
+            Path::new(path_for_ext_check),
+            path_for_ext_check,
+            bytes,
+        );
+    });
 
     if is_raw_file(path_for_ext_check) {
-        match panic::catch_unwind(move || {
-            crate::raw_processing::develop_raw_image(
-                bytes,
-                use_fast_raw_dev,
-                highlight_compression,
-                linear_mode,
-                cancel_token,
-            )
-        }) {
-            Ok(Ok(mut developed)) => {
+        match decode_raw_or_preview_with(
+            bytes,
+            path_for_ext_check,
+            move |bytes| {
+                crate::raw_processing::develop_raw_image(
+                    bytes,
+                    use_fast_raw_dev,
+                    highlight_compression,
+                    linear_mode,
+                    cancel_token,
+                )
+            },
+            extract_preview_or_full_from_source,
+        )? {
+            RawDecodeOutcome::Developed(mut developed) => {
                 if !use_fast_raw_dev && (color_nr_amount > 0.0 || sharpening_amount > 0.0) {
                     let start = Instant::now();
                     remove_raw_artifacts_and_enhance(
@@ -235,7 +310,7 @@ fn load_base_image_with_intrinsic_policy(
                         duration
                     );
                 }
-                if matches!(intrinsic_exposure_policy, IntrinsicExposurePolicy::Apply) {
+                if matches!(policy.intrinsic_exposure, IntrinsicExposurePolicy::Apply) {
                     apply_intrinsic_exposure(
                         &mut developed.image,
                         ImageSourceKind::DevelopedRaw,
@@ -247,53 +322,10 @@ fn load_base_image_with_intrinsic_policy(
                     source_kind: ImageSourceKind::DevelopedRaw,
                 })
             }
-            Ok(Err(e)) => {
-                let classified = classify_raw_develop_error(path_for_ext_check, e);
-
-                if classified.to_string().contains("Load cancelled") {
-                    return Err(classified);
-                }
-
-                log::warn!(
-                    "Error developing RAW file '{}': {}",
-                    path_for_ext_check,
-                    classified
-                );
-                if let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check) {
-                    log::warn!(
-                        "Using embedded preview fallback for '{}' ({}x{})",
-                        path_for_ext_check,
-                        preview.width(),
-                        preview.height()
-                    );
-
-                    return Ok(LoadedBaseImage {
-                        image: linearize_embedded_preview(preview),
-                        source_kind: ImageSourceKind::EmbeddedPreview,
-                    });
-                }
-                Err(classified)
-            }
-            Err(_) => {
-                log::error!("Panic while processing RAW file: {}", path_for_ext_check);
-                if let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check) {
-                    log::warn!(
-                        "Using embedded preview fallback for '{}' after RAW decoder panic ({}x{})",
-                        path_for_ext_check,
-                        preview.width(),
-                        preview.height()
-                    );
-
-                    return Ok(LoadedBaseImage {
-                        image: linearize_embedded_preview(preview),
-                        source_kind: ImageSourceKind::EmbeddedPreview,
-                    });
-                }
-                Err(anyhow!(
-                    "Failed to process RAW file: {}",
-                    path_for_ext_check
-                ))
-            }
+            RawDecodeOutcome::EmbeddedPreview(preview) => Ok(LoadedBaseImage {
+                image: linearize_embedded_preview(preview),
+                source_kind: ImageSourceKind::EmbeddedPreview,
+            }),
         }
     } else {
         let mut image = load_image_with_orientation(bytes, cancel_token)?;
@@ -316,6 +348,73 @@ fn load_base_image_with_intrinsic_policy(
             image,
             source_kind: ImageSourceKind::NonRaw,
         })
+    }
+}
+
+enum RawDecodeOutcome {
+    Developed(crate::raw_processing::DevelopedRawImage),
+    EmbeddedPreview(DynamicImage),
+}
+
+fn decode_raw_or_preview_with<D, P>(
+    bytes: &[u8],
+    path_hint: &str,
+    develop: D,
+    extract_preview: P,
+) -> Result<RawDecodeOutcome>
+where
+    D: FnOnce(&[u8]) -> Result<crate::raw_processing::DevelopedRawImage>,
+    P: FnOnce(&RawSource, &RawDecodeParams) -> Result<Option<DynamicImage>>,
+{
+    match panic::catch_unwind(panic::AssertUnwindSafe(|| develop(bytes))) {
+        Ok(Ok(developed)) => Ok(RawDecodeOutcome::Developed(developed)),
+        Ok(Err(error)) => {
+            let classified = classify_raw_develop_error(path_hint, error);
+
+            if classified.to_string().contains("Load cancelled") {
+                return Err(classified);
+            }
+
+            log::warn!("Error developing RAW file '{}': {}", path_hint, classified);
+            if let Some(preview) = safe_embedded_preview_fallback(bytes, path_hint, extract_preview)
+            {
+                log::warn!(
+                    "Using embedded preview fallback for '{}' ({}x{})",
+                    path_hint,
+                    preview.width(),
+                    preview.height()
+                );
+                Ok(RawDecodeOutcome::EmbeddedPreview(preview))
+            } else {
+                Err(classified)
+            }
+        }
+        Err(_) => {
+            log::error!("Panic while processing RAW file: {}", path_hint);
+            if let Some(preview) = safe_embedded_preview_fallback(bytes, path_hint, extract_preview)
+            {
+                log::warn!(
+                    "Using embedded preview fallback for '{}' after RAW decoder panic ({}x{})",
+                    path_hint,
+                    preview.width(),
+                    preview.height()
+                );
+                Ok(RawDecodeOutcome::EmbeddedPreview(preview))
+            } else {
+                Err(anyhow!("Failed to process RAW file: {}", path_hint))
+            }
+        }
+    }
+}
+
+fn extract_preview_or_full_from_source(
+    source: &RawSource,
+    params: &RawDecodeParams,
+) -> Result<Option<DynamicImage>> {
+    let decoder = rawler::get_decoder(source)?;
+    match decoder.preview_image(source, params)? {
+        Some(preview) => Ok(Some(preview)),
+        None => Ok(decoder.full_image(source, params)?),
     }
 }
 
@@ -465,14 +564,20 @@ fn largest_tiff_jpeg_preview(buf: &[u8]) -> Option<DynamicImage> {
     None
 }
 
-fn embedded_preview_fallback(bytes: &[u8], path: &str) -> Option<DynamicImage> {
+fn embedded_preview_fallback<P>(
+    bytes: &[u8],
+    path: &str,
+    extract_preview: P,
+) -> Option<DynamicImage>
+where
+    P: FnOnce(&RawSource, &RawDecodeParams) -> Result<Option<DynamicImage>>,
+{
     let img = match largest_tiff_jpeg_preview(bytes) {
         Some(img) => img,
-        None => rawler::analyze::extract_preview_pixels(
-            path,
-            &rawler::decoders::RawDecodeParams::default(),
-        )
-        .ok()?,
+        None => {
+            let source = RawSource::new_from_slice(bytes).with_path(path);
+            extract_preview(&source, &RawDecodeParams::default()).ok()??
+        }
     };
 
     let orientation = ExifReader::new()
@@ -490,9 +595,16 @@ fn embedded_preview_fallback(bytes: &[u8], path: &str) -> Option<DynamicImage> {
     })
 }
 
-fn safe_embedded_preview_fallback(bytes: &[u8], path: &str) -> Option<DynamicImage> {
+fn safe_embedded_preview_fallback<P>(
+    bytes: &[u8],
+    path: &str,
+    extract_preview: P,
+) -> Option<DynamicImage>
+where
+    P: FnOnce(&RawSource, &RawDecodeParams) -> Result<Option<DynamicImage>>,
+{
     match panic::catch_unwind(panic::AssertUnwindSafe(|| {
-        embedded_preview_fallback(bytes, path)
+        embedded_preview_fallback(bytes, path, extract_preview)
     })) {
         Ok(preview) => preview,
         Err(_) => {
@@ -1086,6 +1198,7 @@ mod tests {
     use image::{ImageBuffer, Rgb, Rgba};
     use rawler::formats::tiff::SRational;
     use serde_json::json;
+    use std::cell::Cell;
 
     fn rgb_pixel_image() -> DynamicImage {
         DynamicImage::ImageRgb32F(ImageBuffer::from_pixel(1, 1, Rgb([0.25, 0.5, 1.0])))
@@ -1093,6 +1206,111 @@ mod tests {
 
     fn rgba_pixel_image() -> DynamicImage {
         DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba([0.25, 0.5, 1.0, 0.75])))
+    }
+
+    #[test]
+    fn analysis_loader_applies_intrinsic_exposure_without_persisting_exif() {
+        let observed_policy = Cell::new(None);
+        let loaded = load_base_image_for_analysis_with(|policy| {
+            observed_policy.set(Some(policy));
+            Ok(LoadedBaseImage {
+                image: DynamicImage::new_rgb8(2, 3),
+                source_kind: ImageSourceKind::DevelopedRaw,
+            })
+        })
+        .unwrap();
+
+        assert_eq!(
+            observed_policy.get(),
+            Some(BaseImageLoadPolicy {
+                intrinsic_exposure: IntrinsicExposurePolicy::Apply,
+                exif_persistence: ExifPersistencePolicy::Skip,
+            })
+        );
+        assert_eq!(loaded.source_kind, ImageSourceKind::DevelopedRaw);
+    }
+
+    #[test]
+    fn analysis_loader_does_not_mutate_primary_or_legacy_exif_sidecars() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("analysis.jpg");
+        let source_path_str = source_path.to_string_lossy().to_string();
+        let mut encoded = std::io::Cursor::new(Vec::new());
+        DynamicImage::new_rgb8(2, 3)
+            .write_to(&mut encoded, image::ImageFormat::Jpeg)
+            .unwrap();
+        let encoded = encoded.into_inner();
+        fs::write(&source_path, &encoded).unwrap();
+
+        let primary_path = exif_processing::get_primary_sidecar_path(&source_path);
+        let legacy_path = exif_processing::get_rrexif_path(&source_path);
+        let malformed_primary = b"{malformed primary sidecar";
+        let legacy_exif = br#"{"Make":"FUJIFILM","Model":"GFX100RF"}"#;
+        fs::write(&primary_path, malformed_primary).unwrap();
+        fs::write(&legacy_path, legacy_exif).unwrap();
+
+        let loaded = load_base_image_for_analysis_from_bytes(
+            &encoded,
+            &source_path_str,
+            true,
+            &AppSettings::default(),
+            None,
+        )
+        .unwrap();
+
+        assert_eq!(loaded.source_kind, ImageSourceKind::NonRaw);
+        assert_eq!(loaded.image.dimensions(), (2, 3));
+        assert_eq!(fs::read(&primary_path).unwrap(), malformed_primary);
+        assert_eq!(fs::read(&legacy_path).unwrap(), legacy_exif);
+    }
+
+    #[test]
+    fn analysis_exif_policy_skips_persistence_callback() {
+        let persistence_calls = Cell::new(0);
+        run_exif_persistence_with(ExifPersistencePolicy::Skip, || {
+            persistence_calls.set(persistence_calls.get() + 1);
+        });
+        assert_eq!(persistence_calls.get(), 0);
+
+        run_exif_persistence_with(ExifPersistencePolicy::Persist, || {
+            persistence_calls.set(persistence_calls.get() + 1);
+        });
+        assert_eq!(persistence_calls.get(), 1);
+    }
+
+    #[test]
+    fn raw_fallback_after_development_error_uses_captured_bytes_and_path_only_as_hint() {
+        let temp = tempfile::tempdir().unwrap();
+        let source_path = temp.path().join("fallback-race.RAF");
+        let path_hint = source_path.to_string_lossy().into_owned();
+        let captured = b"captured revision A".to_vec();
+        let replacement = b"live revision B";
+        fs::write(&source_path, &captured).unwrap();
+
+        let source_for_develop = source_path.clone();
+        let source_for_fallback = source_path.clone();
+        let outcome = decode_raw_or_preview_with(
+            &captured,
+            &path_hint,
+            move |bytes| {
+                assert_eq!(bytes, b"captured revision A");
+                fs::write(&source_for_develop, replacement).unwrap();
+                Err(anyhow!("synthetic RAW development failure"))
+            },
+            move |source, _| {
+                assert_eq!(source.buf(), b"captured revision A");
+                assert_eq!(source.path(), source_for_fallback.as_path());
+                assert_eq!(fs::read(&source_for_fallback).unwrap(), replacement);
+                Ok(Some(DynamicImage::new_rgb8(3, 2)))
+            },
+        )
+        .unwrap();
+
+        let RawDecodeOutcome::EmbeddedPreview(preview) = outcome else {
+            panic!("development failure must select the embedded preview fallback");
+        };
+        assert_eq!(preview.dimensions(), (3, 2));
+        assert_eq!(fs::read(&source_path).unwrap(), replacement);
     }
 
     #[test]

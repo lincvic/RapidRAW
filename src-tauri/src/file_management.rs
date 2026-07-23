@@ -29,6 +29,7 @@ use crate::PendingMetadata;
 use crate::android_integration::*;
 use crate::app_settings::*;
 use crate::cache_utils::calculate_geometry_hash;
+use crate::camera_defaults::{LoadMetadataResult, metadata_result_for_path};
 use crate::exif_processing;
 use crate::formats::{is_raw_file, is_supported_image_file};
 use crate::gpu_processing;
@@ -2648,7 +2649,7 @@ pub fn set_rating_for_paths(
 }
 
 #[tauri::command]
-pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadata, String> {
+pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<LoadMetadataResult, String> {
     let settings = load_settings(app_handle).unwrap_or_default();
     let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
 
@@ -2662,7 +2663,7 @@ pub fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadat
         let _ = fs::write(&sidecar_path, json);
     }
 
-    Ok(metadata)
+    Ok(metadata_result_for_path(metadata, &source_path))
 }
 
 fn get_presets_path(app_handle: &AppHandle) -> Result<std::path::PathBuf, String> {

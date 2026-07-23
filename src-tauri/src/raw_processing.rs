@@ -2,7 +2,7 @@ use crate::image_processing::apply_orientation;
 use anyhow::{Result, anyhow};
 use image::{DynamicImage, ImageBuffer, Rgba};
 use rawler::{
-    decoders::{Orientation, RawDecodeParams},
+    decoders::{Orientation, RawDecodeParams, RawRenderMetadata},
     imgop::develop::{DemosaicAlgorithm, Intermediate, ProcessingStep, RawDevelop},
     rawimage::{RawImage, RawPhotometricInterpretation},
     rawsource::RawSource,
@@ -12,21 +12,29 @@ use std::sync::{
     atomic::{AtomicUsize, Ordering},
 };
 
+pub struct DevelopedRawImage {
+    pub image: DynamicImage,
+    pub render_metadata: RawRenderMetadata,
+}
+
 pub fn develop_raw_image(
     file_bytes: &[u8],
     fast_demosaic: bool,
     highlight_compression: f32,
     linear_mode: String,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
-) -> Result<DynamicImage> {
-    let (developed_image, orientation) = develop_internal(
+) -> Result<DevelopedRawImage> {
+    let (developed_image, orientation, render_metadata) = develop_internal(
         file_bytes,
         fast_demosaic,
         highlight_compression,
         linear_mode,
         cancel_token,
     )?;
-    Ok(apply_orientation(developed_image, orientation))
+    Ok(DevelopedRawImage {
+        image: apply_orientation(developed_image, orientation),
+        render_metadata,
+    })
 }
 
 fn is_linear_raw_format(raw_image: &RawImage) -> bool {
@@ -51,7 +59,7 @@ fn develop_internal(
     highlight_compression: f32,
     linear_mode: String,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
-) -> Result<(DynamicImage, Orientation)> {
+) -> Result<(DynamicImage, Orientation, RawRenderMetadata)> {
     let check_cancel = || -> Result<()> {
         if let Some((tracker, generation)) = &cancel_token
             && tracker.load(Ordering::SeqCst) != *generation
@@ -75,6 +83,7 @@ fn develop_internal(
         .orientation
         .map(Orientation::from_u16)
         .unwrap_or(Orientation::Normal);
+    let render_metadata = metadata.render_metadata;
 
     let is_linear_format = is_linear_raw_format(&raw_image);
 
@@ -230,7 +239,7 @@ fn develop_internal(
         }
     };
 
-    Ok((dynamic_image, orientation))
+    Ok((dynamic_image, orientation, render_metadata))
 }
 
 pub fn get_fast_demosaic_scale_factor(

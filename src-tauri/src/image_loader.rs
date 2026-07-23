@@ -1,6 +1,7 @@
 use crate::Cursor;
 use crate::app_settings::{AppSettings, load_settings};
 use crate::app_state::{AppState, LoadedImage};
+use crate::camera_defaults::ImageSourceKind;
 use crate::exif_processing;
 use crate::file_management::{parse_virtual_path, read_file_mapped};
 use crate::formats::is_raw_file;
@@ -13,7 +14,7 @@ use anyhow::{Context, Result, anyhow};
 use base64::{Engine as _, engine::general_purpose};
 use exif::{Reader as ExifReader, Tag};
 use image::{DynamicImage, GenericImageView, ImageReader, imageops};
-use rawler::Orientation;
+use rawler::{Orientation, formats::tiff::SRational};
 use rayon::prelude::*;
 use serde::Deserialize;
 use serde_json::Value;
@@ -35,6 +36,18 @@ pub struct LoadImageResult {
     pub metadata: ImageMetadata,
     pub exif: HashMap<String, String>,
     pub is_raw: bool,
+}
+
+#[derive(Clone)]
+pub struct LoadedBaseImage {
+    pub image: DynamicImage,
+    pub source_kind: ImageSourceKind,
+}
+
+#[derive(Clone, Copy)]
+enum IntrinsicExposurePolicy {
+    Apply,
+    Skip,
 }
 
 #[derive(Deserialize)]
@@ -84,6 +97,59 @@ pub fn load_base_image_from_bytes(
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<DynamicImage> {
+    Ok(load_base_image_with_metadata_from_bytes(
+        bytes,
+        path_for_ext_check,
+        use_fast_raw_dev,
+        settings,
+        cancel_token,
+    )?
+    .image)
+}
+
+pub fn load_base_image_with_metadata_from_bytes(
+    bytes: &[u8],
+    path_for_ext_check: &str,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<LoadedBaseImage> {
+    load_base_image_with_intrinsic_policy(
+        bytes,
+        path_for_ext_check,
+        use_fast_raw_dev,
+        settings,
+        cancel_token,
+        IntrinsicExposurePolicy::Apply,
+    )
+}
+
+#[cfg(test)]
+pub(crate) fn load_base_image_without_intrinsic_exposure_for_test(
+    bytes: &[u8],
+    path_for_ext_check: &str,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<LoadedBaseImage> {
+    load_base_image_with_intrinsic_policy(
+        bytes,
+        path_for_ext_check,
+        use_fast_raw_dev,
+        settings,
+        cancel_token,
+        IntrinsicExposurePolicy::Skip,
+    )
+}
+
+fn load_base_image_with_intrinsic_policy(
+    bytes: &[u8],
+    path_for_ext_check: &str,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+    intrinsic_exposure_policy: IntrinsicExposurePolicy,
+) -> Result<LoadedBaseImage> {
     let highlight_compression = settings.raw_highlight_compression.unwrap_or(2.5);
     let linear_mode = settings.linear_raw_mode.clone();
     let color_nr_setting = settings.raw_preprocessing_color_nr.unwrap_or(0.5);
@@ -112,11 +178,11 @@ pub fn load_base_image_from_bytes(
                 cancel_token,
             )
         }) {
-            Ok(Ok(mut image)) => {
+            Ok(Ok(mut developed)) => {
                 if !use_fast_raw_dev && (color_nr_amount > 0.0 || sharpening_amount > 0.0) {
                     let start = Instant::now();
                     remove_raw_artifacts_and_enhance(
-                        &mut image,
+                        &mut developed.image,
                         color_nr_amount,
                         sharpening_amount,
                     );
@@ -127,7 +193,17 @@ pub fn load_base_image_from_bytes(
                         duration
                     );
                 }
-                Ok(image)
+                if matches!(intrinsic_exposure_policy, IntrinsicExposurePolicy::Apply) {
+                    apply_intrinsic_exposure(
+                        &mut developed.image,
+                        ImageSourceKind::DevelopedRaw,
+                        developed.render_metadata.sensor_exposure_comp,
+                    );
+                }
+                Ok(LoadedBaseImage {
+                    image: developed.image,
+                    source_kind: ImageSourceKind::DevelopedRaw,
+                })
             }
             Ok(Err(e)) => {
                 let classified = classify_raw_develop_error(path_for_ext_check, e);
@@ -149,7 +225,10 @@ pub fn load_base_image_from_bytes(
                         preview.height()
                     );
 
-                    return Ok(linearize_embedded_preview(preview));
+                    return Ok(LoadedBaseImage {
+                        image: linearize_embedded_preview(preview),
+                        source_kind: ImageSourceKind::EmbeddedPreview,
+                    });
                 }
                 Err(classified)
             }
@@ -163,7 +242,10 @@ pub fn load_base_image_from_bytes(
                         preview.height()
                     );
 
-                    return Ok(linearize_embedded_preview(preview));
+                    return Ok(LoadedBaseImage {
+                        image: linearize_embedded_preview(preview),
+                        source_kind: ImageSourceKind::EmbeddedPreview,
+                    });
                 }
                 Err(anyhow!(
                     "Failed to process RAW file: {}",
@@ -188,7 +270,46 @@ pub fn load_base_image_from_bytes(
             );
         }
 
-        Ok(image)
+        Ok(LoadedBaseImage {
+            image,
+            source_kind: ImageSourceKind::NonRaw,
+        })
+    }
+}
+
+fn apply_intrinsic_exposure(
+    image: &mut DynamicImage,
+    source_kind: ImageSourceKind,
+    sensor_exposure_comp: Option<SRational>,
+) {
+    if source_kind != ImageSourceKind::DevelopedRaw {
+        return;
+    }
+
+    let Some(exposure_comp) = sensor_exposure_comp else {
+        return;
+    };
+    if exposure_comp.d == 0 {
+        return;
+    }
+
+    let gain = 2_f32.powf(exposure_comp.n as f32 / exposure_comp.d as f32);
+    match image {
+        DynamicImage::ImageRgb32F(buffer) => {
+            for pixel in buffer.pixels_mut() {
+                pixel[0] *= gain;
+                pixel[1] *= gain;
+                pixel[2] *= gain;
+            }
+        }
+        DynamicImage::ImageRgba32F(buffer) => {
+            for pixel in buffer.pixels_mut() {
+                pixel[0] *= gain;
+                pixel[1] *= gain;
+                pixel[2] *= gain;
+            }
+        }
+        _ => {}
     }
 }
 
@@ -885,4 +1006,88 @@ pub async fn load_image(
         exif: exif_data,
         is_raw,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera_defaults::ImageSourceKind;
+    use image::{ImageBuffer, Rgb, Rgba};
+    use rawler::formats::tiff::SRational;
+
+    fn rgb_pixel_image() -> DynamicImage {
+        DynamicImage::ImageRgb32F(ImageBuffer::from_pixel(1, 1, Rgb([0.25, 0.5, 1.0])))
+    }
+
+    fn rgba_pixel_image() -> DynamicImage {
+        DynamicImage::ImageRgba32F(ImageBuffer::from_pixel(1, 1, Rgba([0.25, 0.5, 1.0, 0.75])))
+    }
+
+    #[test]
+    fn intrinsic_exposure_is_linear_unclamped_and_preserves_alpha() {
+        for (ev, expected) in [
+            (0, [0.25, 0.5, 1.0]),
+            (1, [0.5, 1.0, 2.0]),
+            (2, [1.0, 2.0, 4.0]),
+            (3, [2.0, 4.0, 8.0]),
+        ] {
+            let mut rgb = rgb_pixel_image();
+            apply_intrinsic_exposure(
+                &mut rgb,
+                ImageSourceKind::DevelopedRaw,
+                Some(SRational::new(ev, 1)),
+            );
+            let DynamicImage::ImageRgb32F(rgb) = rgb else {
+                panic!("intrinsic exposure changed the RGB image variant");
+            };
+            assert_eq!(rgb.get_pixel(0, 0).0, expected);
+
+            let mut rgba = rgba_pixel_image();
+            apply_intrinsic_exposure(
+                &mut rgba,
+                ImageSourceKind::DevelopedRaw,
+                Some(SRational::new(ev, 1)),
+            );
+            let DynamicImage::ImageRgba32F(rgba) = rgba else {
+                panic!("intrinsic exposure changed the RGBA image variant");
+            };
+            assert_eq!(
+                rgba.get_pixel(0, 0).0,
+                [expected[0], expected[1], expected[2], 0.75]
+            );
+        }
+    }
+
+    #[test]
+    fn intrinsic_exposure_skips_fallback_and_non_raw_pixels() {
+        for source_kind in [ImageSourceKind::EmbeddedPreview, ImageSourceKind::NonRaw] {
+            let mut image = rgba_pixel_image();
+            apply_intrinsic_exposure(&mut image, source_kind, Some(SRational::new(2, 1)));
+            assert_eq!(image.to_rgba32f().get_pixel(0, 0).0, [0.25, 0.5, 1.0, 0.75]);
+        }
+    }
+
+    #[test]
+    fn intrinsic_exposure_skips_missing_or_invalid_metadata() {
+        for exposure_comp in [None, Some(SRational::new(2, 0))] {
+            let mut image = rgba_pixel_image();
+            apply_intrinsic_exposure(&mut image, ImageSourceKind::DevelopedRaw, exposure_comp);
+            assert_eq!(image.to_rgba32f().get_pixel(0, 0).0, [0.25, 0.5, 1.0, 0.75]);
+        }
+    }
+
+    #[test]
+    fn intrinsic_exposure_skips_non_float_images() {
+        let mut image = DynamicImage::ImageRgb8(ImageBuffer::from_pixel(1, 1, Rgb([32, 64, 128])));
+        apply_intrinsic_exposure(
+            &mut image,
+            ImageSourceKind::DevelopedRaw,
+            Some(SRational::new(2, 1)),
+        );
+
+        let DynamicImage::ImageRgb8(image) = image else {
+            panic!("intrinsic exposure changed the non-float image variant");
+        };
+        assert_eq!(image.get_pixel(0, 0).0, [32, 64, 128]);
+    }
 }

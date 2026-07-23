@@ -9,7 +9,7 @@ import { globalImageCache } from '../utils/ImageLRUCache';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { computeSortedLibrary } from './useSortedLibrary';
 
-export function useLibraryActions(handleImageSelect?: (path: string) => void) {
+export function useLibraryActions(handleImageSelect?: (path: string) => Promise<boolean>) {
   const handleRate = useCallback((newRating: number, paths?: string[]) => {
     const { multiSelectedPaths, imageRatings, setLibrary } = useLibraryStore.getState();
     const { selectedImage } = useEditorStore.getState();
@@ -104,7 +104,7 @@ export function useLibraryActions(handleImageSelect?: (path: string) => void) {
       await invoke(Invokes.UpdateExifFields, { paths: physicalPathsArray, updates });
 
       setEditor((state) => {
-        if (!state.selectedImage || !physicalPathsSet.has(state.selectedImage.path.split('?vc=')[0])) return state;
+        if (!state.selectedImage || !physicalPathsSet.has(state.selectedImage.path.split('?vc=')[0])) return {};
         return { selectedImage: { ...state.selectedImage, exif: { ...(state.selectedImage.exif || {}), ...updates } } };
       });
 
@@ -222,11 +222,17 @@ export function useLibraryActions(handleImageSelect?: (path: string) => void) {
         shiftAnchor: selectionAnchorPath ?? (inEditor ? selectedImage.path : libraryActivePath),
         updateLibraryActivePath: !inEditor,
         onSimpleClick: (p: string, isAlreadySelected: boolean) => {
-          if (!isAlreadySelected) {
-            setLibrary({ multiSelectedPaths: [p] });
+          const commitSelection = () => {
+            if (!isAlreadySelected) setLibrary({ multiSelectedPaths: [p] });
+            setLibrary({ selectionAnchorPath: p });
+          };
+          if (handleImageSelect) {
+            void handleImageSelect(p).then((selected) => {
+              if (selected) commitSelection();
+            });
+          } else {
+            commitSelection();
           }
-          if (handleImageSelect) handleImageSelect(p);
-          setLibrary({ selectionAnchorPath: p });
         },
       });
     },
@@ -288,7 +294,7 @@ export function useLibraryActions(handleImageSelect?: (path: string) => void) {
     handleSettingsChange({ ...appSettings, pinnedFolders: newPins });
 
     try {
-      const trees = await invoke(Invokes.GetPinnedFolderTrees, {
+      const trees = await invoke<any[]>(Invokes.GetPinnedFolderTrees, {
         paths: newPins,
         expandedFolders: Array.from(expandedFolders),
         showImageCounts: appSettings.enableFolderImageCounts ?? false,

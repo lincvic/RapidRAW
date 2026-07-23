@@ -32,7 +32,7 @@ interface NegativeConversionModalProps {
   isOpen: boolean;
   onClose(): void;
   targetPaths: string[];
-  onSave(savedPaths: string[]): void;
+  onSave(savedPaths: string[]): Promise<boolean>;
 }
 
 export default function NegativeConversionModal({
@@ -179,8 +179,7 @@ export default function NegativeConversionModal({
         paths: targetPaths,
         params,
       });
-      onSave(savedPaths);
-      onClose();
+      if (await onSave(savedPaths)) onClose();
     } catch (e) {
       console.error('Failed to batch save negatives', e);
     } finally {

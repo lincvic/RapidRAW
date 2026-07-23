@@ -23,7 +23,7 @@ import { AppSettings, Invokes, AlbumItem, Album, AlbumGroup } from '../ui/AppPro
 import { CopyPasteSettings } from '../../utils/adjustments';
 
 export interface AppModalsProps {
-  handleImageSelect: (path: string) => void;
+  handleImageSelect: (path: string) => Promise<boolean>;
   handleSavePanorama: () => Promise<string>;
   handleStartPanorama: (paths: string[]) => void;
   handleSaveHdr: () => Promise<string>;
@@ -171,7 +171,7 @@ export default function AppModals(props: AppModalsProps) {
             },
           })
         }
-        onOpenFile={(path: string) => props.handleImageSelect(path)}
+        onOpenFile={props.handleImageSelect}
         onSave={props.handleSavePanorama}
         onStitch={() => props.handleStartPanorama(panoramaModalState.stitchingSourcePaths)}
         progressMessage={panoramaModalState.progressMessage}
@@ -201,7 +201,7 @@ export default function AppModals(props: AppModalsProps) {
             },
           })
         }
-        onOpenFile={(path: string) => props.handleImageSelect(path)}
+        onOpenFile={props.handleImageSelect}
         onSave={props.handleSaveHdr}
         onMerge={() => props.handleStartHdr(hdrModalState.stitchingSourcePaths)}
         progressMessage={hdrModalState.progressMessage}
@@ -210,12 +210,12 @@ export default function AppModals(props: AppModalsProps) {
         isOpen={negativeModalState.isOpen}
         onClose={() => setUI((state) => ({ negativeModalState: { ...state.negativeModalState, isOpen: false } }))}
         targetPaths={negativeModalState.targetPaths}
-        onSave={(savedPaths) => {
-          props.refreshImageList().then(() => {
-            if (selectedImage && negativeModalState.targetPaths.includes(selectedImage.path) && savedPaths.length > 0) {
-              props.handleImageSelect(savedPaths[0]);
-            }
-          });
+        onSave={async (savedPaths) => {
+          await props.refreshImageList();
+          if (selectedImage && negativeModalState.targetPaths.includes(selectedImage.path) && savedPaths.length > 0) {
+            return props.handleImageSelect(savedPaths[0]);
+          }
+          return true;
         }}
       />
       <DenoiseModal

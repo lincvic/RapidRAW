@@ -1,6 +1,5 @@
 import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import debounce from 'lodash.debounce';
 import { toast } from 'react-toastify';
 import { useEditorStore } from '../store/useEditorStore';
 import { useLibraryStore } from '../store/useLibraryStore';
@@ -17,31 +16,19 @@ import {
 import { calculateCenteredCrop } from '../utils/cropUtils';
 import { Invokes } from '../components/ui/AppProperties';
 import { globalImageCache } from '../utils/ImageLRUCache';
-
-export const debouncedSetHistory = debounce((newAdj: Adjustments) => {
-  useEditorStore.getState().pushHistory(newAdj);
-}, 500);
-
-export const debouncedSave = debounce((path: string, adjustmentsToSave: Adjustments) => {
-  invoke(Invokes.SaveMetadataAndUpdateThumbnail, { path, adjustments: adjustmentsToSave }).catch((err) => {
-    console.error('Auto-save failed:', err);
-    toast.error(`Failed to save changes: ${err}`);
-  });
-}, 300);
+import { runEditorMutation, type SuspendedHistoryToken } from '../services/editorPersistence';
 
 export function useEditorActions() {
   const setEditor = useEditorStore((s) => s.setEditor);
+  const applyExplicitAdjustments = useEditorStore((s) => s.applyExplicitAdjustments);
 
   const setAdjustments = useCallback(
     (value: Partial<Adjustments> | ((prev: Adjustments) => Adjustments)) => {
-      setEditor((state) => {
-        const prev = state.adjustments;
-        const newAdjustments = typeof value === 'function' ? value(prev) : { ...prev, ...value };
-        debouncedSetHistory(newAdjustments);
-        return { adjustments: newAdjustments };
-      });
+      const previous = useEditorStore.getState().adjustments;
+      const next = typeof value === 'function' ? value(previous) : { ...previous, ...value };
+      applyExplicitAdjustments(next);
     },
-    [setEditor],
+    [applyExplicitAdjustments],
   );
 
   const handleRotate = useCallback(
@@ -87,9 +74,10 @@ export function useEditorActions() {
       const isAndroid = useSettingsStore.getState().osPlatform === 'android';
       try {
         const result: { size: number } = await invoke('load_and_parse_lut', { path });
-        let name = isAndroid && path.startsWith('content://')
-          ? await invoke<string>('resolve_android_content_uri_name', { uriStr: path })
-          : path.split(/[\\/]/).pop() || 'LUT';
+        let name =
+          isAndroid && path.startsWith('content://')
+            ? await invoke<string>('resolve_android_content_uri_name', { uriStr: path })
+            : path.split(/[\\/]/).pop() || 'LUT';
         setAdjustments((prev: Adjustments) => ({
           ...prev,
           lutPath: path,
@@ -123,32 +111,32 @@ export function useEditorActions() {
     [setEditor],
   );
 
-  const handleResetAdjustments = useCallback(
-    (paths?: string[]) => {
-      const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
-      const { selectedImage, resetHistory } = useEditorStore.getState();
-      const pathsToReset = paths || multiSelectedPaths;
-      if (pathsToReset.length === 0) return;
+  const handleResetAdjustments = useCallback(async (paths?: string[]) => {
+    const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
+    const { selectedImage } = useEditorStore.getState();
+    const pathsToReset = paths || multiSelectedPaths;
+    if (pathsToReset.length === 0) return;
 
-      pathsToReset.forEach((p) => globalImageCache.delete(p));
-      debouncedSetHistory.cancel();
+    const selectedPath = selectedImage && pathsToReset.includes(selectedImage.path) ? selectedImage.path : null;
+    const finishReset = (historyToken: SuspendedHistoryToken | null) => {
+      pathsToReset.forEach((path) => globalImageCache.delete(path));
+      if (libraryActivePath && pathsToReset.includes(libraryActivePath)) {
+        setLibrary({ libraryActiveAdjustments: { ...INITIAL_ADJUSTMENTS } });
+      }
+      if (selectedPath) useEditorStore.getState().beginAdjustmentReload(selectedPath, historyToken);
+    };
 
-      invoke(Invokes.ResetAdjustmentsForPaths, { paths: pathsToReset })
-        .then(() => {
-          if (libraryActivePath && pathsToReset.includes(libraryActivePath))
-            setLibrary({ libraryActiveAdjustments: { ...INITIAL_ADJUSTMENTS } });
-          if (selectedImage && pathsToReset.includes(selectedImage.path)) {
-            const aspect =
-              selectedImage.width && selectedImage.height ? selectedImage.width / selectedImage.height : null;
-            const resetData = { ...INITIAL_ADJUSTMENTS, aspectRatio: aspect, aiPatches: [] };
-            resetHistory(resetData);
-            setEditor({ adjustments: resetData });
-          }
-        })
-        .catch((err) => toast.error(`Failed to reset adjustments: ${err}`));
-    },
-    [setEditor],
-  );
+    try {
+      const reset = () => invoke(Invokes.ResetAdjustmentsForPaths, { paths: pathsToReset });
+      if (selectedPath) await runEditorMutation(selectedPath, reset, finishReset);
+      else {
+        await reset();
+        finishReset(null);
+      }
+    } catch (err) {
+      toast.error(`Failed to reset adjustments: ${err}`);
+    }
+  }, []);
 
   const handleCopyAdjustments = useCallback(async (pathOrEvent?: string | any) => {
     const pathOverride = typeof pathOrEvent === 'string' ? pathOrEvent : undefined;
@@ -195,9 +183,10 @@ export function useEditorActions() {
       const { appSettings } = useSettingsStore.getState();
       const { setProcess } = useProcessStore.getState();
 
-      if (!copiedAdjustments || !appSettings) return;
+      const copyPasteSettings = appSettings?.copyPasteSettings;
+      if (!copiedAdjustments || !copyPasteSettings) return;
 
-      const { mode, includedAdjustments } = appSettings.copyPasteSettings;
+      const { mode, includedAdjustments } = copyPasteSettings;
       const adjustmentsToApply: Partial<Adjustments> = {};
 
       for (const key of includedAdjustments) {

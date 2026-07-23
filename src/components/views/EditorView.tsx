@@ -50,7 +50,7 @@ interface EditorViewProps {
   thumbnailAspectRatio: ThumbnailAspectRatio;
   sortedImageList: ImageFile[];
   createResizeHandler: (stateKey: string, startSize: number) => (e: ReactPointerEvent<HTMLDivElement>) => void;
-  handleBackToLibrary: () => void;
+  handleBackToLibrary: () => Promise<boolean>;
   handleEditorContextMenu: (...args: any) => void;
   handleThumbnailContextMenu: (...args: any) => void;
   handleImageClick: (...args: any) => void;
@@ -220,8 +220,8 @@ export default function EditorView({
             {renderedRightPanel === Panel.Masks && <MasksPanel />}
             {renderedRightPanel === Panel.Presets && (
               <PresetsPanel
-                onNavigateToCommunity={() => {
-                  handleBackToLibrary();
+                onNavigateToCommunity={async () => {
+                  if (!(await handleBackToLibrary())) return;
                   setUI({ activeView: 'community' });
                 }}
               />

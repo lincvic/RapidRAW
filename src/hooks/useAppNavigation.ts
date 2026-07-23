@@ -1,4 +1,4 @@
-import { useCallback } from 'react';
+import { useCallback, useRef } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { open } from '@tauri-apps/plugin-dialog';
 import { homeDir } from '@tauri-apps/api/path';
@@ -9,9 +9,18 @@ import { useUIStore } from '../store/useUIStore';
 import { useProcessStore } from '../store/useProcessStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes, LibraryViewMode, ImageFile } from '../components/ui/AppProperties';
-import { INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
 import { globalImageCache } from '../utils/ImageLRUCache';
-import { debouncedSave, debouncedSetHistory } from './useEditorActions';
+import { runAfterEditorSave, runEditorTransition } from '../services/editorPersistence';
+import { initializeAdjustmentLoad, structurallyEqual } from '../utils/rafCameraDefaults';
+import type { AdjustmentLoadContext, LoadMetadataResult } from '../types/imageLoading';
+import {
+  createEditorNavigationTransitions,
+  createNavigationIntentTracker,
+  isCurrentEditorSession,
+  isCurrentNavigation,
+  resolveAndCommitForCleanEditorSession,
+  resolveAndCommitForCurrentNavigationIntent,
+} from '../utils/asyncNavigation';
 
 export interface AppNavigationProps {
   clearThumbnailQueue: () => void;
@@ -28,7 +37,18 @@ export interface AppNavigationProps {
   };
 }
 
+const getCurrentEditorSession = () => {
+  const state = useEditorStore.getState();
+  return {
+    generation: state.adjustmentSessionGeneration,
+    path: state.selectedImage?.path ?? null,
+  };
+};
+
 export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationProps) {
+  const navigationGenerationRef = useRef(0);
+  const navigationIntentGenerationRef = useRef(0);
+  const libraryNavigationGenerationRef = useRef(0);
   const {
     transformWrapperRef,
     preloadedDataRef,
@@ -38,10 +58,35 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     latestRenderedJobIdRef,
     previewJobIdRef,
     currentResRef,
-    prevAdjustmentsRef,
   } = refs;
+  const editorNavigationTransitionsRef = useRef<ReturnType<typeof createEditorNavigationTransitions> | null>(null);
+  if (editorNavigationTransitionsRef.current === null) {
+    editorNavigationTransitionsRef.current = createEditorNavigationTransitions({
+      navigationGenerationRef,
+      selectedImagePathRef,
+      clearEditorSession: () => useEditorStore.getState().clearEditorSession(),
+    });
+  }
+  const editorNavigationTransitions = editorNavigationTransitionsRef.current;
+  const navigationIntentTrackerRef = useRef<ReturnType<typeof createNavigationIntentTracker> | null>(null);
+  if (navigationIntentTrackerRef.current === null) {
+    navigationIntentTrackerRef.current = createNavigationIntentTracker(navigationIntentGenerationRef);
+  }
+  const navigationIntentTracker = navigationIntentTrackerRef.current;
+  const libraryNavigationTrackerRef = useRef<ReturnType<typeof createNavigationIntentTracker> | null>(null);
+  if (libraryNavigationTrackerRef.current === null) {
+    libraryNavigationTrackerRef.current = createNavigationIntentTracker(libraryNavigationGenerationRef);
+  }
+  const libraryNavigationTracker = libraryNavigationTrackerRef.current;
+
+  const handleImageLoadFailure = useCallback(() => {
+    navigationIntentTracker.begin();
+    editorNavigationTransitions.clearForImageLoadFailure();
+  }, [editorNavigationTransitions, navigationIntentTracker]);
 
   const handleGoHome = useCallback(() => {
+    navigationIntentTracker.begin();
+    libraryNavigationTracker.begin();
     useLibraryStore.getState().setLibrary({
       rootPaths: [],
       currentFolderPath: null,
@@ -52,214 +97,230 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       multiSelectedPaths: [],
       libraryActivePath: null,
       expandedFolders: new Set(),
+      isViewLoading: false,
     });
     useUIStore.getState().setUI({ isLibraryExportPanelVisible: false });
   }, []);
 
-  const handleBackToLibrary = useCallback(() => {
-    const { selectedImage, resetHistory, setEditor } = useEditorStore.getState();
+  const handleBackToLibrary = useCallback(async (): Promise<boolean> => {
+    const navigationIntent = navigationIntentTracker.begin();
+    const { selectedImage } = useEditorStore.getState();
     const { setLibrary } = useLibraryStore.getState();
     const { setUI } = useUIStore.getState();
-
-    if (selectedImage?.path && cachedEditStateRef.current) {
-      globalImageCache.set(selectedImage.path, cachedEditStateRef.current);
-    }
-    if (transformWrapperRef.current) {
-      transformWrapperRef.current.resetTransform(0);
-    }
-    setEditor({ zoom: 1 });
-
-    debouncedSave.flush();
-    debouncedSetHistory.cancel();
-
     const lastActivePath = selectedImage?.path ?? null;
+    const interactivePatchUrl = useEditorStore.getState().interactivePatch?.url;
 
-    setEditor({
-      hasRenderedFirstFrame: false,
-      selectedImage: null,
-      finalPreviewUrl: null,
-      uncroppedAdjustedPreviewUrl: null,
-      histogram: null,
-      waveform: null,
-      activeMaskId: null,
-      activeMaskContainerId: null,
-      activeAiPatchContainerId: null,
-      isWbPickerActive: false,
-      activeAiSubMaskId: null,
-      transformedOriginalUrl: null,
-    });
-
-    selectedImagePathRef.current = null;
-
-    setLibrary({ libraryActivePath: lastActivePath });
-    setUI({ slideDirection: 1 });
-
-    setEditor({ adjustments: INITIAL_ADJUSTMENTS });
-    resetHistory(INITIAL_ADJUSTMENTS);
-    useEditorStore.getState().patchesSentToBackend.clear();
-
-    isBackendReadyRef.current = true;
-    setEditor((state) => {
-      if (state.interactivePatch?.url) URL.revokeObjectURL(state.interactivePatch.url);
-      return { interactivePatch: null };
-    });
+    try {
+      let didNavigate = false;
+      await runEditorTransition(
+        selectedImage?.path,
+        () => {
+          if (selectedImage?.path && cachedEditStateRef.current?.selectedImage?.path === selectedImage.path) {
+            globalImageCache.set(selectedImage.path, cachedEditStateRef.current);
+          }
+          if (transformWrapperRef.current) transformWrapperRef.current.resetTransform(0);
+          if (interactivePatchUrl) URL.revokeObjectURL(interactivePatchUrl);
+          editorNavigationTransitions.clearForBackToLibrary();
+          setLibrary({ isViewLoading: false, libraryActivePath: lastActivePath });
+          setUI({ slideDirection: 1 });
+          isBackendReadyRef.current = true;
+          didNavigate = true;
+        },
+        () => navigationIntentTracker.isCurrent(navigationIntent),
+      );
+      return didNavigate;
+    } catch (error) {
+      toast.error(`Failed to save changes: ${error}`);
+      return false;
+    }
   }, [refs]);
 
   const handleImageSelect = useCallback(
     async (path: string) => {
-      const { selectedImage, isSliderDragging, resetHistory, setEditor } = useEditorStore.getState();
-      const { setLibrary, multiSelectedPaths } = useLibraryStore.getState();
-      const { setUI } = useUIStore.getState();
+      const navigationIntent = navigationIntentTracker.begin();
+      const { selectedImage } = useEditorStore.getState();
 
-      if (selectedImage?.path === path) return;
+      if (selectedImage?.path === path) return true;
 
-      useEditorStore.getState().patchesSentToBackend.clear();
-      debouncedSave.flush();
-      debouncedSetHistory.cancel();
-
-      if (selectedImage?.path && cachedEditStateRef.current) {
-        globalImageCache.set(selectedImage.path, cachedEditStateRef.current);
+      try {
+        if (selectedImage?.path) await runAfterEditorSave(selectedImage.path, () => undefined);
+      } catch (error) {
+        toast.error(`Failed to save changes: ${error}`);
+        return false;
       }
+      if (!navigationIntentTracker.isCurrent(navigationIntent)) return false;
 
-      const cached = globalImageCache.get(path);
-      const isFrontendCached = Boolean(cached && cached.selectedImage?.isReady);
-      const isCachedInBackend = isFrontendCached
-        ? await invoke<boolean>('is_image_cached', { path }).catch(() => false)
-        : false;
+      return resolveAndCommitForCurrentNavigationIntent(
+        navigationIntent,
+        () => navigationIntentGenerationRef.current,
+        () => invoke<boolean>('is_image_cached', { path }).catch(() => false),
+        async (isCachedInBackend) => {
+          let didSelect = false;
+          const activePath = useEditorStore.getState().selectedImage?.path;
 
-      const hasDifferentResolution =
-        cached &&
-        (useEditorStore.getState().originalSize.width !== cached.originalSize.width ||
-          useEditorStore.getState().originalSize.height !== cached.originalSize.height);
+          try {
+            await runEditorTransition(
+              activePath,
+              () => {
+                const { selectedImage: currentImage, setEditor } = useEditorStore.getState();
+                const { setLibrary, multiSelectedPaths } = useLibraryStore.getState();
+                const { setUI } = useUIStore.getState();
+                if (currentImage?.path && cachedEditStateRef.current?.selectedImage?.path === currentImage.path) {
+                  globalImageCache.set(currentImage.path, cachedEditStateRef.current);
+                }
 
-      if (!isCachedInBackend || hasDifferentResolution) {
-        setEditor({ hasRenderedFirstFrame: false });
-      }
+                const cached = globalImageCache.get(path);
+                const cachedContext = (cached as { adjustmentLoadContext?: AdjustmentLoadContext } | undefined)
+                  ?.adjustmentLoadContext;
+                const isFrontendCached = Boolean(
+                  cached?.selectedImage?.isReady && cachedContext?.reconciled && cachedContext.sourceKind,
+                );
+                const hasDifferentResolution =
+                  cached &&
+                  (useEditorStore.getState().originalSize.width !== cached.originalSize.width ||
+                    useEditorStore.getState().originalSize.height !== cached.originalSize.height);
+                const requestGeneration = editorNavigationTransitions.beginImageSelection(path).generation;
+                const isCurrentRequest = () =>
+                  isCurrentNavigation(
+                    path,
+                    () => selectedImagePathRef.current,
+                    requestGeneration,
+                    () => navigationGenerationRef.current,
+                  );
 
-      selectedImagePathRef.current = path;
+                useEditorStore.getState().beginImageSelection({
+                  exif: null,
+                  height: 0,
+                  isRaw: false,
+                  isReady: false,
+                  metadata: null,
+                  originalUrl: null,
+                  path,
+                  sourceKind: null,
+                  thumbnailUrl: useProcessStore.getState().thumbnails[path],
+                  width: 0,
+                });
+                setEditor({
+                  originalSize: { width: 0, height: 0 },
+                  previewSize: { width: 0, height: 0 },
+                  histogram: null,
+                  waveform: null,
+                  uncroppedAdjustedPreviewUrl: null,
+                  patchesSentToBackend: new Set<string>(),
+                  ...(!isCachedInBackend || !isFrontendCached || hasDifferentResolution
+                    ? { hasRenderedFirstFrame: false }
+                    : {}),
+                });
+                setLibrary({
+                  multiSelectedPaths: multiSelectedPaths.includes(path) ? multiSelectedPaths : [path],
+                  libraryActivePath: null,
+                  selectionAnchorPath: path,
+                });
+                setEditor({
+                  showOriginal: false,
+                  activeMaskId: null,
+                  activeMaskContainerId: null,
+                  activeAiPatchContainerId: null,
+                  activeAiSubMaskId: null,
+                  isWbPickerActive: false,
+                  transformedOriginalUrl: null,
+                });
+                setUI({
+                  isLibraryExportPanelVisible: false,
+                  compactEditorPanelHeightOverride: null,
+                });
+                didSelect = true;
 
-      const newMultiSelectedPaths = multiSelectedPaths.includes(path) ? multiSelectedPaths : [path];
+                if (isFrontendCached && isCachedInBackend && cached && cachedContext) {
+                  const cachedSourceKind = cachedContext.sourceKind;
+                  setEditor({
+                    originalSize: cached.originalSize,
+                    previewSize: cached.previewSize,
+                    histogram: cached.histogram,
+                    waveform: cached.waveform,
+                    finalPreviewUrl: cached.finalPreviewUrl,
+                    uncroppedAdjustedPreviewUrl: cached.uncroppedPreviewUrl,
+                  });
+                  useEditorStore.getState().beginAdjustmentLoad(cached.adjustments, cachedContext);
+                  const activeCachedContext = useEditorStore.getState().adjustmentLoadContext;
+                  if (!activeCachedContext || !cachedSourceKind) return;
+                  useEditorStore.getState().completeAdjustmentLoad(
+                    cached.adjustments,
+                    {
+                      ...activeCachedContext,
+                      dirty: false,
+                      reconciled: true,
+                      sourceKind: cachedSourceKind,
+                    },
+                    {
+                      ...cached.selectedImage,
+                      isReady: false,
+                      path,
+                      thumbnailUrl: useProcessStore.getState().thumbnails[path] || cached.selectedImage.thumbnailUrl,
+                    },
+                  );
+                  const metadataSessionGeneration = useEditorStore.getState().adjustmentSessionGeneration;
+                  setLibrary({ isViewLoading: false });
+                  latestRenderedJobIdRef.current = previewJobIdRef.current;
+                  isBackendReadyRef.current = false;
+                  currentResRef.current = Infinity;
 
-      setLibrary({
-        multiSelectedPaths: newMultiSelectedPaths,
-        libraryActivePath: null,
-        selectionAnchorPath: path,
-      });
+                  invoke(Invokes.LoadImage, { path })
+                    .then((_result: any) => {
+                      if (!isCurrentRequest()) return;
+                      isBackendReadyRef.current = true;
+                      currentResRef.current = 0;
+                      setEditor({ originalSize: { width: _result.width, height: _result.height } });
+                    })
+                    .catch((err: any) => {
+                      if (String(err).includes('cancelled')) return;
+                      if (!isCurrentRequest()) return;
+                      console.error('Background load_image failed on cache hit:', err);
+                      isBackendReadyRef.current = true;
+                      currentResRef.current = 0;
+                    });
+                  void resolveAndCommitForCleanEditorSession(
+                    path,
+                    metadataSessionGeneration,
+                    () => invoke<LoadMetadataResult>(Invokes.LoadMetadata, { path }),
+                    () => useEditorStore.getState(),
+                    (live, metadata) => {
+                      const fresh = initializeAdjustmentLoad(metadata);
+                      return !structurallyEqual(live.adjustments, fresh.adjustments);
+                    },
+                    (live) => live.beginAdjustmentReload(path),
+                  ).catch((err) => {
+                    if (isCurrentRequest()) console.error('Failed background metadata sync on cache hit:', err);
+                  });
+                  return;
+                }
 
-      setEditor({
-        showOriginal: false,
-        activeMaskId: null,
-        activeMaskContainerId: null,
-        activeAiPatchContainerId: null,
-        activeAiSubMaskId: null,
-        isWbPickerActive: false,
-        transformedOriginalUrl: null,
-      });
+                isBackendReadyRef.current = true;
+                setLibrary({ isViewLoading: true });
+                setEditor((state) => {
+                  const previous = state.finalPreviewUrl;
+                  if (previous?.startsWith('blob:') && !globalImageCache.isProtected(previous)) {
+                    setTimeout(() => {
+                      if (!globalImageCache.isProtected(previous)) URL.revokeObjectURL(previous);
+                    }, 250);
+                  }
+                  return { finalPreviewUrl: null };
+                });
+                setEditor((state) => {
+                  if (state.interactivePatch?.url) URL.revokeObjectURL(state.interactivePatch.url);
+                  return { interactivePatch: null };
+                });
+              },
+              () => navigationIntentTracker.isCurrent(navigationIntent),
+            );
+          } catch (error) {
+            toast.error(`Failed to save changes: ${error}`);
+            return false;
+          }
 
-      setUI({
-        isLibraryExportPanelVisible: false,
-        compactEditorPanelHeightOverride: null,
-      });
-
-      if (isFrontendCached) {
-        setEditor({
-          selectedImage: {
-            ...cached.selectedImage,
-            thumbnailUrl: useProcessStore.getState().thumbnails[path] || cached.selectedImage.thumbnailUrl,
-          },
-          originalSize: cached.originalSize,
-          previewSize: cached.previewSize,
-          histogram: cached.histogram,
-          waveform: cached.waveform,
-          finalPreviewUrl: cached.finalPreviewUrl,
-          uncroppedAdjustedPreviewUrl: cached.uncroppedPreviewUrl,
-        });
-
-        setEditor({ adjustments: cached.adjustments });
-        resetHistory(cached.adjustments);
-        prevAdjustmentsRef.current = { path, adjustments: cached.adjustments };
-
-        setLibrary({ isViewLoading: false });
-
-        latestRenderedJobIdRef.current = previewJobIdRef.current;
-        isBackendReadyRef.current = false;
-        currentResRef.current = Infinity;
-
-        invoke(Invokes.LoadImage, { path })
-          .then((_result: any) => {
-            if (selectedImagePathRef.current !== path) return;
-            isBackendReadyRef.current = true;
-            currentResRef.current = 0;
-            setEditor({ originalSize: { width: _result.width, height: _result.height } });
-          })
-          .catch((err: any) => {
-            if (String(err).includes('cancelled')) return;
-            console.error('Background load_image failed on cache hit:', err);
-            isBackendReadyRef.current = true;
-            currentResRef.current = 0;
-          });
-
-        invoke(Invokes.LoadMetadata, { path })
-          .then((metadata: any) => {
-            if (selectedImagePathRef.current !== path) return;
-            let freshAdjustments: any;
-            if (metadata.adjustments && !metadata.adjustments.is_null) {
-              freshAdjustments = normalizeLoadedAdjustments(metadata.adjustments);
-            } else {
-              freshAdjustments = { ...INITIAL_ADJUSTMENTS };
-            }
-            if (!isSliderDragging && JSON.stringify(cached.adjustments) !== JSON.stringify(freshAdjustments)) {
-              setEditor({ adjustments: freshAdjustments });
-              resetHistory(freshAdjustments);
-              prevAdjustmentsRef.current = { path, adjustments: freshAdjustments };
-              globalImageCache.set(path, { ...cached, adjustments: freshAdjustments });
-            }
-          })
-          .catch((err) => console.error('Failed background metadata sync on cache hit:', err));
-
-        return;
-      }
-
-      isBackendReadyRef.current = true;
-
-      setEditor({
-        selectedImage: {
-          exif: null,
-          height: 0,
-          isRaw: false,
-          isReady: false,
-          metadata: null,
-          originalUrl: null,
-          path,
-          sourceKind: null,
-          thumbnailUrl: useProcessStore.getState().thumbnails[path],
-          width: 0,
+          return didSelect;
         },
-        originalSize: { width: 0, height: 0 },
-        previewSize: { width: 0, height: 0 },
-        histogram: null,
-        waveform: null,
-        uncroppedAdjustedPreviewUrl: null,
-      });
-
-      setLibrary({ isViewLoading: true });
-
-      setEditor((state) => {
-        const prev = state.finalPreviewUrl;
-        if (prev?.startsWith('blob:') && !globalImageCache.isProtected(prev)) {
-          setTimeout(() => {
-            if (!globalImageCache.isProtected(prev)) {
-              URL.revokeObjectURL(prev);
-            }
-          }, 250);
-        }
-        return { finalPreviewUrl: null };
-      });
-
-      setEditor((state) => {
-        if (state.interactivePatch?.url) URL.revokeObjectURL(state.interactivePatch.url);
-        return { interactivePatch: null };
-      });
+      );
     },
     [refs],
   );
@@ -272,16 +333,46 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       expandParents = true,
       preserveEditor = false,
     ) => {
+      const libraryNavigation = libraryNavigationTracker.begin();
+      const editorNavigation = preserveEditor ? null : navigationIntentTracker.begin();
+      const preservedEditorSession = preserveEditor ? getCurrentEditorSession() : null;
+      const isCurrentLibraryNavigation = () =>
+        libraryNavigationTracker.isCurrent(libraryNavigation) &&
+        (preservedEditorSession
+          ? isCurrentEditorSession(
+              preservedEditorSession.path,
+              preservedEditorSession.generation,
+              getCurrentEditorSession,
+              () => true,
+            )
+          : editorNavigation !== null && navigationIntentTracker.isCurrent(editorNavigation));
       const { appSettings, handleSettingsChange } = useSettingsStore.getState();
       const { pinnedFolders } = appSettings || { pinnedFolders: [] };
       const { setLibrary, sortCriteria } = useLibraryStore.getState();
       const { setUI } = useUIStore.getState();
       const { setProcess } = useProcessStore.getState();
-      const { selectedImage, resetHistory, setEditor } = useEditorStore.getState();
+      const { selectedImage } = useEditorStore.getState();
       const libraryViewMode = appSettings?.libraryViewMode;
 
+      if (!preserveEditor && selectedImage) {
+        try {
+          await runEditorTransition(
+            selectedImage.path,
+            editorNavigationTransitions.clearForFolderSelection,
+            isCurrentLibraryNavigation,
+          );
+        } catch (error) {
+          if (isCurrentLibraryNavigation()) toast.error(`Failed to save changes: ${error}`);
+          return false;
+        }
+        if (!isCurrentLibraryNavigation()) return false;
+      }
+
       if (!preserveEditor) {
-        await invoke('cancel_thumbnail_generation');
+        await invoke('cancel_thumbnail_generation').catch((error) => {
+          console.warn('Failed to cancel thumbnail generation:', error);
+        });
+        if (!isCurrentLibraryNavigation()) return false;
         clearThumbnailQueue();
         setLibrary({ isViewLoading: true, activeAlbumId: null, libraryScrollTop: 0 });
         useLibraryStore.getState().setSearchCriteria({ tags: [], text: '', mode: 'OR' });
@@ -328,15 +419,6 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           ...(preserveEditor ? {} : { imageList: [], multiSelectedPaths: [], libraryActivePath: null }),
         });
 
-        if (!preserveEditor && selectedImage) {
-          debouncedSave.flush();
-          debouncedSetHistory.cancel();
-          setEditor({ selectedImage: null, finalPreviewUrl: null, uncroppedAdjustedPreviewUrl: null, histogram: null });
-          setEditor({ adjustments: INITIAL_ADJUSTMENTS });
-          resetHistory(INITIAL_ADJUSTMENTS);
-          useEditorStore.getState().patchesSentToBackend.clear();
-        }
-
         const command =
           libraryViewMode === LibraryViewMode.Recursive ? Invokes.ListImagesRecursive : Invokes.ListImagesInDir;
 
@@ -345,6 +427,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           files = preloadedImages;
         } else {
           files = await invoke(command, { path });
+          if (!isCurrentLibraryNavigation()) return false;
         }
 
         const initialRatings: Record<string, number> = {};
@@ -353,7 +436,13 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             initialRatings[f.path] = f.rating;
           }
         });
-        setLibrary({ imageRatings: initialRatings });
+        if (
+          !libraryNavigationTracker.commitIfCurrent(libraryNavigation, () =>
+            setLibrary({ imageRatings: initialRatings }),
+          )
+        ) {
+          return false;
+        }
 
         const exifSortKeys = ['date_taken', 'iso', 'shutter_speed', 'aperture', 'focal_length'];
         const isExifSortActive = exifSortKeys.includes(sortCriteria.key);
@@ -363,6 +452,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
           if (isExifSortActive) {
             const exifDataMap: Record<string, any> = await invoke(Invokes.ReadExifForPaths, { paths });
+            if (!isCurrentLibraryNavigation()) return false;
             const finalImageList = files.map((image) => ({
               ...image,
               exif: exifDataMap[image.path] || image.exif || null,
@@ -372,15 +462,17 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             setLibrary({ imageList: files });
             invoke(Invokes.ReadExifForPaths, { paths })
               .then((exifDataMap: any) => {
-                setLibrary((state) => ({
-                  imageList: state.imageList.map((image) => ({
-                    ...image,
-                    exif: exifDataMap[image.path] || image.exif || null,
-                  })),
-                }));
+                libraryNavigationTracker.commitIfCurrent(libraryNavigation, () => {
+                  setLibrary((state) => ({
+                    imageList: state.imageList.map((image) => ({
+                      ...image,
+                      exif: exifDataMap[image.path] || image.exif || null,
+                    })),
+                  }));
+                });
               })
               .catch((err) => {
-                console.error('Failed to read EXIF data in background:', err);
+                if (isCurrentLibraryNavigation()) console.error('Failed to read EXIF data in background:', err);
               });
           }
         } else {
@@ -392,11 +484,21 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             console.error('Failed to start background indexing:', err);
           });
         }
+        return true;
       } catch (err) {
-        console.error('Failed to load folder contents:', err);
-        toast.error('Failed to load images from the selected folder.');
+        if (isCurrentLibraryNavigation()) {
+          console.error('Failed to load folder contents:', err);
+          toast.error('Failed to load images from the selected folder.');
+        }
+        return false;
       } finally {
-        useLibraryStore.getState().setLibrary({ isViewLoading: false });
+        libraryNavigationTracker.commitIfCurrent(
+          libraryNavigation,
+          () => {
+            useLibraryStore.getState().setLibrary({ isViewLoading: false });
+          },
+          isCurrentLibraryNavigation,
+        );
       }
     },
     [clearThumbnailQueue, refs],
@@ -404,11 +506,42 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
   const handleSelectAlbum = useCallback(
     async (albumId: string, albumName: string, imagePaths: string[], preserveEditor = false) => {
+      const libraryNavigation = libraryNavigationTracker.begin();
+      const editorNavigation = preserveEditor ? null : navigationIntentTracker.begin();
+      const preservedEditorSession = preserveEditor ? getCurrentEditorSession() : null;
+      const isCurrentLibraryNavigation = () =>
+        libraryNavigationTracker.isCurrent(libraryNavigation) &&
+        (preservedEditorSession
+          ? isCurrentEditorSession(
+              preservedEditorSession.path,
+              preservedEditorSession.generation,
+              getCurrentEditorSession,
+              () => true,
+            )
+          : editorNavigation !== null && navigationIntentTracker.isCurrent(editorNavigation));
       const { setLibrary } = useLibraryStore.getState();
       const { setUI } = useUIStore.getState();
 
+      const { selectedImage } = useEditorStore.getState();
+      if (!preserveEditor && selectedImage) {
+        try {
+          await runEditorTransition(
+            selectedImage.path,
+            editorNavigationTransitions.clearForAlbumSelection,
+            isCurrentLibraryNavigation,
+          );
+        } catch (error) {
+          if (isCurrentLibraryNavigation()) toast.error(`Failed to save changes: ${error}`);
+          return false;
+        }
+        if (!isCurrentLibraryNavigation()) return false;
+      }
+
       if (!preserveEditor) {
-        await invoke('cancel_thumbnail_generation');
+        await invoke('cancel_thumbnail_generation').catch((error) => {
+          console.warn('Failed to cancel thumbnail generation:', error);
+        });
+        if (!isCurrentLibraryNavigation()) return false;
         clearThumbnailQueue();
         useLibraryStore.getState().setSearchCriteria({ tags: [], text: '', mode: 'OR' });
         setLibrary({ libraryScrollTop: 0 });
@@ -424,23 +557,34 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
       try {
         const files: ImageFile[] = await invoke(Invokes.GetAlbumImages, { paths: imagePaths });
+        if (!isCurrentLibraryNavigation()) return false;
 
         const initialRatings: Record<string, number> = {};
         files.forEach((f) => {
           if (f.rating !== undefined) initialRatings[f.path] = f.rating;
         });
 
-        setLibrary({
-          imageList: files,
-          imageRatings: initialRatings,
-          ...(preserveEditor ? {} : { multiSelectedPaths: [], libraryActivePath: null }),
+        libraryNavigationTracker.commitIfCurrent(libraryNavigation, () => {
+          setLibrary({
+            imageList: files,
+            imageRatings: initialRatings,
+            ...(preserveEditor ? {} : { multiSelectedPaths: [], libraryActivePath: null }),
+          });
         });
       } catch (err) {
-        console.error('Failed to load album images:', err);
-        toast.error(`Failed to load album: ${err}`);
+        if (isCurrentLibraryNavigation()) {
+          console.error('Failed to load album images:', err);
+          toast.error(`Failed to load album: ${err}`);
+        }
+        return false;
       } finally {
-        setLibrary({ isViewLoading: false });
+        libraryNavigationTracker.commitIfCurrent(
+          libraryNavigation,
+          () => setLibrary({ isViewLoading: false }),
+          isCurrentLibraryNavigation,
+        );
       }
+      return true;
     },
     [clearThumbnailQueue],
   );
@@ -462,6 +606,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       }
 
       if (selectedPath) {
+        if (useEditorStore.getState().selectedImage && !(await handleBackToLibrary())) return;
+
         if (!rootPaths.includes(selectedPath)) {
           const newRootPaths = [...rootPaths, selectedPath];
           setLibrary({ rootPaths: newRootPaths });
@@ -603,5 +749,6 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     handleSelectAlbum,
     handleOpenFolder,
     handleContinueSession,
+    handleImageLoadFailure,
   };
 }

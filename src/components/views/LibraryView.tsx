@@ -23,7 +23,7 @@ interface LibraryViewProps {
   setLibraryViewMode: (mode: LibraryViewMode) => void;
   handleClearSelection: () => void;
   handleLibraryImageSingleClick: (...args: any) => void;
-  handleImageSelect: (...args: any) => void;
+  handleImageSelect: (path: string) => Promise<boolean>;
   handleRate: (...args: any) => void;
   handleThumbnailContextMenu: (...args: any) => void;
   handleMainLibraryContextMenu: (...args: any) => void;
@@ -146,7 +146,7 @@ export default function LibraryView({
             onEmptyAreaContextMenu={handleMainLibraryContextMenu}
             onGoHome={handleGoHome}
             onImageClick={handleLibraryImageSingleClick}
-            onImageDoubleClick={handleImageSelect}
+            onImageDoubleClick={(path: string) => void handleImageSelect(path)}
             onImportClick={() => handleImportClick(currentFolderPath as string)}
             onLibraryRefresh={handleLibraryRefresh}
             onOpenFolder={handleOpenFolder}

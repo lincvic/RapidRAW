@@ -7,8 +7,74 @@ import { useSettingsStore } from '../store/useSettingsStore';
 import { useLibraryStore } from '../store/useLibraryStore';
 import { Adjustments, COPYABLE_ADJUSTMENT_KEYS } from '../utils/adjustments';
 import { Invokes, Panel } from '../components/ui/AppProperties';
-import { debouncedSave } from './useEditorActions';
 import { globalImageCache } from '../utils/ImageLRUCache';
+import { adjustmentsForPersistence, structurallyEqual } from '../utils/rafCameraDefaults';
+import type { AdjustmentLoadContext, PersistedAdjustments } from '../types/imageLoading';
+
+interface ImageProcessingBaseline {
+  adjustments: Adjustments;
+  path: string;
+}
+
+interface ImageProcessingAutoSyncOptions {
+  enabled: boolean;
+  includedAdjustments: string[];
+  selectedPaths: string[];
+}
+
+interface ImageProcessingPersistenceInput {
+  adjustmentLoadContext: AdjustmentLoadContext | null;
+  adjustments: Adjustments;
+  autoSync: ImageProcessingAutoSyncOptions;
+  previousBaseline: ImageProcessingBaseline | null;
+  selectedImage: { isReady: boolean; path: string } | null;
+}
+
+interface ImageProcessingPersistenceDecision {
+  autoSync: { adjustments: Partial<Adjustments>; paths: string[] } | null;
+  nextBaseline: ImageProcessingBaseline | null;
+  persisted: PersistedAdjustments | undefined;
+}
+
+export function decideImageProcessingPersistence({
+  adjustmentLoadContext,
+  adjustments,
+  autoSync: autoSyncOptions,
+  previousBaseline,
+  selectedImage,
+}: ImageProcessingPersistenceInput): ImageProcessingPersistenceDecision {
+  if (!selectedImage?.isReady || !adjustmentLoadContext?.reconciled) {
+    return { persisted: undefined, autoSync: null, nextBaseline: null };
+  }
+
+  const persisted = adjustmentsForPersistence(adjustmentLoadContext, adjustments);
+  let autoSync: ImageProcessingPersistenceDecision['autoSync'] = null;
+  const otherPaths = autoSyncOptions.selectedPaths.filter((path) => path !== selectedImage.path);
+
+  if (
+    persisted !== undefined &&
+    autoSyncOptions.enabled &&
+    otherPaths.length > 0 &&
+    previousBaseline?.path === selectedImage.path
+  ) {
+    const delta: Partial<Adjustments> = {};
+    for (const key of Object.keys(adjustments) as Array<keyof Adjustments>) {
+      if (
+        autoSyncOptions.includedAdjustments.includes(key as string) &&
+        !structurallyEqual(adjustments[key], previousBaseline.adjustments[key])
+      ) {
+        (delta as Record<string, unknown>)[key] = structuredClone(adjustments[key]);
+      }
+    }
+    if (Object.keys(delta).length > 0) autoSync = { paths: otherPaths, adjustments: delta };
+  }
+
+  return {
+    persisted,
+    autoSync,
+    nextBaseline: { path: selectedImage.path, adjustments: structuredClone(adjustments) },
+  };
+}
 
 export function useImageProcessing(
   transformWrapperRef: any,
@@ -23,6 +89,7 @@ export function useImageProcessing(
 
   const selectedImage = useEditorStore((state) => state.selectedImage);
   const adjustments = useEditorStore((state) => state.adjustments);
+  const adjustmentLoadContext = useEditorStore((state) => state.adjustmentLoadContext);
   const previewOverride = useEditorStore((state) => state.previewOverride);
   const isWaveformVisible = useEditorStore((state) => state.isWaveformVisible);
   const activeWaveformChannel = useEditorStore((state) => state.activeWaveformChannel);
@@ -214,8 +281,8 @@ export function useImageProcessing(
             const url = URL.createObjectURL(blob);
 
             setEditor((state) => {
-              if (state.interactivePatch && state.interactivePatch.url)
-                setTimeout(() => URL.revokeObjectURL(state.interactivePatch.url), 100);
+              const previousPatchUrl = state.interactivePatch?.url;
+              if (previousPatchUrl) setTimeout(() => URL.revokeObjectURL(previousPatchUrl), 100);
               return {
                 interactivePatch: {
                   url,
@@ -248,9 +315,8 @@ export function useImageProcessing(
             });
 
             setEditor((state) => {
-              if (state.interactivePatch && state.interactivePatch.url) {
-                setTimeout(() => URL.revokeObjectURL(state.interactivePatch.url), 500);
-              }
+              const previousPatchUrl = state.interactivePatch?.url;
+              if (previousPatchUrl) setTimeout(() => URL.revokeObjectURL(previousPatchUrl), 500);
               return { interactivePatch: null };
             });
           }
@@ -425,37 +491,32 @@ export function useImageProcessing(
         applyAdjustments(renderAdjustments, true, targetRes);
       }
     } else {
+      if (!previewOverride) {
+        const persistenceDecision = decideImageProcessingPersistence({
+          selectedImage,
+          adjustments,
+          adjustmentLoadContext,
+          previousBaseline: prevAdjustmentsRef.current,
+          autoSync: {
+            enabled: appSettings?.copyPasteSettings?.autoSync === true,
+            includedAdjustments: appSettings?.copyPasteSettings?.includedAdjustments || COPYABLE_ADJUSTMENT_KEYS,
+            selectedPaths: multiSelectedPaths,
+          },
+        });
+        prevAdjustmentsRef.current = persistenceDecision.nextBaseline;
+
+        if (persistenceDecision.autoSync) {
+          persistenceDecision.autoSync.paths.forEach((path) => globalImageCache.delete(path));
+          invoke(Invokes.ApplyAdjustmentsToPaths, persistenceDecision.autoSync).catch((err) => {
+            console.error('Failed to apply adjustments to multi-selection:', err);
+          });
+        }
+      }
+
       dragIdleTimer.current = setTimeout(() => {
         currentResRef.current = targetRes;
 
         applyAdjustments(renderAdjustments, false, targetRes);
-
-        if (previewOverride) return;
-
-        debouncedSave(selectedImage.path, adjustments);
-
-        const otherPaths = multiSelectedPaths.filter((p) => p !== selectedImage.path);
-        if (appSettings?.copyPasteSettings?.autoSync && otherPaths.length > 0) {
-          const prev = prevAdjustmentsRef.current;
-          if (prev && prev.path === selectedImage.path) {
-            const delta: Partial<Adjustments> = {};
-            const includedKeys = appSettings?.copyPasteSettings?.includedAdjustments || COPYABLE_ADJUSTMENT_KEYS;
-            for (const key of Object.keys(adjustments) as Array<keyof Adjustments>) {
-              if (includedKeys.includes(key as string)) {
-                if (JSON.stringify(adjustments[key]) !== JSON.stringify(prev.adjustments[key])) {
-                  (delta as any)[key] = adjustments[key];
-                }
-              }
-            }
-            if (Object.keys(delta).length > 0) {
-              otherPaths.forEach((p) => globalImageCache.delete(p));
-              invoke(Invokes.ApplyAdjustmentsToPaths, { paths: otherPaths, adjustments: delta }).catch((err) => {
-                console.error('Failed to apply adjustments to multi-selection:', err);
-              });
-            }
-          }
-        }
-        prevAdjustmentsRef.current = { path: selectedImage.path, adjustments };
       }, 50);
     }
 
@@ -465,6 +526,7 @@ export function useImageProcessing(
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [
     adjustments,
+    adjustmentLoadContext,
     previewOverride,
     selectedImage?.path,
     selectedImage?.isReady,

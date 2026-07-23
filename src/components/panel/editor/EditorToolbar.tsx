@@ -13,7 +13,7 @@ interface EditorToolbarProps {
   canUndo: boolean;
   isAndroid: boolean;
   isLoading: boolean;
-  onBackToLibrary(): void;
+  onBackToLibrary(): Promise<boolean>;
   onRedo(): void;
   onToggleFullScreen(): void;
   onToggleShowOriginal(): void;
@@ -335,7 +335,7 @@ const EditorToolbar = memo(
         <div className="flex items-center gap-2 shrink-0 z-40">
           <button
             className="bg-surface text-text-primary p-2 rounded-full hover:bg-card-active transition-colors shrink-0"
-            onClick={onBackToLibrary}
+            onClick={() => void onBackToLibrary()}
             onKeyDown={handleButtonKeyDown}
             data-tooltip={t('editor.toolbar.tooltips.backToLibrary')}
             data-bench-id="back-to-library"

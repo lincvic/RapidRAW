@@ -4,7 +4,6 @@ import { Loader2 } from 'lucide-react';
 import clsx from 'clsx';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
-import debounce from 'lodash.debounce';
 
 import { ImageDimensions, RenderSize, useImageRenderSize } from '../../hooks/useImageRenderSize';
 import { Adjustments, AiPatch, MaskContainer } from '../../utils/adjustments';
@@ -70,7 +69,7 @@ interface WgpuRenderState {
 }
 
 interface EditorProps {
-  onBackToLibrary(): void;
+  onBackToLibrary(): Promise<boolean>;
   onContextMenu(event: any): void;
   transformWrapperRef: any;
 }
@@ -110,27 +109,22 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
   const hasRenderedFirstFrame = useEditorStore((s) => s.hasRenderedFirstFrame);
 
   const setEditor = useEditorStore((s) => s.setEditor);
+  const applyExplicitAdjustments = useEditorStore((s) => s.applyExplicitAdjustments);
   const undo = useEditorStore((s) => s.undo);
   const redo = useEditorStore((s) => s.redo);
   const goToHistoryIndex = useEditorStore((s) => s.goToHistoryIndex);
-  const pushHistory = useEditorStore((s) => s.pushHistory);
   const canUndo = adjustmentsHistoryIndex > 0;
   const canRedo = adjustmentsHistoryIndex < adjustmentsHistory.length - 1;
 
   const isAndroid = osPlatform === 'android';
 
-  const debouncedSetHistory = useMemo(() => debounce((newAdj: Adjustments) => pushHistory(newAdj), 500), [pushHistory]);
-
   const setAdjustments = useCallback(
     (value: Partial<Adjustments> | ((prev: Adjustments) => Adjustments)) => {
-      setEditor((state) => {
-        const prevAdjustments = state.adjustments;
-        const newAdjustments = typeof value === 'function' ? value(prevAdjustments) : { ...prevAdjustments, ...value };
-        debouncedSetHistory(newAdjustments);
-        return { adjustments: newAdjustments };
-      });
+      const previous = useEditorStore.getState().adjustments;
+      const next = typeof value === 'function' ? value(previous) : { ...previous, ...value };
+      applyExplicitAdjustments(next);
     },
-    [debouncedSetHistory, setEditor],
+    [applyExplicitAdjustments],
   );
 
   const { handleGenerateAiMask, handleQuickErase, handleManualCleanup } = useAiMasking();
@@ -263,7 +257,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
     [setAdjustments],
   );
 
-  const handleWbPicked = useCallback(() => { }, []);
+  const handleWbPicked = useCallback(() => {}, []);
 
   useEffect(() => {
     if (isFullScreen) {
@@ -1185,7 +1179,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
               pixelated: false,
             },
           })
-            .catch(() => { })
+            .catch(() => {})
             .finally(() => {
               isInvoking = false;
             });

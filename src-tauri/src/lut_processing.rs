@@ -1,12 +1,12 @@
-use crate::android_integration::is_android_content_uri;
 #[cfg(target_os = "android")]
 use crate::android_integration::{
-    get_android_cached_lut_path, read_android_content_uri, resolve_android_content_uri_name,
+    get_android_cached_lut_path, is_android_content_uri, read_android_content_uri,
+    resolve_android_content_uri_name,
 };
 use anyhow::anyhow;
 use image::{DynamicImage, GenericImageView, Rgb, Rgb32FImage};
 use serde::Serialize;
-use std::fs::{File, copy, create_dir_all, read_dir};
+use std::fs::{copy, create_dir_all, read_dir};
 use std::io::{BufRead, BufReader, Cursor};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
@@ -26,6 +26,12 @@ use crate::image_processing::{
 pub struct Lut {
     pub size: u32,
     pub data: Vec<f32>,
+}
+
+#[derive(Debug)]
+pub(crate) struct LutSnapshot {
+    pub(crate) content_blake3: String,
+    pub(crate) lut: Lut,
 }
 
 #[derive(Debug, Clone, Serialize)]
@@ -318,7 +324,7 @@ fn parse_hald(image: DynamicImage) -> anyhow::Result<Lut> {
     Ok(Lut { size, data })
 }
 
-pub fn parse_lut_file(path_str: &str) -> anyhow::Result<Lut> {
+fn validate_lut_path(path_str: &str) -> anyhow::Result<()> {
     if path_str.starts_with(r"\\") || path_str.starts_with("//") {
         return Err(anyhow!("Network paths (UNC) are not allowed for LUTs"));
     }
@@ -339,60 +345,77 @@ pub fn parse_lut_file(path_str: &str) -> anyhow::Result<Lut> {
         }
     }
 
-    let (extension, bytes): (String, Option<Vec<u8>>) =
-        if cfg!(target_os = "android") && is_android_content_uri(path_str) {
-            #[cfg(target_os = "android")]
-            {
-                let resolved_name = resolve_android_content_uri_name(path_str)
-                    .unwrap_or_else(|_| path_str.to_string());
-                let ext = Path::new(&resolved_name)
-                    .extension()
-                    .and_then(|s| s.to_str())
-                    .unwrap_or("cube")
-                    .to_lowercase();
-                let uri_bytes = read_android_content_uri(path_str).map_err(|e| anyhow!("{}", e))?;
-                (ext, Some(uri_bytes))
-            }
-            #[cfg(not(target_os = "android"))]
-            {
-                (String::new(), None)
-            }
-        } else {
-            let ext = Path::new(path_str)
-                .extension()
-                .and_then(|s| s.to_str())
-                .unwrap_or("")
-                .to_lowercase();
-            (ext, None)
-        };
+    Ok(())
+}
 
-    match extension.as_str() {
-        "cube" => {
-            if let Some(b) = bytes {
-                parse_cube(BufReader::new(Cursor::new(b)))
-            } else {
-                let file = File::open(path_str)?;
-                parse_cube(BufReader::new(file))
-            }
-        }
-        "3dl" => {
-            if let Some(b) = bytes {
-                parse_3dl(BufReader::new(Cursor::new(b)))
-            } else {
-                let file = File::open(path_str)?;
-                parse_3dl(BufReader::new(file))
-            }
-        }
-        "png" | "jpg" | "jpeg" | "tiff" => {
-            let img = if let Some(b) = bytes {
-                image::load_from_memory(&b)?
-            } else {
-                image::open(path_str)?
-            };
-            parse_hald(img)
-        }
+fn lut_extension(path_str: &str) -> String {
+    #[cfg(target_os = "android")]
+    if is_android_content_uri(path_str) {
+        let resolved_name =
+            resolve_android_content_uri_name(path_str).unwrap_or_else(|_| path_str.to_string());
+        return Path::new(&resolved_name)
+            .extension()
+            .and_then(|extension| extension.to_str())
+            .unwrap_or("cube")
+            .to_lowercase();
+    }
+
+    Path::new(path_str)
+        .extension()
+        .and_then(|extension| extension.to_str())
+        .unwrap_or("")
+        .to_lowercase()
+}
+
+fn validate_lut_extension(extension: &str) -> anyhow::Result<()> {
+    match extension {
+        "cube" | "3dl" | "png" | "jpg" | "jpeg" | "tiff" => Ok(()),
         _ => Err(anyhow!("Unsupported LUT file format: {}", extension)),
     }
+}
+
+fn parse_lut_bytes(extension: &str, bytes: &[u8]) -> anyhow::Result<Lut> {
+    match extension {
+        "cube" => parse_cube(BufReader::new(Cursor::new(bytes))),
+        "3dl" => parse_3dl(BufReader::new(Cursor::new(bytes))),
+        "png" | "jpg" | "jpeg" | "tiff" => parse_hald(image::load_from_memory(bytes)?),
+        _ => Err(anyhow!("Unsupported LUT file format: {}", extension)),
+    }
+}
+
+pub(crate) fn load_lut_snapshot_with<F>(
+    path_str: &str,
+    read_bytes: F,
+) -> anyhow::Result<LutSnapshot>
+where
+    F: FnOnce(&str) -> anyhow::Result<Vec<u8>>,
+{
+    validate_lut_path(path_str)?;
+    let extension = lut_extension(path_str);
+    validate_lut_extension(&extension)?;
+    let bytes = read_bytes(path_str)?;
+    let content_blake3 = blake3::hash(&bytes).to_hex().to_string();
+    let lut = parse_lut_bytes(&extension, &bytes)?;
+
+    Ok(LutSnapshot {
+        content_blake3,
+        lut,
+    })
+}
+
+pub(crate) fn load_lut_snapshot(path_str: &str) -> anyhow::Result<LutSnapshot> {
+    load_lut_snapshot_with(path_str, |path| {
+        #[cfg(target_os = "android")]
+        if is_android_content_uri(path) {
+            return read_android_content_uri(path).map_err(|error| anyhow!("{}", error));
+        }
+
+        Ok(std::fs::read(path)?)
+    })
+}
+
+pub fn parse_lut_file(path_str: &str) -> anyhow::Result<Lut> {
+    Ok(load_lut_snapshot(path_str)?.lut)
 }
 
 pub fn generate_identity_lut_image(size: u32) -> DynamicImage {
@@ -675,4 +698,46 @@ pub fn load_and_parse_lut(path: String, state: State<AppState>) -> Result<LutPar
     cache.insert(path, Arc::new(lut));
 
     Ok(LutParseResult { size: lut_size })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+
+    fn test_cube(last_blue: f32) -> Vec<u8> {
+        format!(
+            "LUT_3D_SIZE 2\n\
+             0 0 0\n\
+             1 0 0\n\
+             0 1 0\n\
+             1 1 0\n\
+             0 0 1\n\
+             1 0 1\n\
+             0 1 1\n\
+             1 1 {last_blue}\n"
+        )
+        .into_bytes()
+    }
+
+    #[test]
+    fn lut_snapshot_hashes_and_parses_the_same_byte_read() {
+        let temp = tempfile::tempdir().unwrap();
+        let path = temp.path().join("mutable.cube");
+        let first_bytes = test_cube(1.0);
+        let replacement_bytes = test_cube(0.5);
+        fs::write(&path, &first_bytes).unwrap();
+        let expected_digest = blake3::hash(&first_bytes).to_hex().to_string();
+
+        let snapshot = load_lut_snapshot_with(path.to_str().unwrap(), |path| {
+            let bytes = fs::read(path)?;
+            fs::write(path, &replacement_bytes)?;
+            Ok(bytes)
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.content_blake3, expected_digest);
+        assert_eq!(snapshot.lut.data.last().copied(), Some(1.0));
+        assert_eq!(fs::read(path).unwrap(), replacement_bytes);
+    }
 }

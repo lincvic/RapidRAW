@@ -2520,6 +2520,7 @@ pub fn run() {
                 }
             }
 
+            file_management::cleanup_thumbnail_cache_on_startup(&app_handle);
             start_preview_worker(app_handle.clone());
             start_analytics_worker(app_handle.clone());
             file_management::start_thumbnail_workers(app_handle.clone());

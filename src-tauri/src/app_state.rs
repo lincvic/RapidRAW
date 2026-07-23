@@ -12,6 +12,7 @@ use wgpu::{Texture, TextureView};
 
 use crate::ai_processing::AiState;
 use crate::cache_utils::DecodedImageCache;
+use crate::camera_defaults::ImageSourceKind;
 use crate::gpu_processing::GpuProcessor;
 use crate::image_processing::GpuContext;
 use crate::lens_correction::LensDatabase;
@@ -41,6 +42,7 @@ pub struct LoadedImage {
     pub path: String,
     pub image: Arc<DynamicImage>,
     pub is_raw: bool,
+    pub source_kind: ImageSourceKind,
 }
 
 #[derive(Clone)]

@@ -1,4 +1,5 @@
 use crate::AppState;
+use crate::camera_defaults::ImageSourceKind;
 use image::DynamicImage;
 use std::collections::HashMap;
 use std::collections::hash_map::DefaultHasher;
@@ -156,9 +157,16 @@ pub fn calculate_full_job_hash(path: &str, adjustments: &serde_json::Value) -> u
     hasher.finish()
 }
 
+#[derive(Clone)]
+pub struct DecodedImageCacheEntry {
+    pub image: Arc<DynamicImage>,
+    pub exif: HashMap<String, String>,
+    pub source_kind: ImageSourceKind,
+}
+
 pub struct DecodedImageCache {
     capacity: usize,
-    items: Vec<(String, Arc<DynamicImage>, HashMap<String, String>)>,
+    items: Vec<(String, DecodedImageCacheEntry)>,
 }
 
 impl DecodedImageCache {
@@ -176,10 +184,10 @@ impl DecodedImageCache {
         }
     }
 
-    pub fn get(&mut self, path: &str) -> Option<(Arc<DynamicImage>, HashMap<String, String>)> {
-        if let Some(pos) = self.items.iter().position(|(p, _, _)| p == path) {
+    pub fn get(&mut self, path: &str) -> Option<DecodedImageCacheEntry> {
+        if let Some(pos) = self.items.iter().position(|(p, _)| p == path) {
             let item = self.items.remove(pos);
-            let result = (item.1.clone(), item.2.clone());
+            let result = item.1.clone();
             self.items.push(item);
             Some(result)
         } else {
@@ -191,18 +199,13 @@ impl DecodedImageCache {
         self.items.clear();
     }
 
-    pub fn insert(
-        &mut self,
-        path: String,
-        image: Arc<DynamicImage>,
-        exif: HashMap<String, String>,
-    ) {
-        if let Some(pos) = self.items.iter().position(|(p, _, _)| *p == path) {
+    pub fn insert(&mut self, path: String, entry: DecodedImageCacheEntry) {
+        if let Some(pos) = self.items.iter().position(|(p, _)| *p == path) {
             self.items.remove(pos);
         } else if self.items.len() >= self.capacity {
             self.items.remove(0);
         }
-        self.items.push((path, image, exif));
+        self.items.push((path, entry));
     }
 }
 
@@ -235,5 +238,26 @@ pub fn clear_session_caches(state: tauri::State<AppState>) {
     }
     if let Ok(mut geometry_cache) = state.geometry_cache.lock() {
         geometry_cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::camera_defaults::ImageSourceKind;
+
+    #[test]
+    fn decoded_cache_retains_embedded_preview_source_kind() {
+        let mut cache = DecodedImageCache::new(2);
+        let entry = DecodedImageCacheEntry {
+            image: Arc::new(DynamicImage::new_rgb8(2, 2)),
+            exif: HashMap::new(),
+            source_kind: ImageSourceKind::EmbeddedPreview,
+        };
+        cache.insert("sample.raf".into(), entry);
+        assert_eq!(
+            cache.get("sample.raf").unwrap().source_kind,
+            ImageSourceKind::EmbeddedPreview
+        );
     }
 }

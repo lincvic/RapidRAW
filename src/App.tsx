@@ -272,6 +272,7 @@ function App() {
     handleSelectAlbum,
     handleOpenFolder,
     handleContinueSession,
+    handleImageLoadFailure,
   } = useAppNavigation({
     clearThumbnailQueue,
     refs: navigationRefs,
@@ -279,6 +280,7 @@ function App() {
 
   const {
     externalEditSession,
+    isExternalEditReady,
     isFinishing: isExternalEditFinishing,
     finishExternalEdit,
   } = useExternalEditSession(handleImageSelect);
@@ -600,7 +602,7 @@ function App() {
           onContextMenu={handleFolderTreeContextMenu}
           onAlbumContextMenu={handleAlbumTreeContextMenu}
           onSelectAlbum={handleSelectAlbum}
-          onFolderSelect={(path) => handleSelectSubfolder(path, false)}
+          onFolderSelect={(path) => void handleSelectSubfolder(path, false)}
           onToggleFolder={handleToggleFolder}
           onOpenFolder={handleOpenFolder}
           setIsVisible={(value: boolean) =>
@@ -627,7 +629,7 @@ function App() {
         latestRenderedJobIdRef={latestRenderedJobIdRef}
         currentResRef={currentResRef}
       />
-      <ImageLoaderManager cachedEditStateRef={cachedEditStateRef} />
+      <ImageLoaderManager cachedEditStateRef={cachedEditStateRef} handleImageLoadFailure={handleImageLoadFailure} />
       <div
         className={clsx(
           'flex flex-col h-screen font-sans text-text-primary overflow-hidden select-none',
@@ -654,7 +656,7 @@ function App() {
           <div className="flex flex-row grow h-full min-h-0">
             {!shouldHideFolderTree && renderFolderTree()}
             <div className="relative flex-1 flex flex-col min-w-0">
-              {selectedImage && externalEditSession && (
+              {selectedImage && externalEditSession && isExternalEditReady && (
                 <ExternalEditBar
                   session={externalEditSession}
                   isFinishing={isExternalEditFinishing}

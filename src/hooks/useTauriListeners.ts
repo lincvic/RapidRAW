@@ -9,7 +9,12 @@ import { useLibraryStore } from '../store/useLibraryStore';
 
 interface TauriListenerProps {
   refreshAllFolderTrees: () => void;
-  handleSelectSubfolder: (path: string, isNewRoot?: boolean, preloadedImages?: any[], expandParents?: boolean) => void;
+  handleSelectSubfolder: (
+    path: string,
+    isNewRoot?: boolean,
+    preloadedImages?: any[],
+    expandParents?: boolean,
+  ) => Promise<boolean>;
   refreshImageList: () => void;
   markGenerated: (path: string) => void;
 }
@@ -188,10 +193,10 @@ export function useTauriListeners({
       listen('import-complete', () => {
         if (isEffectActive) {
           useProcessStore.getState().setImportState({ status: Status.Success });
-          refs.current.refreshAllFolderTrees();
+          void refs.current.refreshAllFolderTrees();
           const currentPath = useLibraryStore.getState().currentFolderPath;
           if (currentPath) {
-            refs.current.handleSelectSubfolder(currentPath, false);
+            void refs.current.handleSelectSubfolder(currentPath, false);
           }
         }
       }),

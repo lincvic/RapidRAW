@@ -51,15 +51,16 @@ import { useProcessStore } from '../store/useProcessStore';
 import { useUIStore } from '../store/useUIStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes, Option, OPTION_SEPARATOR, Panel, AlbumItem, Album, AlbumGroup } from '../components/ui/AppProperties';
-import { Color, COLOR_LABELS, INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
+import { Color, COLOR_LABELS, normalizeLoadedAdjustments } from '../utils/adjustments';
 import TaggingSubMenu from '../context/TaggingSubMenu';
 import { useEditorActions } from './useEditorActions';
 import { useLibraryActions } from './useLibraryActions';
 import { globalImageCache } from '../utils/ImageLRUCache';
+import { runEditorMutation, type SuspendedHistoryToken } from '../services/editorPersistence';
 
 export interface UseAppContextMenusProps {
-  handleImageSelect: (path: string) => void;
-  handleBackToLibrary: () => void;
+  handleImageSelect: (path: string) => Promise<boolean>;
+  handleBackToLibrary: () => Promise<boolean>;
   handleRenameFiles: (paths: string[]) => void;
   handleImportClick: (path: string) => void;
   handleLibraryRefresh: () => Promise<void>;
@@ -161,8 +162,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
       event.preventDefault();
       event.stopPropagation();
 
-      const { selectedImage, history, historyIndex, undo, redo, resetHistory, copiedAdjustments, setEditor } =
-        useEditorStore.getState();
+      const { selectedImage, history, historyIndex, undo, redo, copiedAdjustments } = useEditorStore.getState();
       const { appSettings } = useSettingsStore.getState();
       const { setRightPanel, setUI } = useUIStore.getState();
 
@@ -259,7 +259,9 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
           submenu: [
             { label: t('contextMenus.editor.noLabel'), onClick: () => handleSetColorLabel(null) },
             ...COLOR_LABELS.map((label: Color) => ({
-              label: t(`contextMenus.colors.${label.name}`),
+              label: t(`contextMenus.colors.${label.name}`, {
+                defaultValue: label.name.charAt(0).toUpperCase() + label.name.slice(1),
+              }),
               color: label.color,
               onClick: () => handleSetColorLabel(label.name),
             })),
@@ -291,14 +293,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
               icon: Check,
               isDestructive: true,
               onClick: () => {
-                const originalAspectRatio =
-                  selectedImage.width && selectedImage.height ? selectedImage.width / selectedImage.height : null;
-                resetHistory({
-                  ...INITIAL_ADJUSTMENTS,
-                  aspectRatio: originalAspectRatio,
-                  aiPatches: [],
-                });
-                setEditor({ adjustments: { ...INITIAL_ADJUSTMENTS, aspectRatio: originalAspectRatio, aiPatches: [] } });
+                handleResetAdjustments([selectedImage.path]);
               },
             },
           ],
@@ -324,7 +319,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
       event.preventDefault();
       event.stopPropagation();
 
-      const { selectedImage, copiedAdjustments, setEditor } = useEditorStore.getState();
+      const { selectedImage, copiedAdjustments } = useEditorStore.getState();
       const { multiSelectedPaths, imageList, libraryActivePath, albumTree, activeAlbumId, setLibrary } =
         useLibraryStore.getState();
       const { appSettings } = useSettingsStore.getState();
@@ -434,38 +429,40 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
         }
       };
 
-      const handleApplyAutoAdjustmentsToSelection = () => {
+      const handleApplyAutoAdjustmentsToSelection = async () => {
         if (finalSelection.length === 0) return;
-        finalSelection.forEach((p) => globalImageCache.delete(p));
 
-        invoke(Invokes.ApplyAutoAdjustmentsToPaths, { paths: finalSelection })
-          .then(async () => {
-            if (selectedImage && finalSelection.includes(selectedImage.path)) {
-              const metadata: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
-              if (metadata.adjustments && !metadata.adjustments.is_null) {
-                const normalized = normalizeLoadedAdjustments(metadata.adjustments);
-                setEditor({ adjustments: normalized });
-                useEditorStore.getState().resetHistory(normalized);
-              }
+        const selectedPath = selectedImage && finalSelection.includes(selectedImage.path) ? selectedImage.path : null;
+        const finishAutoAdjust = (historyToken: SuspendedHistoryToken | null) => {
+          finalSelection.forEach((path) => globalImageCache.delete(path));
+          if (selectedPath) useEditorStore.getState().beginAdjustmentReload(selectedPath, historyToken);
+        };
+
+        try {
+          const applyAuto = () => invoke(Invokes.ApplyAutoAdjustmentsToPaths, { paths: finalSelection });
+          if (selectedPath) await runEditorMutation(selectedPath, applyAuto, finishAutoAdjust);
+          else {
+            await applyAuto();
+            finishAutoAdjust(null);
+          }
+
+          if (libraryActivePath && finalSelection.includes(libraryActivePath)) {
+            const metadata: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });
+            if (metadata.adjustments && !metadata.adjustments.is_null) {
+              const normalized = normalizeLoadedAdjustments(metadata.adjustments);
+              setLibrary({ libraryActiveAdjustments: normalized });
             }
-            if (libraryActivePath && finalSelection.includes(libraryActivePath)) {
-              const metadata: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });
-              if (metadata.adjustments && !metadata.adjustments.is_null) {
-                const normalized = normalizeLoadedAdjustments(metadata.adjustments);
-                setLibrary({ libraryActiveAdjustments: normalized });
-              }
-            }
-          })
-          .catch((err) => {
-            console.error('Failed to apply auto adjustments to paths:', err);
-            toast.error(t('contextMenus.toasts.failedApplyAuto', { err }));
-          });
+          }
+        } catch (err) {
+          console.error('Failed to apply auto adjustments to paths:', err);
+          toast.error(t('contextMenus.toasts.failedApplyAuto', { err }));
+        }
       };
 
-      const onExportClick = () => {
+      const onExportClick = async () => {
         if (selectedImage) {
           if (selectedImage.path !== path) {
-            props.handleImageSelect(path);
+            if (!(await props.handleImageSelect(path))) return;
           }
           setLibrary({ multiSelectedPaths: finalSelection });
           setRightPanel(Panel.Export);
@@ -523,7 +520,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
                 disabled: !isSingleSelection,
                 icon: Edit,
                 label: t('contextMenus.editor.editImage'),
-                onClick: () => props.handleImageSelect(finalSelection[0]),
+                onClick: () => void props.handleImageSelect(finalSelection[0]),
               },
               { icon: FileInput, label: exportLabel, onClick: onExportClick },
               { type: OPTION_SEPARATOR },
@@ -691,7 +688,9 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
           submenu: [
             { label: t('contextMenus.editor.noLabel'), onClick: () => handleSetColorLabel(null, finalSelection) },
             ...COLOR_LABELS.map((label: Color) => ({
-              label: t(`contextMenus.colors.${label.name}`),
+              label: t(`contextMenus.colors.${label.name}`, {
+                defaultValue: label.name.charAt(0).toUpperCase() + label.name.slice(1),
+              }),
               color: label.color,
               onClick: () => handleSetColorLabel(label.name, finalSelection),
             })),
@@ -820,7 +819,7 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
                 icon: Trash2,
                 label: t('contextMenus.folders.removeRoot'),
                 isDestructive: true,
-                onClick: () => {
+                onClick: async () => {
                   const newRoots = rootPaths.filter((r: string) => r !== targetPath);
                   const newFolderTrees = folderTrees.filter((t: any) => t.path !== targetPath);
 
@@ -835,12 +834,12 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
                   };
 
                   if (isCurrentInTarget) {
+                    if (!(await props.handleBackToLibrary())) return;
                     updates.currentFolderPath = null;
                     updates.imageList = [];
                     updates.libraryActivePath = null;
                     updates.multiSelectedPaths = [];
                     updates.selectionAnchorPath = null;
-                    props.handleBackToLibrary();
                   }
 
                   setLibrary(updates);
@@ -970,15 +969,18 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
               isDestructive: true,
               onClick: async () => {
                 try {
-                  await invoke(Invokes.DeleteFolder, { path: targetPath });
-
                   const isCurrentInTarget =
                     currentFolderPath === targetPath ||
                     currentFolderPath?.startsWith(targetPath + '/') ||
                     currentFolderPath?.startsWith(targetPath + '\\');
 
                   if (isCurrentInTarget) {
-                    props.handleBackToLibrary();
+                    if (!(await props.handleBackToLibrary())) return;
+                  }
+
+                  await invoke(Invokes.DeleteFolder, { path: targetPath });
+
+                  if (isCurrentInTarget) {
                     setLibrary({
                       currentFolderPath: null,
                       imageList: [],

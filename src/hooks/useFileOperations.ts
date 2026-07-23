@@ -13,8 +13,8 @@ import { Status } from '../components/ui/ExportImportProperties';
 export function useFileOperations(
   refreshImageList: () => Promise<void>,
   refreshAllFolderTrees: () => Promise<void>,
-  handleImageSelect: (path: string) => void,
-  handleBackToLibrary: () => void,
+  handleImageSelect: (path: string) => Promise<boolean>,
+  handleBackToLibrary: () => Promise<boolean>,
   sortedImageList: any[],
 ) {
   const getParentDir = (filePath: string): string => {
@@ -64,6 +64,12 @@ export function useFileOperations(
       }
 
       try {
+        if (selectedImage) {
+          const physicalPath = selectedImage.path.split('?vc=')[0];
+          const isFileBeingEditedDeleted = pathsToDelete.some((p) => p === selectedImage.path || p === physicalPath);
+          if (isFileBeingEditedDeleted && !(await handleBackToLibrary())) return;
+        }
+
         const command = options.includeAssociated ? 'delete_files_with_associated' : 'delete_files_from_disk';
         await invoke(command, { paths: pathsToDelete });
         await refreshImageList();
@@ -74,9 +80,9 @@ export function useFileOperations(
 
           if (isFileBeingEditedDeleted) {
             if (nextImagePath) {
-              handleImageSelect(nextImagePath);
+              await handleImageSelect(nextImagePath);
             } else {
-              handleBackToLibrary();
+              await handleBackToLibrary();
             }
           }
         } else {
@@ -215,6 +221,10 @@ export function useFileOperations(
 
       if (renameTargetPaths.length > 0 && nameTemplate) {
         try {
+          if (selectedImage && renameTargetPaths.includes(selectedImage.path)) {
+            if (!(await handleBackToLibrary())) return;
+          }
+
           const newPaths: Array<string> = await invoke(Invokes.RenameFiles, {
             nameTemplate,
             paths: renameTargetPaths,
@@ -225,9 +235,9 @@ export function useFileOperations(
           if (selectedImage && renameTargetPaths.includes(selectedImage.path)) {
             const oldPathIndex = renameTargetPaths.indexOf(selectedImage.path);
             if (newPaths[oldPathIndex]) {
-              handleImageSelect(newPaths[oldPathIndex]);
+              await handleImageSelect(newPaths[oldPathIndex]);
             } else {
-              handleBackToLibrary();
+              await handleBackToLibrary();
             }
           }
 

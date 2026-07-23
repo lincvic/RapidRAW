@@ -8,6 +8,7 @@ import Slider from '../ui/Slider';
 import Text from '../ui/Text';
 import { TextColors, TextVariants, TextWeights } from '../../types/typography';
 import { listen } from '@tauri-apps/api/event';
+import { navigateAndRunOnSuccess } from '../../utils/asyncNavigation';
 
 interface DenoiseModalProps {
   isOpen: boolean;
@@ -15,7 +16,7 @@ interface DenoiseModalProps {
   onDenoise(intensity: number, method: 'ai' | 'bm3d'): void;
   onBatchDenoise(intensity: number, method: 'ai' | 'bm3d', paths: string[]): Promise<string[]>;
   onSave(): Promise<string>;
-  onOpenFile(path: string): void;
+  onOpenFile(path: string): Promise<boolean>;
   error: string | null;
   previewBase64: string | null;
   originalBase64: string | null;
@@ -324,10 +325,13 @@ export default function DenoiseModal({
     }
   };
 
-  const handleOpen = () => {
+  const handleOpen = async () => {
     if (savedPath) {
-      onOpenFile(savedPath);
-      handleClose();
+      try {
+        await navigateAndRunOnSuccess(savedPath, onOpenFile, handleClose);
+      } catch (error) {
+        console.error('Failed to open saved denoised image:', error);
+      }
     }
   };
 

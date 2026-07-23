@@ -11,9 +11,9 @@ import { useLibraryActions } from './useLibraryActions';
 
 interface KeyboardShortcutsProps {
   sortedImageList: Array<ImageFile>;
-  handleBackToLibrary(): void;
+  handleBackToLibrary(): Promise<boolean>;
   handleDeleteSelected(): void;
-  handleImageSelect(path: string): void;
+  handleImageSelect(path: string): Promise<boolean>;
   handlePasteFiles(str: string): void;
   handleToggleFullScreen(): void;
   handleZoomChange(zoomValue: number, fitToWindow?: boolean): void;
@@ -61,7 +61,7 @@ export const useKeyboardShortcuts = ({
         shouldFire: (s: any) => !s.editor.selectedImage && s.library.libraryActivePath !== null,
         execute: (e: any, s: any) => {
           e.preventDefault();
-          handleImageSelect(s.library.libraryActivePath!);
+          void handleImageSelect(s.library.libraryActivePath!);
         },
       },
       copy_adjustments: {
@@ -116,7 +116,7 @@ export const useKeyboardShortcuts = ({
           const currentIndex = sortedListRef.current.findIndex((img) => img.path === s.editor.selectedImage!.path);
           if (currentIndex === -1) return;
           let nextIndex = currentIndex - 1 < 0 ? sortedListRef.current.length - 1 : currentIndex - 1;
-          handleImageSelect(sortedListRef.current[nextIndex].path);
+          void handleImageSelect(sortedListRef.current[nextIndex].path);
         },
       },
       preview_next: {
@@ -126,7 +126,7 @@ export const useKeyboardShortcuts = ({
           const currentIndex = sortedListRef.current.findIndex((img) => img.path === s.editor.selectedImage!.path);
           if (currentIndex === -1) return;
           let nextIndex = currentIndex + 1 >= sortedListRef.current.length ? 0 : currentIndex + 1;
-          handleImageSelect(sortedListRef.current[nextIndex].path);
+          void handleImageSelect(sortedListRef.current[nextIndex].path);
         },
       },
       zoom_in_step: {
@@ -469,7 +469,7 @@ export const useKeyboardShortcuts = ({
           else if (s.editor.activeMaskContainerId) s.editor.setEditor({ activeMaskContainerId: null });
           else if (s.ui.activeRightPanel === Panel.Crop) s.ui.setRightPanel(Panel.Adjustments);
           else if (s.ui.isFullScreen) handleToggleFullScreen();
-          else if (s.editor.selectedImage) handleBackToLibrary();
+          else if (s.editor.selectedImage) void handleBackToLibrary();
         },
       },
       {
@@ -480,23 +480,23 @@ export const useKeyboardShortcuts = ({
         execute: (e: KeyboardEvent, s: any) => {
           e.preventDefault();
           if (s.editor.activeMaskContainerId) {
-            s.editor.setEditor((state: any) => ({
-              adjustments: {
-                ...state.adjustments,
-                masks: state.adjustments.masks.filter((c: any) => c.id !== s.editor.activeMaskContainerId),
-              },
+            s.editor.applyExplicitAdjustments({
+              ...s.editor.adjustments,
+              masks: s.editor.adjustments.masks.filter((c: any) => c.id !== s.editor.activeMaskContainerId),
+            });
+            s.editor.setEditor({
               activeMaskContainerId: null,
               activeMaskId: null,
-            }));
+            });
           } else if (s.editor.activeAiPatchContainerId) {
-            s.editor.setEditor((state: any) => ({
-              adjustments: {
-                ...state.adjustments,
-                aiPatches: state.adjustments.aiPatches.filter((c: any) => c.id !== s.editor.activeAiPatchContainerId),
-              },
+            s.editor.applyExplicitAdjustments({
+              ...s.editor.adjustments,
+              aiPatches: s.editor.adjustments.aiPatches.filter((c: any) => c.id !== s.editor.activeAiPatchContainerId),
+            });
+            s.editor.setEditor({
               activeAiPatchContainerId: null,
               activeAiSubMaskId: null,
-            }));
+            });
           }
         },
       },

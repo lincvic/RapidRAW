@@ -5,6 +5,7 @@ import { motion } from 'framer-motion';
 import Button from '../ui/Button';
 import Text from '../ui/Text';
 import { TextColors, TextVariants } from '../../types/typography';
+import { navigateAndRunOnSuccess } from '../../utils/asyncNavigation';
 
 interface HdrModalProps {
   error: string | null;
@@ -14,7 +15,7 @@ interface HdrModalProps {
   isProcessing: boolean;
   loadingImageUrl?: string | null;
   onClose(): void;
-  onOpenFile(path: string): void;
+  onOpenFile(path: string): Promise<boolean>;
   onSave(): Promise<string>;
   onMerge(): void;
   progressMessage: string | null;
@@ -85,10 +86,13 @@ export default function HdrModal({
     }
   };
 
-  const handleOpen = () => {
+  const handleOpen = async () => {
     if (savedPath) {
-      onOpenFile(savedPath);
-      handleClose();
+      try {
+        await navigateAndRunOnSuccess(savedPath, onOpenFile, handleClose);
+      } catch (error) {
+        console.error('Failed to open saved HDR:', error);
+      }
     }
   };
 

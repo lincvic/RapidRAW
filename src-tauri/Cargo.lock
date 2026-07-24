@@ -41,6 +41,7 @@ dependencies = [
  "ndarray",
  "ndk-context",
  "objc",
+ "objc2-core-foundation",
  "once_cell",
  "ort",
  "os_info",

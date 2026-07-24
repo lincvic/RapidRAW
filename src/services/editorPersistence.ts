@@ -2,6 +2,7 @@ import { invoke as tauriInvoke } from '@tauri-apps/api/core';
 import { Invokes } from '../components/ui/AppProperties';
 import type { PersistedAdjustments } from '../types/imageLoading';
 import type { Adjustments } from '../utils/adjustments';
+import { EditorImageLoadCancelledError } from './editorImageLoad';
 
 const HISTORY_DEBOUNCE_MS = 500;
 const SAVE_DEBOUNCE_MS = 300;
@@ -21,6 +22,95 @@ export interface SuspendedHistoryToken {
   readonly value: Adjustments;
 }
 
+interface InFlightHistoryOwnership {
+  claimedByReset: boolean;
+  readonly id: number;
+  readonly token: SuspendedHistoryToken | null;
+}
+
+export enum ResetBarrierOutcome {
+  Success = 'success',
+  PreflightSaveFailure = 'preflight_save_failure',
+  RecoverableFailure = 'recoverable_failure',
+  UnsafeSidecarFailure = 'unsafe_sidecar_failure',
+}
+
+export interface ResetBarrierToken {
+  readonly path: string;
+  readonly generation: number;
+  readonly preflightDrain: Promise<void>;
+}
+
+export class EditorResetBarrierCancelledError extends EditorImageLoadCancelledError {
+  readonly outcome: Exclude<ResetBarrierOutcome, ResetBarrierOutcome.Success>;
+
+  constructor(outcome: Exclude<ResetBarrierOutcome, ResetBarrierOutcome.Success>) {
+    super();
+    this.name = 'EditorResetBarrierCancelledError';
+    this.outcome = outcome;
+  }
+}
+
+export interface ResetAdjustmentsErrorPayload {
+  kind: string;
+  path: string;
+  message: string;
+  rollback_succeeded: boolean;
+}
+
+export interface AuthoritativeResetOptions<TSnapshot> {
+  path: string;
+  rollbackValue: PersistedAdjustments | undefined;
+  beginReload(historyToken: SuspendedHistoryToken | null): TSnapshot;
+  restoreReload(snapshot: TSnapshot): void;
+  invokeReset(): Promise<unknown>;
+  onSuccess(): void;
+  beginRecoveryReload(): void;
+}
+
+const parseResetErrorCandidate = (candidate: unknown): ResetAdjustmentsErrorPayload | null => {
+  if (candidate === null || typeof candidate !== 'object') return null;
+  const value = candidate as Record<string, unknown>;
+  if (
+    typeof value.kind !== 'string' ||
+    typeof value.path !== 'string' ||
+    typeof value.message !== 'string' ||
+    typeof value.rollback_succeeded !== 'boolean'
+  ) {
+    return null;
+  }
+  return {
+    kind: value.kind,
+    path: value.path,
+    message: value.message,
+    rollback_succeeded: value.rollback_succeeded,
+  };
+};
+
+export const parseResetAdjustmentsError = (error: unknown): ResetAdjustmentsErrorPayload | null => {
+  const direct = parseResetErrorCandidate(error);
+  if (direct) return direct;
+
+  const serialized =
+    typeof error === 'string'
+      ? error
+      : error instanceof Error && typeof error.message === 'string'
+        ? error.message
+        : null;
+  if (!serialized) return null;
+  try {
+    return parseResetErrorCandidate(JSON.parse(serialized));
+  } catch {
+    return null;
+  }
+};
+
+export const resetAdjustmentsErrorMessage = (error: unknown): string => {
+  const payload = parseResetAdjustmentsError(error);
+  if (payload) return `${payload.message} [${payload.path}]`;
+  return error instanceof Error ? error.message : String(error);
+};
+
 interface SaveRecord {
   id: number;
   value: PersistedAdjustments;
@@ -29,6 +119,14 @@ interface SaveRecord {
 interface ActiveSave {
   promise: Promise<void>;
   record: SaveRecord;
+}
+
+interface ResetBarrierState {
+  buffered: SaveRecord | null;
+  completion: Promise<void>;
+  reject: (error: EditorResetBarrierCancelledError) => void;
+  resolve: () => void;
+  token: ResetBarrierToken;
 }
 
 interface SaveState {
@@ -40,6 +138,7 @@ interface SaveState {
   nextId: number;
   queue: SaveRecord[];
   releaseHold: (() => void) | null;
+  resetBarrier: ResetBarrierState | null;
   scheduled: SaveRecord | null;
   timer: ReturnType<typeof setTimeout> | null;
 }
@@ -53,10 +152,13 @@ const clone = <T>(value: T): T => {
 };
 
 export interface EditorPersistence {
+  beginResetBarrier(path: string, rollbackValue: PersistedAdjustments | undefined): ResetBarrierToken;
   cancelPendingHistory(): void;
   cancelPendingSave(path: string): Promise<void>;
   flushPendingSave(path: string): Promise<void>;
-  restorePendingHistory(token: SuspendedHistoryToken | null | undefined): void;
+  finishResetBarrier(token: ResetBarrierToken, outcome: ResetBarrierOutcome): PersistedAdjustments | undefined;
+  restorePendingHistory(token: SuspendedHistoryToken | null | undefined, commit?: HistoryCommit): void;
+  runAuthoritativeReset<TSnapshot>(options: AuthoritativeResetOptions<TSnapshot>): Promise<void>;
   runAfterEditorSave(path: string, complete: () => Promise<unknown> | unknown): Promise<void>;
   runEditorMutation(
     path: string,
@@ -73,8 +175,11 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
   let historyGeneration = 0;
   let historyTimer: ReturnType<typeof setTimeout> | null = null;
   let pendingHistory: PendingHistory | null = null;
+  const inFlightHistoryOwnerships = new Map<number, InFlightHistoryOwnership>();
   const restoredTokens = new WeakSet<SuspendedHistoryToken>();
   const saves = new Map<string, SaveState>();
+  let nextHistoryOwnershipId = 0;
+  let resetBarrierGeneration = 0;
 
   const clearHistoryTimer = () => {
     if (historyTimer !== null) {
@@ -116,11 +221,38 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     return token;
   };
 
-  const restorePendingHistory = (token: SuspendedHistoryToken | null | undefined) => {
+  const beginHistoryOwnership = (): InFlightHistoryOwnership => {
+    const ownership = {
+      claimedByReset: false,
+      id: ++nextHistoryOwnershipId,
+      token: suspendPendingHistory(),
+    };
+    inFlightHistoryOwnerships.set(ownership.id, ownership);
+    return ownership;
+  };
+
+  const finishHistoryOwnership = (ownership: InFlightHistoryOwnership, restore: boolean) => {
+    if (!inFlightHistoryOwnerships.delete(ownership.id)) return;
+    if (restore && !ownership.claimedByReset) restorePendingHistory(ownership.token);
+  };
+
+  const claimHistoryForReset = (): SuspendedHistoryToken | null => {
+    let newest = suspendPendingHistory();
+    inFlightHistoryOwnerships.forEach((ownership) => {
+      if (ownership.claimedByReset) return;
+      ownership.claimedByReset = true;
+      if (ownership.token && (!newest || ownership.token.generation > newest.generation)) {
+        newest = ownership.token;
+      }
+    });
+    return newest;
+  };
+
+  const restorePendingHistory = (token: SuspendedHistoryToken | null | undefined, commit?: HistoryCommit) => {
     if (!token || restoredTokens.has(token)) return;
     restoredTokens.add(token);
     if (pendingHistory !== null || token.generation < historyGeneration) return;
-    armHistoryTimer({ commit: token.commit, generation: token.generation, value: clone(token.value) });
+    armHistoryTimer({ commit: commit ?? token.commit, generation: token.generation, value: clone(token.value) });
   };
 
   const getSaveState = (path: string): SaveState => {
@@ -135,6 +267,7 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
       nextId: 0,
       queue: [],
       releaseHold: null,
+      resetBarrier: null,
       scheduled: null,
       timer: null,
     };
@@ -158,6 +291,7 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
       state.holdCount === 0 &&
       state.holdPromise === null &&
       state.queue.length === 0 &&
+      state.resetBarrier === null &&
       state.scheduled === null &&
       state.timer === null
     ) {
@@ -170,6 +304,11 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     return available.reduce((newest, record) => (record.id > newest.id ? record : newest));
   };
 
+  const newestRecordOrNull = (records: Array<SaveRecord | null | undefined>): SaveRecord | null => {
+    const available = records.filter((record): record is SaveRecord => record !== null && record !== undefined);
+    return available.length === 0 ? null : newestRecord(available);
+  };
+
   const failSave = (state: SaveState, record: SaveRecord) => {
     state.failed = newestRecord([state.failed, record, state.queue.at(-1), state.scheduled]);
     state.queue = [];
@@ -177,9 +316,7 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     clearSaveTimer(state);
   };
 
-  const pumpSaveQueue = (path: string, state: SaveState) => {
-    if (state.active !== null || state.queue.length === 0) return;
-    const record = state.queue.shift() as SaveRecord;
+  const startSave = (path: string, state: SaveState, record: SaveRecord): Promise<void> => {
     const active = {} as ActiveSave;
     const operation = Promise.resolve()
       .then(() => invoke(Invokes.SaveMetadataAndUpdateThumbnail, { path, adjustments: record.value }))
@@ -201,6 +338,13 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     active.record = record;
     state.active = active;
     void operation.catch(() => undefined);
+    return operation;
+  };
+
+  const pumpSaveQueue = (path: string, state: SaveState) => {
+    if (state.resetBarrier !== null || state.active !== null || state.queue.length === 0) return;
+    const record = state.queue.shift() as SaveRecord;
+    startSave(path, state, record);
   };
 
   const enqueueSave = (path: string, state: SaveState, record: SaveRecord) => {
@@ -253,6 +397,11 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     const record = { id: ++state.nextId, value: clone(value) };
     clearSaveTimer(state);
 
+    if (state.resetBarrier !== null) {
+      state.resetBarrier.buffered = newestRecordOrNull([state.resetBarrier.buffered, record]);
+      return;
+    }
+
     if (state.failed !== null) {
       state.failed = record;
       state.scheduled = null;
@@ -295,6 +444,9 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
   const flushPendingSave = (path: string): Promise<void> => {
     const state = saves.get(path);
     if (!state) return Promise.resolve();
+    if (state.resetBarrier !== null) {
+      return state.resetBarrier.completion.then(() => flushPendingSave(path));
+    }
     if (state.holdPromise !== null) {
       return state.holdPromise.then(() => flushPendingSave(path));
     }
@@ -317,9 +469,133 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     return operation;
   };
 
+  const beginResetBarrier = (path: string, rollbackValue: PersistedAdjustments | undefined): ResetBarrierToken => {
+    const state = getSaveState(path);
+    if (state.resetBarrier !== null) throw new Error(`A reset barrier is already active for '${path}'`);
+
+    clearSaveTimer(state);
+    const dormantFailed = state.active === null ? state.failed : null;
+    const rollbackRecord = rollbackValue === undefined ? null : { id: ++state.nextId, value: clone(rollbackValue) };
+    const buffered = newestRecordOrNull([state.failed, state.queue.at(-1), state.scheduled, rollbackRecord]);
+    state.queue = [];
+    state.scheduled = null;
+
+    let resolve!: () => void;
+    let reject!: (error: EditorResetBarrierCancelledError) => void;
+    const completion = new Promise<void>((resolvePromise, rejectPromise) => {
+      resolve = resolvePromise;
+      reject = rejectPromise;
+    });
+    void completion.catch(() => undefined);
+    const existingHold = state.holdPromise;
+    const existingDrain =
+      state.active?.promise ?? (dormantFailed === null ? state.flushPromise : null) ?? Promise.resolve();
+    const existingWork = existingHold ? existingHold.then(() => existingDrain) : existingDrain;
+    const generation = ++resetBarrierGeneration;
+    const preflightDrain = existingWork.then(() => {
+      if (state.resetBarrier?.token.generation !== generation || dormantFailed === null) return;
+      return startSave(path, state, dormantFailed);
+    });
+    const token = Object.freeze({
+      path,
+      generation,
+      preflightDrain,
+    });
+    state.resetBarrier = { buffered, completion, reject, resolve, token };
+    return token;
+  };
+
+  const finishResetBarrier = (
+    token: ResetBarrierToken,
+    outcome: ResetBarrierOutcome,
+  ): PersistedAdjustments | undefined => {
+    const state = saves.get(token.path);
+    const barrier = state?.resetBarrier;
+    if (!state || !barrier || barrier.token.generation !== token.generation) {
+      throw new Error(`Cannot finish stale reset barrier for '${token.path}'`);
+    }
+
+    const retained = newestRecordOrNull([barrier.buffered, state.failed, state.queue.at(-1), state.scheduled]);
+    clearSaveTimer(state);
+    state.failed = outcome === ResetBarrierOutcome.PreflightSaveFailure ? retained : null;
+    state.queue = [];
+    state.scheduled = null;
+    state.resetBarrier = null;
+
+    if (outcome === ResetBarrierOutcome.Success) {
+      barrier.resolve();
+    } else {
+      barrier.reject(new EditorResetBarrierCancelledError(outcome));
+    }
+    deleteSaveStateIfIdle(token.path, state);
+    return outcome === ResetBarrierOutcome.Success || !retained ? undefined : clone(retained.value);
+  };
+
+  const resetFailureIsRecoverable = (error: unknown): boolean => {
+    const payload = parseResetAdjustmentsError(error);
+    return (
+      payload?.rollback_succeeded === true &&
+      payload.kind !== 'read' &&
+      payload.kind !== 'parse' &&
+      payload.kind !== 'rollback'
+    );
+  };
+
+  const runAuthoritativeReset = async <TSnapshot>(options: AuthoritativeResetOptions<TSnapshot>): Promise<void> => {
+    const historyToken = claimHistoryForReset();
+    let barrier: ResetBarrierToken;
+    try {
+      barrier = beginResetBarrier(options.path, options.rollbackValue);
+    } catch (error) {
+      restorePendingHistory(historyToken);
+      throw error;
+    }
+
+    let snapshot: TSnapshot;
+    try {
+      snapshot = options.beginReload(historyToken);
+    } catch (error) {
+      finishResetBarrier(barrier, ResetBarrierOutcome.PreflightSaveFailure);
+      restorePendingHistory(historyToken);
+      throw error;
+    }
+
+    try {
+      await barrier.preflightDrain;
+    } catch (error) {
+      options.restoreReload(snapshot);
+      finishResetBarrier(barrier, ResetBarrierOutcome.PreflightSaveFailure);
+      throw error;
+    }
+
+    try {
+      await options.invokeReset();
+    } catch (error) {
+      options.restoreReload(snapshot);
+      if (resetFailureIsRecoverable(error)) {
+        const recoveryValue = finishResetBarrier(barrier, ResetBarrierOutcome.RecoverableFailure);
+        if (recoveryValue !== undefined) {
+          scheduleSave(options.path, recoveryValue);
+          await flushPendingSave(options.path);
+        }
+        options.beginRecoveryReload();
+      } else {
+        finishResetBarrier(barrier, ResetBarrierOutcome.UnsafeSidecarFailure);
+      }
+      throw error;
+    }
+
+    finishResetBarrier(barrier, ResetBarrierOutcome.Success);
+    options.onSuccess();
+  };
+
   const cancelPendingSave = async (path: string): Promise<void> => {
     const state = saves.get(path);
     if (!state) return;
+    if (state.resetBarrier !== null) {
+      await state.resetBarrier.completion;
+      return cancelPendingSave(path);
+    }
     clearSaveTimer(state);
     state.scheduled = null;
 
@@ -338,6 +614,12 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
 
   const acquireSaveHoldAfterFlush = async (path: string): Promise<SaveState> => {
     while (true) {
+      const resetBarrier = saves.get(path)?.resetBarrier;
+      if (resetBarrier) {
+        await resetBarrier.completion;
+        continue;
+      }
+
       const preflight = flushPendingSave(path);
       const state = getSaveState(path);
       if (state.holdCount > 0) {
@@ -358,6 +640,12 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
 
   const runWithClosedSaveWindow = async (path: string, complete: () => Promise<unknown> | unknown): Promise<void> => {
     while (true) {
+      const resetBarrier = saves.get(path)?.resetBarrier;
+      if (resetBarrier) {
+        await resetBarrier.completion;
+        continue;
+      }
+
       const preflight = flushPendingSave(path);
       const state = getSaveState(path);
       if (state.holdCount > 0) {
@@ -392,7 +680,7 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     commit: () => void,
     shouldCommit: () => boolean = () => true,
   ): Promise<void> => {
-    const historyToken = suspendPendingHistory();
+    const historyOwnership = beginHistoryOwnership();
     let didCommit = false;
     const guardedCommit = () => {
       if (!shouldCommit()) return;
@@ -407,11 +695,11 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
         guardedCommit();
       }
     } catch (error) {
-      restorePendingHistory(historyToken);
+      finishHistoryOwnership(historyOwnership, true);
       throw error;
     }
 
-    if (!didCommit) restorePendingHistory(historyToken);
+    finishHistoryOwnership(historyOwnership, !didCommit);
   };
 
   const runAfterEditorSave = async (path: string, complete: () => Promise<unknown> | unknown): Promise<void> => {
@@ -423,26 +711,32 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
     mutate: () => Promise<unknown>,
     commit: (historyToken: SuspendedHistoryToken | null) => void,
   ): Promise<void> => {
-    const historyToken = suspendPendingHistory();
+    const historyOwnership = beginHistoryOwnership();
     let heldState: SaveState | null = null;
     try {
       heldState = await acquireSaveHoldAfterFlush(path);
       await mutate();
-      await drainSaveState(path, heldState, () => commit(historyToken));
+      await drainSaveState(path, heldState, () =>
+        commit(historyOwnership.claimedByReset ? null : historyOwnership.token),
+      );
       releaseSaveHold(path, heldState, true);
       heldState = null;
+      finishHistoryOwnership(historyOwnership, false);
     } catch (error) {
       if (heldState) releaseSaveHold(path, heldState, true);
-      restorePendingHistory(historyToken);
+      finishHistoryOwnership(historyOwnership, true);
       throw error;
     }
   };
 
   return {
+    beginResetBarrier,
     cancelPendingHistory,
     cancelPendingSave,
     flushPendingSave,
+    finishResetBarrier,
     restorePendingHistory,
+    runAuthoritativeReset,
     runAfterEditorSave,
     runEditorMutation,
     runEditorTransition,
@@ -455,9 +749,12 @@ export function createEditorPersistence(invoke: EditorInvoke): EditorPersistence
 const defaultEditorPersistence = createEditorPersistence((command, args) => tauriInvoke(command, args));
 
 export const cancelPendingHistory = defaultEditorPersistence.cancelPendingHistory;
+export const beginResetBarrier = defaultEditorPersistence.beginResetBarrier;
 export const cancelPendingSave = defaultEditorPersistence.cancelPendingSave;
 export const flushPendingSave = defaultEditorPersistence.flushPendingSave;
+export const finishResetBarrier = defaultEditorPersistence.finishResetBarrier;
 export const restorePendingHistory = defaultEditorPersistence.restorePendingHistory;
+export const runAuthoritativeReset = defaultEditorPersistence.runAuthoritativeReset;
 export const runAfterEditorSave = defaultEditorPersistence.runAfterEditorSave;
 export const runEditorMutation = defaultEditorPersistence.runEditorMutation;
 export const runEditorTransition = defaultEditorPersistence.runEditorTransition;

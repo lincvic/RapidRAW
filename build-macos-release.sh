@@ -146,7 +146,15 @@ done
 if ! toolchain="$(
   awk '
     /^[[:space:]]*#/ { next }
-    /^[[:space:]]*channel[[:space:]]*=/ {
+    /^[[:space:]]*\[/ {
+      in_toolchain = 0
+      if ($0 ~ /^[[:space:]]*\[toolchain\][[:space:]]*(#.*)?$/) {
+        in_toolchain = 1
+        toolchain_sections++
+      }
+      next
+    }
+    in_toolchain && /^[[:space:]]*channel[[:space:]]*=/ {
       declarations++
       line = $0
       sub(/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"/, "", line)
@@ -160,7 +168,7 @@ if ! toolchain="$(
       }
     }
     END {
-      if (declarations == 1 && valid == 1) {
+      if (toolchain_sections == 1 && declarations == 1 && valid == 1) {
         print selected
       } else {
         exit 1
@@ -168,7 +176,7 @@ if ! toolchain="$(
     }
   ' "$toolchain_file"
 )"; then
-  die "expected exactly one nonempty channel in $toolchain_file"
+  die "could not determine the pinned Rust toolchain; pin exactly one nonempty quoted channel in [toolchain] of $toolchain_file"
 fi
 
 export RUSTUP_TOOLCHAIN="$toolchain"

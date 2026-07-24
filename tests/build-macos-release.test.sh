@@ -351,6 +351,19 @@ profile = "minimal"
 channel = "stable"
 EOF
       ;;
+    half_quoted)
+      cat > "$fixture_repo/src-tauri/rust-toolchain.toml" <<'EOF'
+[toolchain]
+channel = stable"
+EOF
+      ;;
+    malformed_and_valid)
+      cat > "$fixture_repo/src-tauri/rust-toolchain.toml" <<'EOF'
+[toolchain]
+channel = stable"
+channel = "1.96.1"
+EOF
+      ;;
     *) fail "unsupported fixture toolchain mode: ${TEST_TOOLCHAIN_MODE:-}" ;;
   esac
 
@@ -681,6 +694,24 @@ test_other_section_channel_fails_before_npm() {
   assert_log_not_contains 'npm '
 }
 
+test_half_quoted_toolchain_channel_fails_before_npm() {
+  TEST_TOOLCHAIN_MODE=half_quoted run_fixture --target arm64
+  assert_status 1
+  assert_output_contains 'Error:'
+  assert_output_contains 'pin exactly one nonempty quoted channel in [toolchain]'
+  assert_log_not_contains 'toolchain install'
+  assert_log_not_contains 'npm '
+}
+
+test_malformed_and_valid_channels_fail_before_npm() {
+  TEST_TOOLCHAIN_MODE=malformed_and_valid run_fixture --target arm64
+  assert_status 1
+  assert_output_contains 'Error:'
+  assert_output_contains 'pin exactly one nonempty quoted channel in [toolchain]'
+  assert_log_not_contains 'toolchain install'
+  assert_log_not_contains 'npm '
+}
+
 test_missing_dmg_fails_after_build() {
   TEST_ARTIFACT_MODE=app run_fixture --target arm64
   assert_status 1
@@ -728,6 +759,8 @@ run_test 'missing toolchain channel fails before npm' test_missing_toolchain_cha
 run_test 'empty toolchain channel fails before npm' test_empty_toolchain_channel_fails_before_npm
 run_test 'ambiguous toolchain channel fails before npm' test_ambiguous_toolchain_channel_fails_before_npm
 run_test 'channel outside toolchain section fails before npm' test_other_section_channel_fails_before_npm
+run_test 'half-quoted toolchain channel fails before npm' test_half_quoted_toolchain_channel_fails_before_npm
+run_test 'malformed and valid toolchain channels fail before npm' test_malformed_and_valid_channels_fail_before_npm
 run_test 'missing DMG fails after the build' test_missing_dmg_fails_after_build
 run_test 'missing app fails after the build' test_missing_app_fails_after_build
 

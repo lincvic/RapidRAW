@@ -95,6 +95,7 @@ Expected: `rustc 1.96.1`. The formula, toolchain, `rustfmt`, and `clippy` are al
 ### Task 1: Add Generalized Raw Render Metadata
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/imgop/mod.rs:49`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/decoders/mod.rs:240`
 
@@ -180,6 +181,7 @@ git commit -m "feat(rawler): add raw render metadata API"
 ### Task 2: Parse RAF Aspect And Zoom Tag Types
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/decoders/raf.rs:77`
 - Test: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/decoders/raf.rs`
 
@@ -258,6 +260,7 @@ git commit -m "feat(rawler): parse RAF camera framing tags"
 ### Task 3: Map Fujifilm Dynamic Range Metadata
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/decoders/raf.rs:400`
 - Test: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/decoders/raf.rs`
 
@@ -357,6 +360,7 @@ git commit -m "feat(rawler): expose Fujifilm DR compensation"
 ### Task 4: Compose Camera Crop In Default-Cropped Coordinates
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/decoders/raf.rs:484`
 - Test: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/src/decoders/raf.rs`
 
@@ -458,6 +462,7 @@ git commit -m "feat(rawler): expose Fujifilm camera crop"
 ### Task 5: Validate Private GFX100RF Fixtures And Publish Decoder Commit
 
 **Files:**
+
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW-DngLab/rawler/tests/raf_render_metadata.rs`
 
 - [ ] **Step 1: Write the environment-gated integration test**
@@ -597,6 +602,7 @@ Expected: the push target is `github.com/lincvic/RapidRAW-DngLab`, and `git rev-
 ### Task 6: Pin The Forked Decoder Revision
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/Cargo.toml:27`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/Cargo.lock:5039`
 
@@ -648,6 +654,7 @@ Expected: no unrelated package is upgraded.
 ### Task 7: Convert Decoder Metadata Into Camera Defaults
 
 **Files:**
+
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/camera_defaults.rs`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/lib.rs:1`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/image_processing.rs:75`
@@ -791,6 +798,7 @@ Expected: all eight orientation cases and the rotated reduced-resolution case pa
 ### Task 8: Merge Camera Defaults With Persisted Adjustments
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/camera_defaults.rs`
 
 - [ ] **Step 1: Write failing precedence and bounds tests**
@@ -888,6 +896,7 @@ git commit -m "feat(metadata): resolve effective camera adjustments"
 ### Task 9: Apply Intrinsic Exposure And Preserve Decode Source
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/raw_processing.rs:15`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/image_loader.rs:32`
 
@@ -987,6 +996,7 @@ git commit -m "feat(raw): apply intrinsic exposure and report decode source"
 ### Task 10: Carry Source Kind Through Editor Cache Hits
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/cache_utils.rs:159`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/app_state.rs:40`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/image_loader.rs:748`
@@ -1095,6 +1105,7 @@ git commit -m "feat(raw): preserve authoritative source kind in caches"
 ### Task 11: Return Non-Failing Camera Defaults From `load_metadata`
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/camera_defaults.rs`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/file_management.rs:2651`
 
@@ -1209,6 +1220,7 @@ git commit -m "feat(metadata): expose RAF camera defaults"
 ### Task 12: Use Effective Framing In Every Backend Render Path
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/camera_defaults.rs`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/image_loader.rs:67`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/file_management.rs:65`
@@ -1470,6 +1482,7 @@ Expected: editor loads, standalone previews, thumbnails, batch exports, and both
 ### Task 13: Validate The Backend Against Private Fixtures
 
 **Files:**
+
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/raf_fixture_tests.rs`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/lib.rs`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/camera_defaults.rs`
@@ -1662,6 +1675,7 @@ Keep the backend commits local until Chunk 4 frontend tests and full cross-repos
 ### Task 14: Add Vitest And Typed Image-Loading Contracts
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/package.json`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/package-lock.json`
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/types/imageLoading.ts`
@@ -1781,6 +1795,7 @@ Expected: typecheck and the empty test suite pass.
 ### Task 15: Initialize, Reconcile, And Serialize Camera Defaults
 
 **Files:**
+
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/utils/rafCameraDefaults.ts`
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/utils/rafCameraDefaults.test.ts`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/utils/adjustments.ts`
@@ -1829,7 +1844,7 @@ Export a deep-cloning normalizer from `adjustments.ts` or clone through `normali
 export function initializeAdjustmentLoad(metadata: LoadMetadataResult): {
   adjustments: Adjustments;
   context: AdjustmentLoadContext;
-}
+};
 ```
 
 Determine precedence with `metadata.adjustments === null`; do not read `.is_null`, use truthiness, or use `Object.keys`. For literal null, create the no-camera baseline from normalized initial adjustments, then add `unit: 'px'` to a cloned camera crop. For every object, normalize only that object and ignore all camera-default fields. Initialize `sourceKind: null`, `reconciled: false`, and `dirty: false`.
@@ -1860,7 +1875,7 @@ export function reconcileAdjustmentLoad(
   provisional: Adjustments,
   context: AdjustmentLoadContext,
   image: Pick<LoadImageResult, 'width' | 'height' | 'source_kind'>,
-): { adjustments: Adjustments; context: AdjustmentLoadContext }
+): { adjustments: Adjustments; context: AdjustmentLoadContext };
 ```
 
 Build new adjustment/context objects. If the persisted value was literal null, first complete `noCameraBaseline.aspectRatio` from the authoritative image dimensions. Keep injected fields only for `developed_raw`; restore both for `embedded_preview` and `non_raw`. Finish with `sourceKind`, `reconciled: true`, `dirty: false`, and an `effectiveBaseline` equal to the final reconciled adjustments. Never reconcile one injected field without the other.
@@ -1898,6 +1913,7 @@ git commit -m "feat(frontend): resolve RAF camera adjustment defaults"
 ### Task 16: Make Editor Load State Atomic And Save-Safe
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/store/useEditorStore.ts`
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/store/useEditorStore.test.ts`
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/services/editorPersistence.ts`
@@ -2017,6 +2033,7 @@ git commit -m "fix(frontend): keep RAF camera defaults ephemeral"
 ### Task 17: Unify Metadata-First Cached And Uncached Loading
 
 **Files:**
+
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/services/editorImageLoad.ts`
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/services/editorImageLoad.test.ts`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/hooks/useImageLoader.ts`
@@ -2103,6 +2120,7 @@ git commit -m "fix(frontend): reconcile RAF metadata before image readiness"
 ### Task 18: Preserve Null Reset Crop With A Local Full-Canvas Overlay
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/utils/cropUtils.ts`
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/utils/cropUtils.test.ts`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/components/panel/right/CropPanel.tsx`
@@ -2165,6 +2183,7 @@ git commit -m "fix(crop): preserve full-canvas RAF reset"
 ### Task 19: Make Culling And Collage Use Backend-Owned Defaults
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/services/imagePreviews.ts`
 - Create: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/services/imagePreviews.test.ts`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/components/panel/library/CullingView.tsx`
@@ -2177,10 +2196,9 @@ Inject an invoke function into small preview wrappers and assert exact payloads:
 
 ```ts
 expect(invoke).toHaveBeenCalledWith('generate_preview_for_path', { request: { path } });
-expect(invoke).not.toHaveBeenCalledWith(
-  'generate_preview_for_path',
-  { request: expect.objectContaining({ jsAdjustments: expect.anything() }) },
-);
+expect(invoke).not.toHaveBeenCalledWith('generate_preview_for_path', {
+  request: expect.objectContaining({ jsAdjustments: expect.anything() }),
+});
 
 expect(explicitInvoke).toHaveBeenCalledWith('generate_preview_for_path', {
   request: { path, jsAdjustments: negativeConversionAdjustments },
@@ -2221,6 +2239,7 @@ git commit -m "fix(preview): use backend RAF camera defaults"
 ### Task 20: Reload Camera Defaults After Reset Adjustments
 
 **Files:**
+
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/hooks/useEditorActions.ts`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src/hooks/useAppContextMenus.ts`
 - Modify: `/Users/laynewang/Documents/RustProjects/RapidRAW/src-tauri/src/file_management.rs:2399`
@@ -2307,6 +2326,7 @@ git commit -m "fix(editor): reload RAF defaults after adjustment reset"
 ### Task 21: Verify Frontend And Cross-Path RAF Behavior
 
 **Files:**
+
 - Verify only; do not add private fixtures or generated sidecars.
 
 - [ ] **Step 1: Run the complete frontend suite**

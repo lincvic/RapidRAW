@@ -39,13 +39,13 @@ The local GFX100RF sample library covers manual DR200, manual DR400, Auto DR200,
 
 Representative cases:
 
-| File | Exposure metadata | Aspect | Digital zoom | Camera JPEG size |
-| --- | --- | --- | --- | --- |
-| `DSCF0420` | DR200 | 4:3 | No | 11648x8736 |
-| `DSCF0581` | DR200 | 65:24 | No | 11648x4304 |
-| `DSCF0434` | DR400 | 17:6 | 9056x6792 at 1296x972 | 9056x3192 |
-| `DSCF0568` | Auto DR200 | 4:3 | 5120x3840 at 3264x2448 | 5120x3840 |
-| `DSCF0476` | DR400 | 65:24 | No | 11648x4304 |
+| File       | Exposure metadata | Aspect | Digital zoom           | Camera JPEG size |
+| ---------- | ----------------- | ------ | ---------------------- | ---------------- |
+| `DSCF0420` | DR200             | 4:3    | No                     | 11648x8736       |
+| `DSCF0581` | DR200             | 65:24  | No                     | 11648x4304       |
+| `DSCF0434` | DR400             | 17:6   | 9056x6792 at 1296x972  | 9056x3192        |
+| `DSCF0568` | Auto DR200        | 4:3    | 5120x3840 at 3264x2448 | 5120x3840        |
+| `DSCF0476` | DR400             | 65:24  | No                     | 11648x4304       |
 
 The RAF base crop is 11648x8736 even when the camera JPEG is 65:24. This proves that `RawImageCropTopLeft` and `RawImageCroppedSize` describe the sensor-border crop, while `RawImageAspectRatio` describes separate camera framing.
 
@@ -107,11 +107,11 @@ The RAF decoder reads MakerNote fields in this order:
 Recognized values map as follows:
 
 | Metadata value | Intrinsic exposure |
-| --- | --- |
-| 100 | 0 EV |
-| 200 | +1 EV |
-| 400 | +2 EV |
-| 800 | +3 EV |
+| -------------- | ------------------ |
+| 100            | 0 EV               |
+| 200            | +1 EV              |
+| 400            | +2 EV              |
+| 800            | +3 EV              |
 
 The implementation accepts only valid power-of-two multiples of 100 in the supported range. A recognized DR100 value produces `Some(0 EV)`, which distinguishes it from missing metadata. Zero, malformed values, and unknown values produce no compensation and do not fail decoding.
 
@@ -121,12 +121,12 @@ The implementation accepts only valid power-of-two multiples of 100 in the suppo
 
 Extend the proprietary RAF-block parser with the correct value types:
 
-| Tag | Type | Meaning |
-| --- | --- | --- |
+| Tag      | Type                        | Meaning               |
+| -------- | --------------------------- | --------------------- |
 | `0x0115` | two big-endian `u16` values | `RawImageAspectRatio` |
-| `0x0117` | one big-endian `u32` value | `RawZoomActive` |
-| `0x0118` | two big-endian `u16` values | `RawZoomTopLeft` |
-| `0x0119` | two big-endian `u16` values | `RawZoomSize` |
+| `0x0117` | one big-endian `u32` value  | `RawZoomActive`       |
+| `0x0118` | two big-endian `u16` values | `RawZoomTopLeft`      |
+| `0x0119` | two big-endian `u16` values | `RawZoomSize`         |
 
 Fuji stores the two-dimensional values in height/width or y/x order. The decoder converts them to width/height and x/y coordinates.
 

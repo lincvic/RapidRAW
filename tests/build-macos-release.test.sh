@@ -162,7 +162,7 @@ write_rustup_stub() {
 #!/usr/bin/env bash
 set -u
 
-printf 'rustup' >> "$TEST_COMMAND_LOG"
+printf 'rustup env RUSTUP_TOOLCHAIN=%s' "${RUSTUP_TOOLCHAIN:-}" >> "$TEST_COMMAND_LOG"
 printf ' %s' "$@" >> "$TEST_COMMAND_LOG"
 printf '\n' >> "$TEST_COMMAND_LOG"
 
@@ -263,6 +263,7 @@ case "$TEST_ARTIFACT_MODE" in
   all)
     mkdir -p "$bundle_dir/macos/RapidRAW.app" "$bundle_dir/dmg"
     : > "$bundle_dir/dmg/RapidRAW-test.dmg"
+    : > "$bundle_dir/dmg/RapidRAW-z-test.dmg"
     ;;
   app)
     mkdir -p "$bundle_dir/macos/RapidRAW.app"
@@ -441,12 +442,12 @@ test_help_accepts_valid_target() {
 test_explicit_arm64_build() {
   run_fixture --target arm64
   assert_status 0
-  assert_log_contains 'rustup toolchain install 1.96.1 --no-self-update --profile minimal'
-  assert_log_contains 'rustup target add --toolchain 1.96.1 aarch64-apple-darwin'
+  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 toolchain install 1.96.1 --no-self-update --profile minimal'
+  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 target add --toolchain 1.96.1 aarch64-apple-darwin'
   assert_log_contains 'proxy cargo RUSTUP_TOOLCHAIN=1.96.1 --version'
   assert_log_contains 'proxy rustc RUSTUP_TOOLCHAIN=1.96.1 --version'
-  assert_log_contains 'rustup run 1.96.1 cargo --version'
-  assert_log_contains 'rustup run 1.96.1 rustc --version'
+  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 run 1.96.1 cargo --version'
+  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 run 1.96.1 rustc --version'
   assert_log_not_contains 'standalone cargo'
   assert_log_not_contains 'standalone rustc'
   assert_log_contains 'npm install'
@@ -458,17 +459,28 @@ test_explicit_arm64_build() {
   assert_output_contains 'Rustc: rustc 1.96.1 (fixture)'
   assert_output_contains "App: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/RapidRAW.app"
   assert_output_contains "DMG: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-test.dmg"
+  assert_output_contains "DMG: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-z-test.dmg"
   assert_directory_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/RapidRAW.app"
   assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-test.dmg"
+  assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-z-test.dmg"
 }
 
 test_explicit_x86_64_build() {
   run_fixture --target x86_64
   assert_status 0
-  assert_log_contains 'rustup target add --toolchain 1.96.1 x86_64-apple-darwin'
+  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 target add --toolchain 1.96.1 x86_64-apple-darwin'
   assert_log_contains 'npm run tauri -- build --verbose --target x86_64-apple-darwin --bundles app,dmg --no-sign'
   assert_output_contains 'Architecture: x86_64'
   assert_output_contains 'Target: x86_64-apple-darwin'
+}
+
+test_explicit_target_skips_native_detection() {
+  TEST_UNAME_MACHINE=powerpc run_fixture --target arm64
+  assert_status 0
+  assert_log_not_contains 'uname -m'
+  assert_log_not_contains 'sysctl '
+  assert_output_contains 'Architecture: arm64'
+  assert_output_contains 'Target: aarch64-apple-darwin'
 }
 
 test_default_native_arm64_build() {
@@ -508,6 +520,8 @@ test_inherited_toolchain_is_overridden() {
   assert_status 0
   assert_log_contains 'proxy cargo RUSTUP_TOOLCHAIN=1.96.1 --version'
   assert_log_contains 'proxy rustc RUSTUP_TOOLCHAIN=1.96.1 --version'
+  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 toolchain install 1.96.1 --no-self-update --profile minimal'
+  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 target add --toolchain 1.96.1 aarch64-apple-darwin'
   assert_log_contains 'npm env RUSTUP_TOOLCHAIN=1.96.1'
   assert_log_not_contains 'RUSTUP_TOOLCHAIN=stable'
 }
@@ -567,7 +581,7 @@ test_missing_toolchain_channel_fails_before_npm() {
   assert_status 1
   assert_output_contains 'Error:'
   assert_output_contains 'exactly one nonempty channel'
-  assert_log_not_contains 'rustup toolchain install'
+  assert_log_not_contains 'toolchain install'
   assert_log_not_contains 'npm '
 }
 
@@ -576,7 +590,7 @@ test_empty_toolchain_channel_fails_before_npm() {
   assert_status 1
   assert_output_contains 'Error:'
   assert_output_contains 'exactly one nonempty channel'
-  assert_log_not_contains 'rustup toolchain install'
+  assert_log_not_contains 'toolchain install'
   assert_log_not_contains 'npm '
 }
 
@@ -585,7 +599,7 @@ test_ambiguous_toolchain_channel_fails_before_npm() {
   assert_status 1
   assert_output_contains 'Error:'
   assert_output_contains 'exactly one nonempty channel'
-  assert_log_not_contains 'rustup toolchain install'
+  assert_log_not_contains 'toolchain install'
   assert_log_not_contains 'npm '
 }
 
@@ -617,6 +631,7 @@ run_test 'help rejects a duplicate target' test_help_rejects_duplicate_target
 run_test 'help accepts a valid target' test_help_accepts_valid_target
 run_test 'explicit arm64 builds with pinned rustup proxies' test_explicit_arm64_build
 run_test 'explicit x86_64 maps to the Intel target' test_explicit_x86_64_build
+run_test 'explicit target skips native architecture detection' test_explicit_target_skips_native_detection
 run_test 'native arm64 is the default target' test_default_native_arm64_build
 run_test 'Rosetta defaults to the native arm64 target' test_rosetta_defaults_to_arm64
 run_test 'native Intel defaults to x86_64' test_native_intel_defaults_to_x86_64

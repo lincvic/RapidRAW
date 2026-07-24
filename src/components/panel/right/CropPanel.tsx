@@ -13,7 +13,7 @@ import {
   X,
 } from 'lucide-react';
 import { useTranslation } from 'react-i18next';
-import { Adjustments, INITIAL_ADJUSTMENTS } from '../../../utils/adjustments';
+import { Adjustments } from '../../../utils/adjustments';
 import clsx from 'clsx';
 import { Orientation } from '../../ui/AppProperties';
 import TransformModal from '../../modals/TransformModal';
@@ -24,7 +24,7 @@ import Slider from '../../ui/Slider';
 import { TEXT_COLOR_KEYS, TextColors, TextVariants, TextWeights } from '../../../types/typography';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useEditorActions } from '../../../hooks/useEditorActions';
-import { calculateAreaPreservingCrop, calculateCenteredCrop } from '../../../utils/cropUtils';
+import { calculateAreaPreservingCrop, calculateCenteredCrop, resetCropAdjustments } from '../../../utils/cropUtils';
 import { Crop } from 'react-image-crop';
 
 const BASE_RATIO = 1.618;
@@ -354,9 +354,6 @@ export default function CropPanel() {
   }, [aspectRatio, applyAspectRatio]);
 
   const handleReset = () => {
-    const originalAspectRatio =
-      selectedImage?.width && selectedImage?.height ? selectedImage.width / selectedImage.height : null;
-
     setPreferPortrait(false);
     setIsEditingCustom(false);
     lastSyncedRatio.current = null;
@@ -364,32 +361,9 @@ export default function CropPanel() {
 
     setOverlay('thirds');
 
-    setAdjustments((prev: Adjustments) => ({
-      ...prev,
-      aspectRatio: originalAspectRatio,
-      crop: INITIAL_ADJUSTMENTS.crop,
-      flipHorizontal: INITIAL_ADJUSTMENTS.flipHorizontal ?? false,
-      flipVertical: INITIAL_ADJUSTMENTS.flipVertical ?? false,
-      orientationSteps: INITIAL_ADJUSTMENTS.orientationSteps ?? 0,
-      rotation: INITIAL_ADJUSTMENTS.rotation ?? 0,
-      transformDistortion: INITIAL_ADJUSTMENTS.transformDistortion ?? 0,
-      transformVertical: INITIAL_ADJUSTMENTS.transformVertical ?? 0,
-      transformHorizontal: INITIAL_ADJUSTMENTS.transformHorizontal ?? 0,
-      transformRotate: INITIAL_ADJUSTMENTS.transformRotate ?? 0,
-      transformAspect: INITIAL_ADJUSTMENTS.transformAspect ?? 0,
-      transformScale: INITIAL_ADJUSTMENTS.transformScale ?? 100,
-      transformXOffset: INITIAL_ADJUSTMENTS.transformXOffset ?? 0,
-      transformYOffset: INITIAL_ADJUSTMENTS.transformYOffset ?? 0,
-      lensMaker: INITIAL_ADJUSTMENTS.lensMaker,
-      lensModel: INITIAL_ADJUSTMENTS.lensModel,
-      lensDistortionAmount: INITIAL_ADJUSTMENTS.lensDistortionAmount,
-      lensVignetteAmount: INITIAL_ADJUSTMENTS.lensVignetteAmount,
-      lensTcaAmount: INITIAL_ADJUSTMENTS.lensTcaAmount,
-      lensDistortionEnabled: INITIAL_ADJUSTMENTS.lensDistortionEnabled,
-      lensTcaEnabled: INITIAL_ADJUSTMENTS.lensTcaEnabled,
-      lensVignetteEnabled: INITIAL_ADJUSTMENTS.lensVignetteEnabled,
-      lensDistortionParams: INITIAL_ADJUSTMENTS.lensDistortionParams,
-    }));
+    setAdjustments((prev: Adjustments) =>
+      resetCropAdjustments(prev, selectedImage?.width ?? 0, selectedImage?.height ?? 0),
+    );
   };
 
   const isPresetActive = (preset: CropPreset) => preset === activePreset;

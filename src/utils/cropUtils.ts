@@ -1,4 +1,81 @@
-import { Crop } from 'react-image-crop';
+import type { Crop, PercentCrop } from 'react-image-crop';
+import { INITIAL_ADJUSTMENTS, type Adjustments } from './adjustments';
+
+export interface CropSynchronizationParams {
+  imagePath: string;
+  rotation: number;
+  aspectRatio: number | null;
+  orientationSteps: number;
+}
+
+interface CropSynchronizationSeed {
+  params: CropSynchronizationParams;
+  overlay: PercentCrop | null;
+}
+
+export function resetCropAdjustments(adjustments: Adjustments, imageWidth: number, imageHeight: number): Adjustments {
+  return {
+    ...adjustments,
+    aspectRatio: imageWidth > 0 && imageHeight > 0 ? imageWidth / imageHeight : null,
+    crop: null,
+    flipHorizontal: INITIAL_ADJUSTMENTS.flipHorizontal,
+    flipVertical: INITIAL_ADJUSTMENTS.flipVertical,
+    orientationSteps: INITIAL_ADJUSTMENTS.orientationSteps,
+    rotation: INITIAL_ADJUSTMENTS.rotation,
+    transformDistortion: INITIAL_ADJUSTMENTS.transformDistortion,
+    transformVertical: INITIAL_ADJUSTMENTS.transformVertical,
+    transformHorizontal: INITIAL_ADJUSTMENTS.transformHorizontal,
+    transformRotate: INITIAL_ADJUSTMENTS.transformRotate,
+    transformAspect: INITIAL_ADJUSTMENTS.transformAspect,
+    transformScale: INITIAL_ADJUSTMENTS.transformScale,
+    transformXOffset: INITIAL_ADJUSTMENTS.transformXOffset,
+    transformYOffset: INITIAL_ADJUSTMENTS.transformYOffset,
+    lensMaker: INITIAL_ADJUSTMENTS.lensMaker,
+    lensModel: INITIAL_ADJUSTMENTS.lensModel,
+    lensDistortionAmount: INITIAL_ADJUSTMENTS.lensDistortionAmount,
+    lensVignetteAmount: INITIAL_ADJUSTMENTS.lensVignetteAmount,
+    lensTcaAmount: INITIAL_ADJUSTMENTS.lensTcaAmount,
+    lensDistortionEnabled: INITIAL_ADJUSTMENTS.lensDistortionEnabled,
+    lensTcaEnabled: INITIAL_ADJUSTMENTS.lensTcaEnabled,
+    lensVignetteEnabled: INITIAL_ADJUSTMENTS.lensVignetteEnabled,
+    lensDistortionParams: INITIAL_ADJUSTMENTS.lensDistortionParams,
+  };
+}
+
+export function localCropOverlay(crop: Crop | null, canvasWidth: number, canvasHeight: number): PercentCrop | null {
+  if (!Number.isFinite(canvasWidth) || canvasWidth <= 0 || !Number.isFinite(canvasHeight) || canvasHeight <= 0) {
+    return null;
+  }
+
+  if (crop === null) {
+    return { unit: '%', x: 0, y: 0, width: 100, height: 100 };
+  }
+
+  return {
+    unit: '%',
+    x: (crop.x / canvasWidth) * 100,
+    y: (crop.y / canvasHeight) * 100,
+    width: (crop.width / canvasWidth) * 100,
+    height: (crop.height / canvasHeight) * 100,
+  };
+}
+
+export function getCropSynchronizationSeed(
+  previous: CropSynchronizationParams | null,
+  current: CropSynchronizationParams,
+  crop: Crop | null,
+  canvasWidth: number,
+  canvasHeight: number,
+): CropSynchronizationSeed | null {
+  if (crop !== null && previous?.imagePath === current.imagePath) {
+    return null;
+  }
+
+  return {
+    params: current,
+    overlay: localCropOverlay(crop, canvasWidth, canvasHeight),
+  };
+}
 
 export function getOrientedDimensions(
   imageWidth: number,

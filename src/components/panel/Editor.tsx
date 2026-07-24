@@ -7,7 +7,13 @@ import { toast } from 'react-toastify';
 
 import { ImageDimensions, RenderSize, useImageRenderSize } from '../../hooks/useImageRenderSize';
 import { Adjustments, AiPatch, MaskContainer } from '../../utils/adjustments';
-import { calculateCenteredCrop, rotateCropCenter } from '../../utils/cropUtils';
+import {
+  calculateCenteredCrop,
+  getCropSynchronizationSeed,
+  localCropOverlay,
+  rotateCropCenter,
+  type CropSynchronizationParams,
+} from '../../utils/cropUtils';
 import EditorToolbar from './editor/EditorToolbar';
 import ImageCanvas from './editor/ImageCanvas';
 import { Mask, SubMask } from './right/Masks';
@@ -130,7 +136,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
   const { handleGenerateAiMask, handleQuickErase, handleManualCleanup } = useAiMasking();
 
   const [crop, setCrop] = useState<Crop | null>(null);
-  const prevCropParams = useRef<any>(null);
+  const prevCropParams = useRef<CropSynchronizationParams | null>(null);
   const lastValidCropRef = useRef<PercentCrop | null>(null);
 
   const [isMaskHovered, setIsMaskHovered] = useState(false);
@@ -1386,12 +1392,41 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
   }, [showSpinner]);
 
   useEffect(() => {
-    if (!isCropping || !selectedImage?.width) {
+    if (!selectedImage?.width) {
       return;
     }
 
     const { aspectRatio, orientationSteps = 0, crop: currentAdjCrop, rotation = 0 } = adjustments;
     const effectiveRotation = liveRotation !== null && liveRotation !== undefined ? liveRotation : rotation;
+    const isSwapped = orientationSteps === 1 || orientationSteps === 3;
+    const W = isSwapped ? selectedImage.height : selectedImage.width;
+    const H = isSwapped ? selectedImage.width : selectedImage.height;
+    const currentCropParams: CropSynchronizationParams = {
+      imagePath: selectedImage.path,
+      rotation,
+      aspectRatio,
+      orientationSteps,
+    };
+    const synchronizationSeed = getCropSynchronizationSeed(
+      prevCropParams.current,
+      currentCropParams,
+      currentAdjCrop,
+      W,
+      H,
+    );
+
+    if (synchronizationSeed) {
+      prevCropParams.current = synchronizationSeed.params;
+      if (isCropping) {
+        setCrop(synchronizationSeed.overlay);
+        lastValidCropRef.current = synchronizationSeed.overlay;
+      }
+      return;
+    }
+
+    if (!isCropping) {
+      return;
+    }
 
     const geometryChanged =
       prevCropParams.current?.rotation !== rotation ||
@@ -1399,12 +1434,9 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
       prevCropParams.current?.orientationSteps !== orientationSteps;
 
     const isDraggingRotation = liveRotation !== null && liveRotation !== undefined;
-    const needsRecalc = currentAdjCrop === null || geometryChanged || isDraggingRotation;
+    const needsRecalc = geometryChanged || isDraggingRotation;
 
     if (needsRecalc) {
-      const isSwapped = orientationSteps === 1 || orientationSteps === 3;
-      const W = isSwapped ? selectedImage.height : selectedImage.width;
-      const H = isSwapped ? selectedImage.width : selectedImage.height;
       const A = aspectRatio || W / H;
 
       let nextPixelCrop = currentAdjCrop;
@@ -1555,7 +1587,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
           lastValidCropRef.current = pc;
         }
       } else {
-        prevCropParams.current = { rotation, aspectRatio, orientationSteps };
+        prevCropParams.current = currentCropParams;
 
         if (
           nextPixelCrop &&
@@ -1595,19 +1627,9 @@ export default function Editor({ onBackToLibrary, onContextMenu, transformWrappe
     const cropBaseWidth = isSwapped ? selectedImage.height : selectedImage.width;
     const cropBaseHeight = isSwapped ? selectedImage.width : selectedImage.height;
 
-    const { crop: pixelCrop } = adjustments;
-
-    if (pixelCrop) {
-      const pct: PercentCrop = {
-        unit: '%',
-        x: (pixelCrop.x / cropBaseWidth) * 100,
-        y: (pixelCrop.y / cropBaseHeight) * 100,
-        width: (pixelCrop.width / cropBaseWidth) * 100,
-        height: (pixelCrop.height / cropBaseHeight) * 100,
-      };
-      setCrop(pct);
-      lastValidCropRef.current = pct;
-    }
+    const overlay = localCropOverlay(adjustments.crop, cropBaseWidth, cropBaseHeight);
+    setCrop(overlay);
+    lastValidCropRef.current = overlay;
   }, [isCropping, adjustments.crop, adjustments.orientationSteps, selectedImage, liveRotation]);
 
   const handleCropChange = useCallback(

@@ -50,7 +50,16 @@ import { useLibraryStore } from '../store/useLibraryStore';
 import { useProcessStore } from '../store/useProcessStore';
 import { useUIStore } from '../store/useUIStore';
 import { useSettingsStore } from '../store/useSettingsStore';
-import { Invokes, Option, OPTION_SEPARATOR, Panel, AlbumItem, Album, AlbumGroup } from '../components/ui/AppProperties';
+import {
+  Invokes,
+  Option,
+  OPTION_SEPARATOR,
+  Panel,
+  AlbumItem,
+  Album,
+  AlbumGroup,
+  type SelectedImage,
+} from '../components/ui/AppProperties';
 import { Color, COLOR_LABELS, normalizeLoadedAdjustments } from '../utils/adjustments';
 import TaggingSubMenu from '../context/TaggingSubMenu';
 import { useEditorActions } from './useEditorActions';
@@ -68,6 +77,36 @@ export interface UseAppContextMenusProps {
   refreshImageList: () => Promise<void>;
   executeDelete: (paths: string[], options: any) => Promise<void>;
   handleTogglePinFolder: (path: string) => Promise<void>;
+}
+
+export class AutoAdjustTargetLoadingError extends Error {
+  constructor(path: string) {
+    super(`Cannot apply auto adjustments while the selected image is loading: ${path}`);
+    this.name = 'AutoAdjustTargetLoadingError';
+  }
+}
+
+export async function routeAutoAdjustForSelection(
+  getSelectedImage: () => Pick<SelectedImage, 'isReady' | 'path'> | null,
+  paths: readonly string[],
+  runSelectedMutation: (path: string, mutate: () => Promise<void>) => Promise<void>,
+  applyAuto: () => Promise<unknown>,
+): Promise<boolean> {
+  const selectedImage = getSelectedImage();
+  if (selectedImage && paths.includes(selectedImage.path)) {
+    if (!selectedImage.isReady) throw new AutoAdjustTargetLoadingError(selectedImage.path);
+    const selectedPath = selectedImage.path;
+    await runSelectedMutation(selectedPath, async () => {
+      const currentImage = getSelectedImage();
+      if (!currentImage?.isReady || currentImage.path !== selectedPath) {
+        throw new AutoAdjustTargetLoadingError(selectedPath);
+      }
+      await applyAuto();
+    });
+    return true;
+  }
+  await applyAuto();
+  return false;
 }
 
 export function useAppContextMenus(props: UseAppContextMenusProps) {
@@ -432,19 +471,24 @@ export function useAppContextMenus(props: UseAppContextMenusProps) {
       const handleApplyAutoAdjustmentsToSelection = async () => {
         if (finalSelection.length === 0) return;
 
-        const selectedPath = selectedImage && finalSelection.includes(selectedImage.path) ? selectedImage.path : null;
-        const finishAutoAdjust = (historyToken: SuspendedHistoryToken | null) => {
+        const finishAutoAdjust = (selectedPath: string | null, historyToken: SuspendedHistoryToken | null) => {
           finalSelection.forEach((path) => globalImageCache.delete(path));
           if (selectedPath) useEditorStore.getState().beginAdjustmentReload(selectedPath, historyToken);
         };
 
         try {
           const applyAuto = () => invoke(Invokes.ApplyAutoAdjustmentsToPaths, { paths: finalSelection });
-          if (selectedPath) await runEditorMutation(selectedPath, applyAuto, finishAutoAdjust);
-          else {
-            await applyAuto();
-            finishAutoAdjust(null);
-          }
+          const selectedTarget = await routeAutoAdjustForSelection(
+            () => useEditorStore.getState().selectedImage,
+            finalSelection,
+            async (selectedPath, mutate) => {
+              await runEditorMutation(selectedPath, mutate, (historyToken) =>
+                finishAutoAdjust(selectedPath, historyToken),
+              );
+            },
+            applyAuto,
+          );
+          if (!selectedTarget) finishAutoAdjust(null, null);
 
           if (libraryActivePath && finalSelection.includes(libraryActivePath)) {
             const metadata: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });

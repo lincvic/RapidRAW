@@ -4575,12 +4575,18 @@ fn prepare_auto_adjustment_metadata_from_snapshot(
         mut metadata,
     } = snapshot;
 
+    // Camera defaults use the full post-orientation canvas, while analysis may use a fast decode.
+    let (persistence_width, persistence_height) =
+        match (camera_defaults.canvas_width, camera_defaults.canvas_height) {
+            (Some(width), Some(height)) if width > 0 && height > 0 => (width, height),
+            _ => (developed_width, developed_height),
+        };
     metadata.adjustments = crate::camera_defaults::effective_adjustments(
         &metadata.adjustments,
         camera_defaults,
         source_kind,
-        developed_width,
-        developed_height,
+        persistence_width,
+        persistence_height,
     );
     merge_auto_adjustments(&mut metadata, auto_adjustments);
 
@@ -7823,6 +7829,70 @@ mod tests {
         assert_eq!(updated.adjustments["aspectRatio"], json!(2.0));
         assert_eq!(
             updated.adjustments["sectionVisibility"],
+            json!({ "basic": true, "effects": true })
+        );
+    }
+
+    #[test]
+    fn auto_adjust_fast_raw_decode_does_not_scale_persisted_camera_crop() {
+        let tags = Some(vec!["camera-default".to_string()]);
+        let exif = Some(HashMap::from([(
+            "Model".to_string(),
+            "GFX100RF".to_string(),
+        )]));
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 5,
+            adjustments: Value::Null,
+            tags: tags.clone(),
+            exif: exif.clone(),
+        };
+        let auto_adjustments = json!({
+            "exposure": 1.25,
+            "sectionVisibility": {
+                "basic": true,
+                "effects": true,
+            },
+        });
+        let camera_defaults = CameraDefaults {
+            crop: Some(Crop {
+                x: 8.0,
+                y: 8.0,
+                width: 16.0,
+                height: 8.0,
+            }),
+            aspect_ratio: Some(2.0),
+            canvas_width: Some(32),
+            canvas_height: Some(24),
+        };
+        let metadata_bytes = serde_json::to_vec(&metadata).unwrap();
+
+        let prepared = prepare_auto_adjustment_metadata_with(
+            "fast-developed.RAF",
+            Path::new("fast-developed.RAF.rrdata"),
+            &auto_adjustments,
+            &camera_defaults,
+            ImageSourceKind::DevelopedRaw,
+            8,
+            6,
+            move |_| Ok(metadata_bytes),
+        )
+        .unwrap();
+        let persisted: ImageMetadata =
+            serde_json::from_slice(&prepared.serialized_metadata).unwrap();
+
+        assert_eq!(persisted.version, 7);
+        assert_eq!(persisted.rating, 5);
+        assert_eq!(persisted.tags, tags);
+        assert_eq!(persisted.exif, exif);
+        assert_eq!(persisted.adjustments["exposure"], json!(1.25));
+        assert_eq!(
+            persisted.adjustments["crop"],
+            json!({ "x": 8.0, "y": 8.0, "width": 16.0, "height": 8.0 })
+        );
+        assert_eq!(persisted.adjustments["aspectRatio"], json!(2.0));
+        assert_eq!(
+            persisted.adjustments["sectionVisibility"],
             json!({ "basic": true, "effects": true })
         );
     }

@@ -156,15 +156,12 @@ if ! toolchain="$(
     }
     in_toolchain && /^[[:space:]]*channel[[:space:]]*=/ {
       declarations++
-      line = $0
-      sub(/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"/, "", line)
-      if (line ~ /^[^"]+"[[:space:]]*(#.*)?$/) {
-        value = line
+      if ($0 ~ /^[[:space:]]*channel[[:space:]]*=[[:space:]]*"[^"]+"[[:space:]]*(#.*)?$/) {
+        value = $0
+        sub(/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"/, "", value)
         sub(/"[[:space:]]*(#.*)?$/, "", value)
-        if (length(value) > 0) {
-          valid++
-          selected = value
-        }
+        valid++
+        selected = value
       }
     }
     END {

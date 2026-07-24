@@ -5,7 +5,7 @@ usage() {
   cat <<'EOF'
 Usage: build-macos-release.sh [--target arm64|x86_64]
 
-Build unsigned macOS release artifacts for RapidRAW.
+Build unsigned RapidRAW.app and .dmg release artifacts for macOS.
 
 Options:
   --target arm64|x86_64  Select the target architecture.

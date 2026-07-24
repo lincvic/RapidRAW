@@ -88,27 +88,26 @@ if ! command -v brew >/dev/null 2>&1; then
   die 'Homebrew is required; install Homebrew and the rustup formula before building'
 fi
 
-host_machine="$(uname -m)"
-case "$host_machine" in
-  arm64)
-    native_arch='arm64'
-    ;;
-  x86_64)
-    translated="$(sysctl -in sysctl.proc_translated 2>/dev/null || true)"
-    if [[ "$translated" == '1' ]]; then
-      native_arch='arm64'
-    else
-      native_arch='x86_64'
-    fi
-    ;;
-  *)
-    die "unsupported macOS host architecture: $host_machine"
-    ;;
-esac
-
 if [[ -n "$requested_arch" ]]; then
   architecture="$requested_arch"
 else
+  host_machine="$(uname -m)"
+  case "$host_machine" in
+    arm64)
+      native_arch='arm64'
+      ;;
+    x86_64)
+      translated="$(sysctl -in sysctl.proc_translated 2>/dev/null || true)"
+      if [[ "$translated" == '1' ]]; then
+        native_arch='arm64'
+      else
+        native_arch='x86_64'
+      fi
+      ;;
+    *)
+      die "unsupported macOS host architecture: $host_machine"
+      ;;
+  esac
   architecture="$native_arch"
 fi
 
@@ -200,15 +199,14 @@ if [[ ! -d "$app_path" ]]; then
   die "app artifact not found: $app_path"
 fi
 
-dmg_path=''
+dmg_paths=()
 for candidate in "$bundle_dir"/dmg/*.dmg; do
   if [[ -f "$candidate" ]]; then
-    dmg_path="$candidate"
-    break
+    dmg_paths[${#dmg_paths[@]}]="$candidate"
   fi
 done
 
-if [[ -z "$dmg_path" ]]; then
+if [[ "${#dmg_paths[@]}" -eq 0 ]]; then
   die "DMG artifact not found in $bundle_dir/dmg"
 fi
 
@@ -217,4 +215,6 @@ printf 'Target: %s\n' "$target_triple"
 printf 'Cargo: %s\n' "$cargo_version"
 printf 'Rustc: %s\n' "$rustc_version"
 printf 'App: %s\n' "$app_path"
-printf 'DMG: %s\n' "$dmg_path"
+for dmg_path in "${dmg_paths[@]}"; do
+  printf 'DMG: %s\n' "$dmg_path"
+done

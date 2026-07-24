@@ -21,12 +21,13 @@ usage_error() {
 
 requested_arch=''
 target_seen=0
+help_requested=0
 
 while [[ "$#" -gt 0 ]]; do
   case "$1" in
     -h|--help)
-      usage
-      exit 0
+      help_requested=1
+      shift
       ;;
     --target)
       if [[ "$target_seen" -eq 1 ]]; then
@@ -56,5 +57,10 @@ while [[ "$#" -gt 0 ]]; do
       ;;
   esac
 done
+
+if [[ "$help_requested" -eq 1 ]]; then
+  usage
+  exit 0
+fi
 
 exit 0

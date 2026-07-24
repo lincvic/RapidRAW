@@ -28,7 +28,7 @@ import { useSettingsStore } from '../../../store/useSettingsStore';
 import { useLibraryActions } from '../../../hooks/useLibraryActions';
 import { COLOR_LABELS, Color } from '../../../utils/adjustments';
 import { IconAperture, IconFocalLength, IconIso, IconShutter } from '../editor/ExifIcons';
-import { generateExplicitPreviewForPath, type PreviewMetadataResult } from '../../../services/imagePreviews';
+import { generateEffectivePreviewForPath } from '../../../services/imagePreviews';
 
 interface SyncViewport {
   isActive: boolean;
@@ -240,16 +240,9 @@ function CullingPreview({
     setIsLoading(true);
     setHighResSrc(null);
 
-    const fetchPreviewWithAdjustments = async () => {
+    const fetchEffectivePreview = async () => {
       try {
-        const metadata = await invoke<PreviewMetadataResult>(Invokes.LoadMetadata, {
-          path: image.path,
-        });
-        if (!active) return;
-
-        const adjustments = metadata.adjustments ?? {};
-
-        const bytes = await generateExplicitPreviewForPath(image.path, adjustments);
+        const bytes = await generateEffectivePreviewForPath(image.path);
         if (!active) return;
 
         const blob = new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' });
@@ -262,11 +255,11 @@ function CullingPreview({
           setIsLoading(false);
         }
       } catch (err) {
-        console.error('Error loading culling preview with adjustments:', err);
+        console.error('Error loading effective culling preview:', err);
 
         if (active) {
           try {
-            const fallbackBytes = await generateExplicitPreviewForPath(image.path, {});
+            const fallbackBytes = await generateEffectivePreviewForPath(image.path);
             if (!active) return;
             const blob = new Blob([new Uint8Array(fallbackBytes)], { type: 'image/jpeg' });
             const localBlobUrl = URL.createObjectURL(blob);
@@ -282,7 +275,7 @@ function CullingPreview({
     };
 
     const delayTimeout = setTimeout(() => {
-      fetchPreviewWithAdjustments();
+      fetchEffectivePreview();
     }, 200);
 
     return () => {

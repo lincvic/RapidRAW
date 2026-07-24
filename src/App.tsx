@@ -58,6 +58,7 @@ import {
 
 import ImageProcessingManager from './components/managers/ImageProcessingManager';
 import ImageLoaderManager from './components/managers/ImageLoaderManager';
+import type { ImageCacheEntry } from './utils/ImageLRUCache';
 
 const CLERK_PUBLISHABLE_KEY = 'pk_test_YnJpZWYtc2Vhc25haWwtMTIuY2xlcmsuYWNjb3VudHMuZGV2JA'; // local dev key
 
@@ -178,11 +179,10 @@ function App() {
     };
   });
 
-  const isBackendReadyRef = useRef(true);
   const previewJobIdRef = useRef<number>(0);
   const latestRenderedJobIdRef = useRef<number>(0);
   const currentResRef = useRef<number>(1280);
-  const cachedEditStateRef = useRef<any | null>(null);
+  const cachedEditStateRef = useRef<ImageCacheEntry | null>(null);
 
   const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>(defaultLibraryViewMode);
   const [isResizing, setIsResizing] = useState(false);
@@ -257,11 +257,9 @@ function App() {
     preloadedDataRef,
     cachedEditStateRef,
     selectedImagePathRef,
-    isBackendReadyRef,
     latestRenderedJobIdRef,
     previewJobIdRef,
     currentResRef,
-    prevAdjustmentsRef,
   };
 
   const {

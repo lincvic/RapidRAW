@@ -9,17 +9,13 @@ import { useUIStore } from '../store/useUIStore';
 import { useProcessStore } from '../store/useProcessStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes, LibraryViewMode, ImageFile } from '../components/ui/AppProperties';
-import { globalImageCache } from '../utils/ImageLRUCache';
-import { runAfterEditorSave, runEditorTransition } from '../services/editorPersistence';
-import { initializeAdjustmentLoad, structurallyEqual } from '../utils/rafCameraDefaults';
-import type { AdjustmentLoadContext, LoadMetadataResult } from '../types/imageLoading';
+import { createCachedEditorPlaceholder, globalImageCache, type ImageCacheEntry } from '../utils/ImageLRUCache';
+import { runEditorTransition } from '../services/editorPersistence';
 import {
   createEditorNavigationTransitions,
   createNavigationIntentTracker,
+  invalidatePendingPreviewJobs,
   isCurrentEditorSession,
-  isCurrentNavigation,
-  resolveAndCommitForCleanEditorSession,
-  resolveAndCommitForCurrentNavigationIntent,
 } from '../utils/asyncNavigation';
 
 export interface AppNavigationProps {
@@ -27,13 +23,11 @@ export interface AppNavigationProps {
   refs: {
     transformWrapperRef: React.RefObject<any>;
     preloadedDataRef: React.RefObject<any>;
-    cachedEditStateRef: React.RefObject<any>;
+    cachedEditStateRef: React.RefObject<ImageCacheEntry | null>;
     selectedImagePathRef: React.RefObject<string | null>;
-    isBackendReadyRef: React.RefObject<boolean>;
     latestRenderedJobIdRef: React.RefObject<number>;
     previewJobIdRef: React.RefObject<number>;
     currentResRef: React.RefObject<number>;
-    prevAdjustmentsRef: React.RefObject<any>;
   };
 }
 
@@ -54,7 +48,6 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     preloadedDataRef,
     cachedEditStateRef,
     selectedImagePathRef,
-    isBackendReadyRef,
     latestRenderedJobIdRef,
     previewJobIdRef,
     currentResRef,
@@ -64,6 +57,11 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     editorNavigationTransitionsRef.current = createEditorNavigationTransitions({
       navigationGenerationRef,
       selectedImagePathRef,
+      releaseEditorPreviews: () => {
+        const { finalPreviewUrl, uncroppedAdjustedPreviewUrl } = useEditorStore.getState();
+        globalImageCache.revokeWhenUnprotected(finalPreviewUrl);
+        globalImageCache.revokeWhenUnprotected(uncroppedAdjustedPreviewUrl);
+      },
       clearEditorSession: () => useEditorStore.getState().clearEditorSession(),
     });
   }
@@ -123,7 +121,6 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           editorNavigationTransitions.clearForBackToLibrary();
           setLibrary({ isViewLoading: false, libraryActivePath: lastActivePath });
           setUI({ slideDirection: 1 });
-          isBackendReadyRef.current = true;
           didNavigate = true;
         },
         () => navigationIntentTracker.isCurrent(navigationIntent),
@@ -142,185 +139,94 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
 
       if (selectedImage?.path === path) return true;
 
+      let didSelect = false;
+      const activePath = selectedImage?.path;
+
       try {
-        if (selectedImage?.path) await runAfterEditorSave(selectedImage.path, () => undefined);
+        await runEditorTransition(
+          activePath,
+          () => {
+            const { selectedImage: currentImage, setEditor } = useEditorStore.getState();
+            const { setLibrary, multiSelectedPaths } = useLibraryStore.getState();
+            const { setUI } = useUIStore.getState();
+            const previousFinalPreviewUrl = useEditorStore.getState().finalPreviewUrl;
+            const previousUncroppedPreviewUrl = useEditorStore.getState().uncroppedAdjustedPreviewUrl;
+            const cached = globalImageCache.takeForNavigation(
+              path,
+              currentImage?.path && cachedEditStateRef.current?.selectedImage.path === currentImage.path
+                ? { key: currentImage.path, entry: cachedEditStateRef.current }
+                : undefined,
+            );
+            editorNavigationTransitions.beginImageSelection(path);
+            useEditorStore.getState().beginImageSelection({
+              exif: null,
+              height: 0,
+              isRaw: false,
+              isReady: false,
+              metadata: null,
+              originalUrl: null,
+              path,
+              sourceKind: null,
+              thumbnailUrl: useProcessStore.getState().thumbnails[path] || cached?.selectedImage.thumbnailUrl || '',
+              width: 0,
+            });
+            setEditor({
+              originalSize: { width: 0, height: 0 },
+              previewSize: { width: 0, height: 0 },
+              histogram: null,
+              waveform: null,
+              uncroppedAdjustedPreviewUrl: null,
+              patchesSentToBackend: new Set<string>(),
+              hasRenderedFirstFrame: false,
+              showOriginal: false,
+              activeMaskId: null,
+              activeMaskContainerId: null,
+              activeAiPatchContainerId: null,
+              activeAiSubMaskId: null,
+              isWbPickerActive: false,
+              transformedOriginalUrl: null,
+            });
+            setLibrary({
+              multiSelectedPaths: multiSelectedPaths.includes(path) ? multiSelectedPaths : [path],
+              libraryActivePath: null,
+              selectionAnchorPath: path,
+              isViewLoading: true,
+            });
+            setUI({
+              isLibraryExportPanelVisible: false,
+              compactEditorPanelHeightOverride: null,
+            });
+
+            invalidatePendingPreviewJobs(previewJobIdRef, latestRenderedJobIdRef);
+            currentResRef.current = 0;
+
+            if (cached) {
+              setEditor(createCachedEditorPlaceholder(cached));
+            } else {
+              setEditor({ finalPreviewUrl: null });
+            }
+
+            if (previousFinalPreviewUrl !== cached?.finalPreviewUrl) {
+              globalImageCache.revokeWhenUnprotected(previousFinalPreviewUrl);
+            }
+            if (previousUncroppedPreviewUrl !== cached?.uncroppedPreviewUrl) {
+              globalImageCache.revokeWhenUnprotected(previousUncroppedPreviewUrl);
+            }
+
+            setEditor((state) => {
+              if (state.interactivePatch?.url) URL.revokeObjectURL(state.interactivePatch.url);
+              return { interactivePatch: null };
+            });
+            didSelect = true;
+          },
+          () => navigationIntentTracker.isCurrent(navigationIntent),
+        );
       } catch (error) {
         toast.error(`Failed to save changes: ${error}`);
         return false;
       }
-      if (!navigationIntentTracker.isCurrent(navigationIntent)) return false;
 
-      return resolveAndCommitForCurrentNavigationIntent(
-        navigationIntent,
-        () => navigationIntentGenerationRef.current,
-        () => invoke<boolean>('is_image_cached', { path }).catch(() => false),
-        async (isCachedInBackend) => {
-          let didSelect = false;
-          const activePath = useEditorStore.getState().selectedImage?.path;
-
-          try {
-            await runEditorTransition(
-              activePath,
-              () => {
-                const { selectedImage: currentImage, setEditor } = useEditorStore.getState();
-                const { setLibrary, multiSelectedPaths } = useLibraryStore.getState();
-                const { setUI } = useUIStore.getState();
-                if (currentImage?.path && cachedEditStateRef.current?.selectedImage?.path === currentImage.path) {
-                  globalImageCache.set(currentImage.path, cachedEditStateRef.current);
-                }
-
-                const cached = globalImageCache.get(path);
-                const cachedContext = (cached as { adjustmentLoadContext?: AdjustmentLoadContext } | undefined)
-                  ?.adjustmentLoadContext;
-                const isFrontendCached = Boolean(
-                  cached?.selectedImage?.isReady && cachedContext?.reconciled && cachedContext.sourceKind,
-                );
-                const hasDifferentResolution =
-                  cached &&
-                  (useEditorStore.getState().originalSize.width !== cached.originalSize.width ||
-                    useEditorStore.getState().originalSize.height !== cached.originalSize.height);
-                const requestGeneration = editorNavigationTransitions.beginImageSelection(path).generation;
-                const isCurrentRequest = () =>
-                  isCurrentNavigation(
-                    path,
-                    () => selectedImagePathRef.current,
-                    requestGeneration,
-                    () => navigationGenerationRef.current,
-                  );
-
-                useEditorStore.getState().beginImageSelection({
-                  exif: null,
-                  height: 0,
-                  isRaw: false,
-                  isReady: false,
-                  metadata: null,
-                  originalUrl: null,
-                  path,
-                  sourceKind: null,
-                  thumbnailUrl: useProcessStore.getState().thumbnails[path],
-                  width: 0,
-                });
-                setEditor({
-                  originalSize: { width: 0, height: 0 },
-                  previewSize: { width: 0, height: 0 },
-                  histogram: null,
-                  waveform: null,
-                  uncroppedAdjustedPreviewUrl: null,
-                  patchesSentToBackend: new Set<string>(),
-                  ...(!isCachedInBackend || !isFrontendCached || hasDifferentResolution
-                    ? { hasRenderedFirstFrame: false }
-                    : {}),
-                });
-                setLibrary({
-                  multiSelectedPaths: multiSelectedPaths.includes(path) ? multiSelectedPaths : [path],
-                  libraryActivePath: null,
-                  selectionAnchorPath: path,
-                });
-                setEditor({
-                  showOriginal: false,
-                  activeMaskId: null,
-                  activeMaskContainerId: null,
-                  activeAiPatchContainerId: null,
-                  activeAiSubMaskId: null,
-                  isWbPickerActive: false,
-                  transformedOriginalUrl: null,
-                });
-                setUI({
-                  isLibraryExportPanelVisible: false,
-                  compactEditorPanelHeightOverride: null,
-                });
-                didSelect = true;
-
-                if (isFrontendCached && isCachedInBackend && cached && cachedContext) {
-                  const cachedSourceKind = cachedContext.sourceKind;
-                  setEditor({
-                    originalSize: cached.originalSize,
-                    previewSize: cached.previewSize,
-                    histogram: cached.histogram,
-                    waveform: cached.waveform,
-                    finalPreviewUrl: cached.finalPreviewUrl,
-                    uncroppedAdjustedPreviewUrl: cached.uncroppedPreviewUrl,
-                  });
-                  useEditorStore.getState().beginAdjustmentLoad(cached.adjustments, cachedContext);
-                  const activeCachedContext = useEditorStore.getState().adjustmentLoadContext;
-                  if (!activeCachedContext || !cachedSourceKind) return;
-                  useEditorStore.getState().completeAdjustmentLoad(
-                    cached.adjustments,
-                    {
-                      ...activeCachedContext,
-                      dirty: false,
-                      reconciled: true,
-                      sourceKind: cachedSourceKind,
-                    },
-                    {
-                      ...cached.selectedImage,
-                      isReady: false,
-                      path,
-                      thumbnailUrl: useProcessStore.getState().thumbnails[path] || cached.selectedImage.thumbnailUrl,
-                    },
-                  );
-                  const metadataSessionGeneration = useEditorStore.getState().adjustmentSessionGeneration;
-                  setLibrary({ isViewLoading: false });
-                  latestRenderedJobIdRef.current = previewJobIdRef.current;
-                  isBackendReadyRef.current = false;
-                  currentResRef.current = Infinity;
-
-                  invoke(Invokes.LoadImage, { path })
-                    .then((_result: any) => {
-                      if (!isCurrentRequest()) return;
-                      isBackendReadyRef.current = true;
-                      currentResRef.current = 0;
-                      setEditor({ originalSize: { width: _result.width, height: _result.height } });
-                    })
-                    .catch((err: any) => {
-                      if (String(err).includes('cancelled')) return;
-                      if (!isCurrentRequest()) return;
-                      console.error('Background load_image failed on cache hit:', err);
-                      isBackendReadyRef.current = true;
-                      currentResRef.current = 0;
-                    });
-                  void resolveAndCommitForCleanEditorSession(
-                    path,
-                    metadataSessionGeneration,
-                    () => invoke<LoadMetadataResult>(Invokes.LoadMetadata, { path }),
-                    () => useEditorStore.getState(),
-                    (live, metadata) => {
-                      const fresh = initializeAdjustmentLoad(metadata);
-                      return !structurallyEqual(live.adjustments, fresh.adjustments);
-                    },
-                    (live) => live.beginAdjustmentReload(path),
-                  ).catch((err) => {
-                    if (isCurrentRequest()) console.error('Failed background metadata sync on cache hit:', err);
-                  });
-                  return;
-                }
-
-                isBackendReadyRef.current = true;
-                setLibrary({ isViewLoading: true });
-                setEditor((state) => {
-                  const previous = state.finalPreviewUrl;
-                  if (previous?.startsWith('blob:') && !globalImageCache.isProtected(previous)) {
-                    setTimeout(() => {
-                      if (!globalImageCache.isProtected(previous)) URL.revokeObjectURL(previous);
-                    }, 250);
-                  }
-                  return { finalPreviewUrl: null };
-                });
-                setEditor((state) => {
-                  if (state.interactivePatch?.url) URL.revokeObjectURL(state.interactivePatch.url);
-                  return { interactivePatch: null };
-                });
-              },
-              () => navigationIntentTracker.isCurrent(navigationIntent),
-            );
-          } catch (error) {
-            toast.error(`Failed to save changes: ${error}`);
-            return false;
-          }
-
-          return didSelect;
-        },
-      );
+      return didSelect;
     },
     [refs],
   );

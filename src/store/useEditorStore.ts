@@ -126,7 +126,14 @@ interface EditorState {
     adjustments: Adjustments,
     context: AdjustmentLoadContext,
     selectedImage: SelectedImage,
-  ) => void;
+    dimensions: {
+      originalSize: ImageDimensions;
+      previewSize: ImageDimensions;
+    },
+  ) => {
+    finalPreviewUrl: string | null;
+    uncroppedPreviewUrl: string | null;
+  } | null;
   applyExplicitAdjustments: (value: Adjustments) => void;
   beginAdjustmentReload: (path: string, suspendedHistory?: SuspendedHistoryToken | null) => AdjustmentSessionSnapshot;
   beginImageSelection: (selectedImage: SelectedImage) => void;
@@ -252,7 +259,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     });
   },
 
-  completeAdjustmentLoad: (adjustments, context, selectedImage) => {
+  completeAdjustmentLoad: (adjustments, context, selectedImage, dimensions) => {
     const current = get();
     const currentImage = current.selectedImage;
     if (
@@ -262,11 +269,12 @@ export const useEditorStore = create<EditorState>((set, get) => ({
       context.sourceKind === null ||
       contextGeneration(context) !== current.adjustmentLoadGeneration
     ) {
-      return;
+      return null;
     }
 
     cancelPendingHistory();
     const nextAdjustments = clone(adjustments);
+    let retiredPreviews: { finalPreviewUrl: string | null; uncroppedPreviewUrl: string | null } | null = null;
     set((state) => {
       if (
         state.selectedImage?.path !== selectedImage.path ||
@@ -276,6 +284,10 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         return {};
       }
       const nextContext = { ...clone(context), dirty: false };
+      retiredPreviews = {
+        finalPreviewUrl: state.finalPreviewUrl,
+        uncroppedPreviewUrl: state.uncroppedAdjustedPreviewUrl,
+      };
       return {
         adjustments: nextAdjustments,
         adjustmentLoadContext: nextContext,
@@ -283,6 +295,13 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         adjustmentReloadSnapshot: null,
         history: [clone(nextAdjustments)],
         historyIndex: 0,
+        finalPreviewUrl: null,
+        uncroppedAdjustedPreviewUrl: null,
+        histogram: null,
+        waveform: null,
+        hasRenderedFirstFrame: false,
+        originalSize: clone(dimensions.originalSize),
+        previewSize: clone(dimensions.previewSize),
         selectedImage: {
           ...state.selectedImage,
           ...clone(selectedImage),
@@ -291,6 +310,7 @@ export const useEditorStore = create<EditorState>((set, get) => ({
         },
       };
     });
+    return retiredPreviews;
   },
 
   applyExplicitAdjustments: (value) => {

@@ -46,6 +46,11 @@ const selectedImage = (overrides: Partial<SelectedImage> = {}): SelectedImage =>
 const cloneAdjustments = (overrides: Partial<Adjustments> = {}): Adjustments =>
   normalizeLoadedAdjustments({ ...overrides });
 
+const loadDimensions = {
+  originalSize: { width: 7000, height: 3000 },
+  previewSize: { width: 1400, height: 600 },
+};
+
 const completeDevelopedLoad = () => {
   const initialized = initializeAdjustmentLoad(metadata(null));
   const image = selectedImage({ sourceKind: IMAGE_SOURCE_KINDS.DevelopedRaw });
@@ -63,7 +68,7 @@ const completeDevelopedLoad = () => {
     },
   );
 
-  useEditorStore.getState().completeAdjustmentLoad(reconciled.adjustments, reconciled.context, image);
+  useEditorStore.getState().completeAdjustmentLoad(reconciled.adjustments, reconciled.context, image, loadDimensions);
 
   return { ...reconciled, image };
 };
@@ -101,7 +106,7 @@ describe('editor adjustment session transitions', () => {
     expect(state.adjustmentLoadContext).toMatchObject({ reconciled: false, dirty: false });
   });
 
-  it('completes adjustments, history, context, provenance, and readiness in one observed state', () => {
+  it('completes dimensions, adjustments, history, context, provenance, and readiness in one observed state', () => {
     const initialized = initializeAdjustmentLoad(metadata(null));
     useEditorStore.getState().setEditor({ selectedImage: selectedImage() });
     useEditorStore.getState().beginAdjustmentLoad(initialized.adjustments, initialized.context);
@@ -116,9 +121,12 @@ describe('editor adjustment session transitions', () => {
       },
     );
 
+    const dimensions = loadDimensions;
     const observed: ReturnType<typeof useEditorStore.getState>[] = [];
     const unsubscribe = useEditorStore.subscribe((state) => observed.push(state));
-    useEditorStore.getState().completeAdjustmentLoad(reconciled.adjustments, reconciled.context, selectedImage());
+    useEditorStore
+      .getState()
+      .completeAdjustmentLoad(reconciled.adjustments, reconciled.context, selectedImage(), dimensions);
     unsubscribe();
 
     const state = useEditorStore.getState();
@@ -126,6 +134,18 @@ describe('editor adjustment session transitions', () => {
     expect(observed.some((entry) => entry.selectedImage?.isReady && !entry.adjustmentLoadContext?.reconciled)).toBe(
       false,
     );
+    expect(
+      observed.some(
+        (entry) =>
+          entry.originalSize.width === dimensions.originalSize.width &&
+          entry.originalSize.height === dimensions.originalSize.height &&
+          entry.previewSize.width === dimensions.previewSize.width &&
+          entry.previewSize.height === dimensions.previewSize.height &&
+          (!entry.selectedImage?.isReady || !entry.adjustmentLoadContext?.reconciled),
+      ),
+    ).toBe(false);
+    expect(state.originalSize).toEqual(dimensions.originalSize);
+    expect(state.previewSize).toEqual(dimensions.previewSize);
     expect(state.adjustments).toEqual(reconciled.adjustments);
     expect(state.history).toEqual([reconciled.adjustments]);
     expect(state.historyIndex).toBe(0);
@@ -190,7 +210,12 @@ describe('editor adjustment session transitions', () => {
 
     useEditorStore
       .getState()
-      .completeAdjustmentLoad(reconciled.adjustments, reconciled.context, selectedImage({ isRaw: true }));
+      .completeAdjustmentLoad(
+        reconciled.adjustments,
+        reconciled.context,
+        selectedImage({ isRaw: true }),
+        loadDimensions,
+      );
     useEditorStore.getState().undo();
 
     const state = useEditorStore.getState();
@@ -215,6 +240,10 @@ describe('editor adjustment session transitions', () => {
         source_kind: IMAGE_SOURCE_KINDS.DevelopedRaw,
       },
     );
+    const staleDimensions = {
+      originalSize: { width: 999, height: 888 },
+      previewSize: { width: 333, height: 222 },
+    };
 
     useEditorStore
       .getState()
@@ -222,9 +251,12 @@ describe('editor adjustment session transitions', () => {
         reconciled.adjustments,
         reconciled.context,
         selectedImage({ path: '/stale.raf', sourceKind: IMAGE_SOURCE_KINDS.EmbeddedPreview }),
+        staleDimensions,
       );
     expect(useEditorStore.getState().selectedImage).toMatchObject({ path: '/current.raf', isReady: false });
     expect(useEditorStore.getState().adjustmentLoadContext?.reconciled).toBe(false);
+    expect(useEditorStore.getState().originalSize).toEqual({ width: 0, height: 0 });
+    expect(useEditorStore.getState().previewSize).toEqual({ width: 0, height: 0 });
 
     useEditorStore
       .getState()
@@ -232,6 +264,7 @@ describe('editor adjustment session transitions', () => {
         reconciled.adjustments,
         reconciled.context,
         selectedImage({ path: '/current.raf', sourceKind: IMAGE_SOURCE_KINDS.EmbeddedPreview }),
+        loadDimensions,
       );
     expect(useEditorStore.getState().selectedImage).toMatchObject({
       path: '/current.raf',
@@ -239,6 +272,8 @@ describe('editor adjustment session transitions', () => {
       sourceKind: IMAGE_SOURCE_KINDS.DevelopedRaw,
     });
     expect(useEditorStore.getState().adjustmentLoadContext?.sourceKind).toBe(IMAGE_SOURCE_KINDS.DevelopedRaw);
+    expect(useEditorStore.getState().originalSize).toEqual(loadDimensions.originalSize);
+    expect(useEditorStore.getState().previewSize).toEqual(loadDimensions.previewSize);
   });
 
   it('ignores an older completion for the same path after the active load has completed and been edited', () => {
@@ -247,7 +282,9 @@ describe('editor adjustment session transitions', () => {
     useEditorStore.getState().applyExplicitAdjustments(edited);
     const historyBefore = useEditorStore.getState().history;
 
-    useEditorStore.getState().completeAdjustmentLoad(completed.adjustments, completed.context, completed.image);
+    useEditorStore
+      .getState()
+      .completeAdjustmentLoad(completed.adjustments, completed.context, completed.image, loadDimensions);
 
     expect(useEditorStore.getState().adjustments.exposure).toBe(2);
     expect(useEditorStore.getState().adjustmentLoadContext?.dirty).toBe(true);

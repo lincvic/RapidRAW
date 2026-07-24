@@ -11,6 +11,7 @@ interface MutableRef<T> {
 interface EditorNavigationTransitionInput {
   clearEditorSession: () => void;
   navigationGenerationRef: MutableRef<number>;
+  releaseEditorPreviews: () => void;
   selectedImagePathRef: MutableRef<string | null>;
 }
 
@@ -24,11 +25,13 @@ interface EditorSessionTarget {
   path: string | null;
 }
 
-interface CleanEditorSessionTarget {
-  adjustmentLoadContext: { dirty: boolean; reconciled: boolean } | null;
-  adjustmentSessionGeneration: number;
-  isSliderDragging: boolean;
-  selectedImage: { isReady: boolean; path: string } | null;
+export function invalidatePendingPreviewJobs(
+  previewGeneration: MutableRef<number>,
+  latestPublishedGeneration: MutableRef<number>,
+): void {
+  const invalidatedGeneration = Math.max(previewGeneration.current, latestPublishedGeneration.current) + 1;
+  previewGeneration.current = invalidatedGeneration;
+  latestPublishedGeneration.current = invalidatedGeneration;
 }
 
 export interface ExternalEditExportToken {
@@ -198,11 +201,13 @@ export function isCurrentEditorSession(
 export function createEditorNavigationTransitions({
   clearEditorSession,
   navigationGenerationRef,
+  releaseEditorPreviews,
   selectedImagePathRef,
 }: EditorNavigationTransitionInput) {
   const invalidateAndClear = () => {
     selectedImagePathRef.current = null;
     navigationGenerationRef.current += 1;
+    releaseEditorPreviews();
     clearEditorSession();
   };
 
@@ -331,43 +336,6 @@ export async function resolveForCurrentNavigation<T>(
 ): Promise<T | undefined> {
   const value = await resolve();
   return isCurrentNavigation(requestedPath, currentPath, requestGeneration, currentGeneration) ? value : undefined;
-}
-
-export async function resolveAndCommitForCurrentNavigationIntent<T>(
-  requestGeneration: number,
-  currentGeneration: () => number,
-  resolve: () => Promise<T>,
-  commit: (value: T) => Promise<boolean> | boolean,
-): Promise<boolean> {
-  const value = await resolve();
-  if (currentGeneration() !== requestGeneration) return false;
-  return commit(value);
-}
-
-export async function resolveAndCommitForCleanEditorSession<TValue, TState extends CleanEditorSessionTarget>(
-  requestedPath: string,
-  requestGeneration: number,
-  resolve: () => Promise<TValue>,
-  getCurrent: () => TState,
-  shouldCommit: (current: TState, value: TValue) => boolean,
-  commit: (current: TState, value: TValue) => void,
-): Promise<boolean> {
-  const value = await resolve();
-  const current = getCurrent();
-  const context = current.adjustmentLoadContext;
-  if (
-    current.adjustmentSessionGeneration !== requestGeneration ||
-    current.selectedImage?.path !== requestedPath ||
-    !current.selectedImage.isReady ||
-    !context?.reconciled ||
-    context.dirty ||
-    current.isSliderDragging ||
-    !shouldCommit(current, value)
-  ) {
-    return false;
-  }
-  commit(current, value);
-  return true;
 }
 
 export async function runExclusiveAsync<T>(

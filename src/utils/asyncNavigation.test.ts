@@ -3,6 +3,7 @@ import * as asyncNavigation from './asyncNavigation';
 import {
   createEditorNavigationTransitions,
   createNavigationIntentTracker,
+  invalidatePendingPreviewJobs,
   isReadyNavigationTarget,
   navigateAndRunOnSuccess,
   navigateExternalEditSource,
@@ -10,6 +11,18 @@ import {
 } from './asyncNavigation';
 
 describe('async navigation outcomes', () => {
+  it('advances preview publication beyond every job started before navigation', () => {
+    const previewGeneration = { current: 7 };
+    const latestPublishedGeneration = { current: 4 };
+
+    invalidatePendingPreviewJobs(previewGeneration, latestPublishedGeneration);
+
+    expect(previewGeneration.current).toBe(8);
+    expect(latestPublishedGeneration.current).toBe(8);
+    expect(7).toBeLessThan(latestPublishedGeneration.current);
+    expect(++previewGeneration.current).toBeGreaterThan(latestPublishedGeneration.current);
+  });
+
   it('runs dependent state changes only after navigation succeeds', async () => {
     const onSuccess = vi.fn();
 
@@ -344,111 +357,6 @@ describe('async navigation outcomes', () => {
     await expect(result).resolves.toBeUndefined();
   });
 
-  it('does not publish a selection before its deferred cache probe resolves', async () => {
-    const resolveAndCommit = (
-      asyncNavigation as typeof asyncNavigation & {
-        resolveAndCommitForCurrentNavigationIntent?: <T>(
-          requestGeneration: number,
-          currentGeneration: () => number,
-          resolve: () => Promise<T>,
-          commit: (value: T) => Promise<boolean> | boolean,
-        ) => Promise<boolean>;
-      }
-    ).resolveAndCommitForCurrentNavigationIntent;
-    expect(resolveAndCommit).toBeTypeOf('function');
-    if (!resolveAndCommit) return;
-
-    let resolveProbe!: (value: boolean) => void;
-    const probe = new Promise<boolean>((resolve) => {
-      resolveProbe = resolve;
-    });
-    let currentIntent = 4;
-    const publishSelection = vi.fn().mockReturnValue(true);
-
-    const operation = resolveAndCommit(
-      4,
-      () => currentIntent,
-      () => probe,
-      publishSelection,
-    );
-    await Promise.resolve();
-    expect(publishSelection).not.toHaveBeenCalled();
-
-    resolveProbe(false);
-    await expect(operation).resolves.toBe(true);
-    expect(publishSelection).toHaveBeenCalledOnce();
-    expect(publishSelection).toHaveBeenCalledWith(false);
-
-    currentIntent = 5;
-  });
-
-  it('does not apply deferred cache metadata after the live editor becomes dirty or starts dragging', async () => {
-    interface SessionState {
-      adjustmentLoadContext: { dirty: boolean; reconciled: boolean } | null;
-      adjustmentSessionGeneration: number;
-      adjustments: { exposure: number };
-      isSliderDragging: boolean;
-      selectedImage: { isReady: boolean; path: string } | null;
-    }
-    const resolveAndCommit = (
-      asyncNavigation as typeof asyncNavigation & {
-        resolveAndCommitForCleanEditorSession?: <TValue, TState extends SessionState>(
-          requestedPath: string,
-          requestGeneration: number,
-          resolve: () => Promise<TValue>,
-          getCurrent: () => TState,
-          shouldCommit: (current: TState, value: TValue) => boolean,
-          commit: (current: TState, value: TValue) => void,
-        ) => Promise<boolean>;
-      }
-    ).resolveAndCommitForCleanEditorSession;
-    expect(resolveAndCommit).toBeTypeOf('function');
-    if (!resolveAndCommit) return;
-
-    const cleanState = (): SessionState => ({
-      adjustmentLoadContext: { dirty: false, reconciled: true },
-      adjustmentSessionGeneration: 4,
-      adjustments: { exposure: 0 },
-      isSliderDragging: false,
-      selectedImage: { isReady: true, path: '/cached.raf' },
-    });
-    let current = cleanState();
-    let resolveMetadata!: (value: { exposure: number }) => void;
-    const metadata = new Promise<{ exposure: number }>((resolve) => {
-      resolveMetadata = resolve;
-    });
-    const reload = vi.fn();
-    const dirtyOperation = resolveAndCommit(
-      '/cached.raf',
-      4,
-      () => metadata,
-      () => current,
-      (live, fresh) => live.adjustments.exposure !== fresh.exposure,
-      reload,
-    );
-    current = {
-      ...current,
-      adjustmentLoadContext: { dirty: true, reconciled: true },
-      adjustments: { exposure: 1.25 },
-    };
-    resolveMetadata({ exposure: 0.5 });
-    await expect(dirtyOperation).resolves.toBe(false);
-    expect(reload).not.toHaveBeenCalled();
-
-    current = { ...cleanState(), isSliderDragging: true };
-    await expect(
-      resolveAndCommit(
-        '/cached.raf',
-        4,
-        () => Promise.resolve({ exposure: 0.5 }),
-        () => current,
-        (live, fresh) => live.adjustments.exposure !== fresh.exposure,
-        reload,
-      ),
-    ).resolves.toBe(false);
-    expect(reload).not.toHaveBeenCalled();
-  });
-
   it('discards a stale lookup after an A to B to A navigation sequence', async () => {
     let currentPath = '/a.raf';
     let currentGeneration = 1;
@@ -512,6 +420,7 @@ describe('async navigation outcomes', () => {
     const transitions = createEditorNavigationTransitions({
       selectedImagePathRef,
       navigationGenerationRef,
+      releaseEditorPreviews: vi.fn(),
       clearEditorSession: vi.fn(),
     });
     const activeRequestIsCurrent = () =>
@@ -641,10 +550,12 @@ describe('async navigation outcomes', () => {
   ] as const)('%s invalidates a pending selection before clearing editor state', (route) => {
     const selectedImagePathRef = { current: '/pending.raf' as string | null };
     const navigationGenerationRef = { current: 4 };
+    const releaseEditorPreviews = vi.fn();
     const stateAtClear: Array<{ path: string | null; generation: number }> = [];
     const transitions = createEditorNavigationTransitions({
       selectedImagePathRef,
       navigationGenerationRef,
+      releaseEditorPreviews,
       clearEditorSession: () => {
         stateAtClear.push({ path: selectedImagePathRef.current, generation: navigationGenerationRef.current });
       },
@@ -661,6 +572,7 @@ describe('async navigation outcomes', () => {
     transitions[route]();
 
     expect(pendingRequestIsCurrent()).toBe(false);
+    expect(releaseEditorPreviews).toHaveBeenCalledOnce();
     expect(stateAtClear).toEqual([{ path: null, generation: 5 }]);
   });
 

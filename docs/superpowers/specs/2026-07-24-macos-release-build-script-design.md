@@ -8,8 +8,8 @@ The local script should expose that existing build path without introducing a se
 
 ## Goals
 
-- Build an unsigned release-mode `RapidRAW.app` and `.dmg` on macOS.
-- Default to the current Mac architecture.
+- Build an unsigned release-mode `RapidRAW.app` and `.dmg` on macOS, even when signing credentials are present in the caller's environment.
+- Default to the Mac's native hardware architecture, including when the shell is running under Rosetta.
 - Allow one explicit architecture override per invocation.
 - Use the repository-pinned Rust toolchain and existing Tauri configuration.
 - Work when invoked from any current working directory.
@@ -37,7 +37,7 @@ Supported invocations:
 ./build-macos-release.sh --help
 ```
 
-With no target option, the script maps `uname -m` as follows:
+With no target option, the script detects the native hardware architecture. It first reads `uname -m`; when that reports `x86_64`, it also checks `sysctl -in sysctl.proc_translated`. A value of `1` means the process is translated by Rosetta on Apple Silicon, so the native architecture is `arm64`. Otherwise, architectures map as follows:
 
 | macOS architecture | Rust target triple     |
 | ------------------ | ---------------------- |
@@ -53,13 +53,14 @@ The script uses `/usr/bin/env bash` with `set -euo pipefail` and resolves the re
 It performs these steps in order:
 
 1. Require `uname -s` to report `Darwin`.
-2. Require `npm` and locate `rustup`. If rustup is not already on `PATH`, check Homebrew's `rustup` prefix and prepend its `bin` directory.
+2. Require `npm` and Homebrew. Resolve Homebrew's `rustup` prefix and unconditionally prepend its `bin` directory to `PATH`, ensuring the rustup `cargo` and `rustc` proxies take precedence over a standalone Homebrew Rust installation.
 3. Resolve the selected Rust target triple.
-4. From the repository root, let rustup read `src-tauri/rust-toolchain.toml`, verify that the pinned toolchain is available, and add the selected target to that toolchain.
+4. From `src-tauri`, let rustup read `rust-toolchain.toml`, resolve and install the pinned toolchain when needed, and add the selected target explicitly to that toolchain. Verify that the `cargo` and `rustc` commands which the build will use are rustup proxies running the pinned toolchain versions.
 5. Run `npm install`, matching the repository's build workflow.
-6. Run the Tauri release build with verbose output, the selected target, and explicit `app` and `dmg` bundles.
-7. Verify that Tauri produced at least one `.app` and one `.dmg` in the target-specific release bundle directory.
-8. Print the architecture, target triple, and absolute artifact paths.
+6. Immediately before compilation, create a temporary timestamp marker.
+7. Run `npm run tauri -- build --verbose --target <target-triple> --bundles app,dmg --no-sign`. The explicit `--no-sign` prevents inherited Apple credentials from enabling signing or notarization.
+8. Verify that the expected `RapidRAW.app` is newer than the marker and that at least one `.dmg` newer than the marker exists in the target-specific release bundle directory.
+9. Print the architecture, target triple, and absolute paths of only those fresh artifacts.
 
 The expected output root is:
 
@@ -71,7 +72,7 @@ The application should be under `bundle/macos/`, and the disk image should be un
 
 ## Toolchain Behavior
 
-The script must use the rustup proxy rather than an independently installed Homebrew `cargo` binary. This ensures Tauri and Cargo honor the repository's Rust 1.96.1 pin. The toolchain version is not duplicated in the script; `src-tauri/rust-toolchain.toml` remains authoritative.
+The script must put `$(brew --prefix rustup)/bin` at the front of `PATH` even when `rustup` is already discoverable. It resolves the active toolchain while its working directory is `src-tauri`, then explicitly installs that toolchain and its selected compilation target. Before starting npm or Tauri, it checks the resolved `cargo` and `rustc` executables and versions from that same directory. This ensures Tauri and Cargo honor the repository's Rust 1.96.1 pin instead of a standalone Homebrew Rust installation. The toolchain version is not duplicated in the script; `src-tauri/rust-toolchain.toml` remains authoritative.
 
 Cross-architecture builds remain one target per invocation. The script installs the requested Rust standard-library target but does not install Rosetta, Xcode, or additional linker components automatically. If the local Xcode toolchain cannot produce the requested architecture, the Tauri/Cargo error is preserved.
 
@@ -79,7 +80,9 @@ Cross-architecture builds remain one target per invocation. The script installs 
 
 Each preflight failure prints a concise message to standard error and exits nonzero. The script does not suppress output from npm, rustup, Cargo, or Tauri. A successful command is not reported unless both required bundle types are present.
 
-Because the output is intentionally unsigned, the script does not invent or require `APPLE_*` environment variables. Any environment inherited from the caller remains untouched.
+Because the output is intentionally unsigned, the script does not invent, require, or clear `APPLE_*` environment variables. Any environment inherited from the caller remains untouched, while Tauri's explicit `--no-sign` option makes those variables irrelevant to the build.
+
+The timestamp marker is removed on exit. Pre-existing `.app` or `.dmg` files cannot satisfy success checks and are not included in the reported artifact list.
 
 ## Verification
 
@@ -88,6 +91,10 @@ Verification covers:
 - `bash -n build-macos-release.sh`.
 - `--help` exits zero and documents both supported target values.
 - Unknown options, missing target values, and unsupported targets exit nonzero before dependency installation or compilation.
+- Native target detection selects `arm64` when invoked by an `x86_64` process translated by Rosetta.
+- Homebrew's rustup proxies take precedence, and the selected Cargo/Rustc versions match the toolchain pinned under `src-tauri`.
+- The Tauri invocation contains explicit `--bundles app,dmg` and `--no-sign` arguments.
 - A native invocation completes successfully on macOS.
-- The resulting `.app` and `.dmg` exist under the selected target's release bundle directory.
+- The resulting `.app` and `.dmg` exist under the selected target's release bundle directory and are newer than the pre-build marker.
+- Pre-existing bundle files alone cannot make a failed or incomplete build appear successful.
 - `git diff --check` passes and generated build artifacts remain ignored.

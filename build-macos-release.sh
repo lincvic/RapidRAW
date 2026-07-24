@@ -19,6 +19,11 @@ usage_error() {
   exit 2
 }
 
+die() {
+  printf 'Error: %s\n' "$1" >&2
+  exit 1
+}
+
 requested_arch=''
 target_seen=0
 help_requested=0
@@ -63,4 +68,153 @@ if [[ "$help_requested" -eq 1 ]]; then
   exit 0
 fi
 
-exit 0
+script_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+repo_root="$script_dir"
+tauri_dir="$repo_root/src-tauri"
+toolchain_file="$tauri_dir/rust-toolchain.toml"
+
+cd "$repo_root"
+
+host_system="$(uname -s)"
+if [[ "$host_system" != 'Darwin' ]]; then
+  die "macOS is required to build macOS release artifacts (detected $host_system)"
+fi
+
+if ! command -v npm >/dev/null 2>&1; then
+  die 'npm is required; install Node.js and npm before building'
+fi
+
+if ! command -v brew >/dev/null 2>&1; then
+  die 'Homebrew is required; install Homebrew and the rustup formula before building'
+fi
+
+host_machine="$(uname -m)"
+case "$host_machine" in
+  arm64)
+    native_arch='arm64'
+    ;;
+  x86_64)
+    translated="$(sysctl -in sysctl.proc_translated 2>/dev/null || true)"
+    if [[ "$translated" == '1' ]]; then
+      native_arch='arm64'
+    else
+      native_arch='x86_64'
+    fi
+    ;;
+  *)
+    die "unsupported macOS host architecture: $host_machine"
+    ;;
+esac
+
+if [[ -n "$requested_arch" ]]; then
+  architecture="$requested_arch"
+else
+  architecture="$native_arch"
+fi
+
+case "$architecture" in
+  arm64)
+    target_triple='aarch64-apple-darwin'
+    ;;
+  x86_64)
+    target_triple='x86_64-apple-darwin'
+    ;;
+esac
+
+rustup_prefix="$(brew --prefix rustup)"
+if [[ -z "$rustup_prefix" ]]; then
+  die 'Homebrew returned an empty prefix for the rustup formula'
+fi
+rustup_bin="$rustup_prefix/bin"
+
+for proxy_name in rustup cargo rustc; do
+  proxy_path="$rustup_bin/$proxy_name"
+  if [[ ! -x "$proxy_path" ]]; then
+    die "Homebrew rustup proxy is missing or not executable: $proxy_path"
+  fi
+done
+
+export PATH="$rustup_bin:$PATH"
+
+for proxy_name in rustup cargo rustc; do
+  proxy_path="$rustup_bin/$proxy_name"
+  resolved_proxy="$(command -v "$proxy_name" || true)"
+  if [[ "$resolved_proxy" != "$proxy_path" ]]; then
+    die "Homebrew rustup proxy was not selected for $proxy_name: expected $proxy_path, got ${resolved_proxy:-not found}"
+  fi
+done
+
+if ! toolchain="$(
+  awk '
+    /^[[:space:]]*#/ { next }
+    /^[[:space:]]*channel[[:space:]]*=/ {
+      declarations++
+      line = $0
+      sub(/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"/, "", line)
+      if (line ~ /^[^"]+"[[:space:]]*(#.*)?$/) {
+        value = line
+        sub(/"[[:space:]]*(#.*)?$/, "", value)
+        if (length(value) > 0) {
+          valid++
+          selected = value
+        }
+      }
+    }
+    END {
+      if (declarations == 1 && valid == 1) {
+        print selected
+      } else {
+        exit 1
+      }
+    }
+  ' "$toolchain_file"
+)"; then
+  die "expected exactly one nonempty channel in $toolchain_file"
+fi
+
+export RUSTUP_TOOLCHAIN="$toolchain"
+
+rustup toolchain install "$toolchain" --no-self-update --profile minimal
+rustup target add --toolchain "$toolchain" "$target_triple"
+
+cd "$tauri_dir"
+cargo_version="$(cargo --version)"
+rustup_cargo_version="$(rustup run "$toolchain" cargo --version)"
+if [[ "$cargo_version" != "$rustup_cargo_version" ]]; then
+  die "Cargo version mismatch: rustup proxy returned '$cargo_version', but rustup run returned '$rustup_cargo_version'"
+fi
+
+rustc_version="$(rustc --version)"
+rustup_rustc_version="$(rustup run "$toolchain" rustc --version)"
+if [[ "$rustc_version" != "$rustup_rustc_version" ]]; then
+  die "Rustc version mismatch: rustup proxy returned '$rustc_version', but rustup run returned '$rustup_rustc_version'"
+fi
+
+cd "$repo_root"
+npm install
+npm run tauri -- build --verbose --target "$target_triple" --bundles app,dmg --no-sign
+
+bundle_dir="$tauri_dir/target/$target_triple/release/bundle"
+app_path="$bundle_dir/macos/RapidRAW.app"
+if [[ ! -d "$app_path" ]]; then
+  die "app artifact not found: $app_path"
+fi
+
+dmg_path=''
+for candidate in "$bundle_dir"/dmg/*.dmg; do
+  if [[ -f "$candidate" ]]; then
+    dmg_path="$candidate"
+    break
+  fi
+done
+
+if [[ -z "$dmg_path" ]]; then
+  die "DMG artifact not found in $bundle_dir/dmg"
+fi
+
+printf 'Architecture: %s\n' "$architecture"
+printf 'Target: %s\n' "$target_triple"
+printf 'Cargo: %s\n' "$cargo_version"
+printf 'Rustc: %s\n' "$rustc_version"
+printf 'App: %s\n' "$app_path"
+printf 'DMG: %s\n' "$dmg_path"

@@ -17,6 +17,7 @@ fixture_repo=''
 fixture_log=''
 fixture_stub_bin=''
 fixture_rustup_prefix=''
+fixture_marker_dir=''
 test_count=0
 
 fail() {
@@ -99,6 +100,16 @@ assert_file_exists() {
   if [[ ! -f "$path" ]]; then
     fail "expected file to exist: $path"
   fi
+}
+
+assert_no_build_markers() {
+  local marker
+
+  for marker in "$fixture_marker_dir"/rapidraw-macos-build.*; do
+    if [[ -e "$marker" ]]; then
+      fail "expected build marker to be removed: $marker"
+    fi
+  done
 }
 
 write_uname_stub() {
@@ -294,9 +305,17 @@ case "$TEST_ARTIFACT_MODE" in
     mkdir -p "$bundle_dir/macos/RapidRAW.app" "$bundle_dir/dmg"
     : > "$bundle_dir/dmg/RapidRAW-test.dmg"
     : > "$bundle_dir/dmg/RapidRAW-z-test.dmg"
+    /usr/bin/touch "$bundle_dir/macos/RapidRAW.app" \
+      "$bundle_dir/dmg/RapidRAW-test.dmg" \
+      "$bundle_dir/dmg/RapidRAW-z-test.dmg"
+    /usr/bin/touch -A 000001 "$bundle_dir/macos/RapidRAW.app" \
+      "$bundle_dir/dmg/RapidRAW-test.dmg" \
+      "$bundle_dir/dmg/RapidRAW-z-test.dmg"
     ;;
   app)
     mkdir -p "$bundle_dir/macos/RapidRAW.app"
+    /usr/bin/touch "$bundle_dir/macos/RapidRAW.app"
+    /usr/bin/touch -A 000001 "$bundle_dir/macos/RapidRAW.app"
     ;;
   none)
     ;;
@@ -314,12 +333,24 @@ setup_fixture() {
   fixture_stub_bin="$fixture_root/stub-bin"
   fixture_rustup_prefix="$fixture_root/homebrew-rustup"
   fixture_log="$fixture_root/commands.log"
+  fixture_marker_dir="$fixture_root/markers"
 
-  mkdir -p "$fixture_repo/src-tauri" "$fixture_stub_bin" "$fixture_rustup_prefix/bin" "$fixture_root/caller"
+  mkdir -p "$fixture_repo/src-tauri" "$fixture_stub_bin" "$fixture_rustup_prefix/bin" \
+    "$fixture_root/caller" "$fixture_marker_dir"
   cp "$build_script" "$fixture_repo/build-macos-release.sh"
   cp "$toolchain_file" "$fixture_repo/src-tauri/rust-toolchain.toml"
   chmod +x "$fixture_repo/build-macos-release.sh"
   : > "$fixture_log"
+
+  if [[ -n "${TEST_PREEXISTING_TARGET_TRIPLE:-}" ]]; then
+    preexisting_bundle_dir="$fixture_repo/src-tauri/target/$TEST_PREEXISTING_TARGET_TRIPLE/release/bundle"
+    mkdir -p "$preexisting_bundle_dir/macos/RapidRAW.app" "$preexisting_bundle_dir/dmg"
+    : > "$preexisting_bundle_dir/dmg/RapidRAW-stale.dmg"
+    : > "$preexisting_bundle_dir/dmg/RapidRAW-stale-extra.dmg"
+    /usr/bin/touch -t 202001010000 "$preexisting_bundle_dir/macos/RapidRAW.app" \
+      "$preexisting_bundle_dir/dmg/RapidRAW-stale.dmg" \
+      "$preexisting_bundle_dir/dmg/RapidRAW-stale-extra.dmg"
+  fi
 
   case "${TEST_TOOLCHAIN_MODE:-valid}" in
     valid) ;;
@@ -394,6 +425,7 @@ run_fixture() {
     cd "$fixture_root/caller"
     env -i \
       PATH="$fixture_stub_bin:/usr/bin:/bin" \
+      TMPDIR="$fixture_marker_dir" \
       RUSTUP_TOOLCHAIN="${TEST_INHERITED_TOOLCHAIN:-stable}" \
       TEST_COMMAND_LOG="$fixture_log" \
       TEST_UNAME_SYSTEM="${TEST_UNAME_SYSTEM:-Darwin}" \
@@ -518,6 +550,7 @@ test_explicit_arm64_build() {
   assert_directory_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/RapidRAW.app"
   assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-test.dmg"
   assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-z-test.dmg"
+  assert_no_build_markers
 }
 
 test_explicit_x86_64_build() {
@@ -597,6 +630,7 @@ test_npm_install_failure_is_preserved() {
   assert_output_equals 'fixture npm install failure'
   assert_log_contains 'npm install'
   assert_log_not_contains 'npm run tauri'
+  assert_no_build_markers
 }
 
 test_tauri_build_failure_is_preserved() {
@@ -607,6 +641,7 @@ test_tauri_build_failure_is_preserved() {
   assert_output_not_contains 'Architecture:'
   assert_output_not_contains 'App:'
   assert_output_not_contains 'DMG:'
+  assert_no_build_markers
 }
 
 test_non_darwin_fails_before_npm() {
@@ -712,20 +747,56 @@ test_malformed_and_valid_channels_fail_before_npm() {
   assert_log_not_contains 'npm '
 }
 
+test_stale_app_and_dmgs_do_not_satisfy_build() {
+  TEST_PREEXISTING_TARGET_TRIPLE=aarch64-apple-darwin TEST_ARTIFACT_MODE=none \
+    run_fixture --target arm64
+  assert_status 1
+  assert_output_contains 'Error:'
+  assert_output_contains 'fresh RapidRAW.app was not produced'
+  assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
+  assert_no_build_markers
+}
+
+test_stale_dmgs_do_not_satisfy_build() {
+  TEST_PREEXISTING_TARGET_TRIPLE=aarch64-apple-darwin TEST_ARTIFACT_MODE=app \
+    run_fixture --target arm64
+  assert_status 1
+  assert_output_contains 'Error:'
+  assert_output_contains 'no fresh .dmg was produced'
+  assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
+  assert_no_build_markers
+}
+
+test_stale_dmgs_are_excluded_from_success_output() {
+  TEST_PREEXISTING_TARGET_TRIPLE=aarch64-apple-darwin TEST_ARTIFACT_MODE=all \
+    run_fixture --target arm64
+  assert_status 0
+  assert_output_contains "App: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/RapidRAW.app"
+  assert_output_contains "DMG: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-test.dmg"
+  assert_output_contains "DMG: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-z-test.dmg"
+  assert_output_not_contains "DMG: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-stale.dmg"
+  assert_output_not_contains "DMG: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-stale-extra.dmg"
+  assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-stale.dmg"
+  assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-stale-extra.dmg"
+  assert_no_build_markers
+}
+
 test_missing_dmg_fails_after_build() {
   TEST_ARTIFACT_MODE=app run_fixture --target arm64
   assert_status 1
   assert_output_contains 'Error:'
-  assert_output_contains 'DMG artifact not found'
+  assert_output_contains 'no fresh .dmg was produced'
   assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
+  assert_no_build_markers
 }
 
 test_missing_app_fails_after_build() {
   TEST_ARTIFACT_MODE=none run_fixture --target arm64
   assert_status 1
   assert_output_contains 'Error:'
-  assert_output_contains 'app artifact not found'
+  assert_output_contains 'fresh RapidRAW.app was not produced'
   assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
+  assert_no_build_markers
 }
 
 run_test 'help documents supported targets' test_help
@@ -761,6 +832,9 @@ run_test 'ambiguous toolchain channel fails before npm' test_ambiguous_toolchain
 run_test 'channel outside toolchain section fails before npm' test_other_section_channel_fails_before_npm
 run_test 'half-quoted toolchain channel fails before npm' test_half_quoted_toolchain_channel_fails_before_npm
 run_test 'malformed and valid toolchain channels fail before npm' test_malformed_and_valid_channels_fail_before_npm
+run_test 'stale app and DMGs do not satisfy a successful build' test_stale_app_and_dmgs_do_not_satisfy_build
+run_test 'stale DMGs do not satisfy a build that refreshes only the app' test_stale_dmgs_do_not_satisfy_build
+run_test 'successful builds report fresh DMGs and exclude stale DMGs' test_stale_dmgs_are_excluded_from_success_output
 run_test 'missing DMG fails after the build' test_missing_dmg_fails_after_build
 run_test 'missing app fails after the build' test_missing_app_fails_after_build
 

@@ -198,6 +198,8 @@ cd "$repo_root"
 npm install
 build_marker="$(mktemp "${TMPDIR:-/tmp}/rapidraw-macos-build.XXXXXX")"
 trap 'rm -f "$build_marker"' EXIT
+find_status_file="$(mktemp "${TMPDIR:-/tmp}/rapidraw-macos-find-status.XXXXXX")"
+trap 'rm -f "$build_marker" "$find_status_file"' EXIT
 npm run tauri -- build --verbose --target "$target_triple" --bundles app,dmg --no-sign
 
 bundle_dir="$tauri_dir/target/$target_triple/release/bundle"
@@ -210,7 +212,25 @@ dmg_paths=()
 if [[ -d "$bundle_dir/dmg" ]]; then
   while IFS= read -r -d '' candidate; do
     dmg_paths[${#dmg_paths[@]}]="$candidate"
-  done < <(find "$bundle_dir/dmg" -type f -name '*.dmg' -newer "$build_marker" -print0)
+  done < <(
+    if find "$bundle_dir/dmg" -type f -name '*.dmg' -newer "$build_marker" -print0; then
+      find_status=0
+    else
+      find_status=$?
+    fi
+    printf '%s\n' "$find_status" > "$find_status_file"
+  )
+
+  dmg_find_status="$(<"$find_status_file")"
+  case "$dmg_find_status" in
+    0) ;;
+    [1-9]|[1-9][0-9]|1[0-9][0-9]|2[0-4][0-9]|25[0-5])
+      die "fresh .dmg search failed: find exited with status $dmg_find_status"
+      ;;
+    *)
+      die 'could not verify fresh .dmg search: find status was missing or invalid'
+      ;;
+  esac
 fi
 
 if [[ "${#dmg_paths[@]}" -eq 0 ]]; then

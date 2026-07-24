@@ -102,12 +102,13 @@ assert_file_exists() {
   fi
 }
 
-assert_no_build_markers() {
-  local marker
+assert_no_build_temporary_files() {
+  local temporary_file
 
-  for marker in "$fixture_marker_dir"/rapidraw-macos-build.*; do
-    if [[ -e "$marker" ]]; then
-      fail "expected build marker to be removed: $marker"
+  for temporary_file in "$fixture_marker_dir"/rapidraw-macos-build.* \
+    "$fixture_marker_dir"/rapidraw-macos-find-status.*; do
+    if [[ -e "$temporary_file" ]]; then
+      fail "expected build temporary file to be removed: $temporary_file"
     fi
   done
 }
@@ -266,6 +267,32 @@ printf 'rustc 1.96.1 (fixture)\n'
 EOF
 }
 
+write_find_stub() {
+  cat > "$fixture_stub_bin/find" <<'EOF'
+#!/usr/bin/env bash
+set -u
+
+case "$TEST_FIND_MODE" in
+  normal)
+    exec /usr/bin/find "$@"
+    ;;
+  fail_after_output)
+    /usr/bin/find "$@"
+    real_find_status=$?
+    if [[ "$real_find_status" -ne 0 ]]; then
+      exit "$real_find_status"
+    fi
+    printf 'fixture find failure after emitting results\n' >&2
+    exit 47
+    ;;
+  *)
+    printf 'unsupported fixture find mode: %s\n' "$TEST_FIND_MODE" >&2
+    exit 64
+    ;;
+esac
+EOF
+}
+
 write_npm_stub() {
   cat > "$fixture_stub_bin/npm" <<'EOF'
 #!/usr/bin/env bash
@@ -403,6 +430,7 @@ EOF
   write_standalone_rust_stubs
   write_rustup_stub
   write_rustup_proxy_stubs
+  write_find_stub
 
   if [[ "${TEST_MISSING_BREW:-0}" -ne 1 ]]; then
     write_brew_stub
@@ -439,6 +467,7 @@ run_fixture() {
       TEST_NPM_INSTALL_STATUS="${TEST_NPM_INSTALL_STATUS:-0}" \
       TEST_TAURI_BUILD_STATUS="${TEST_TAURI_BUILD_STATUS:-0}" \
       TEST_ARTIFACT_MODE="${TEST_ARTIFACT_MODE:-all}" \
+      TEST_FIND_MODE="${TEST_FIND_MODE:-normal}" \
       "$fixture_repo/build-macos-release.sh" "$@" 2>&1
   )"
   status=$?
@@ -550,7 +579,7 @@ test_explicit_arm64_build() {
   assert_directory_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/macos/RapidRAW.app"
   assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-test.dmg"
   assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-z-test.dmg"
-  assert_no_build_markers
+  assert_no_build_temporary_files
 }
 
 test_explicit_x86_64_build() {
@@ -630,7 +659,7 @@ test_npm_install_failure_is_preserved() {
   assert_output_equals 'fixture npm install failure'
   assert_log_contains 'npm install'
   assert_log_not_contains 'npm run tauri'
-  assert_no_build_markers
+  assert_no_build_temporary_files
 }
 
 test_tauri_build_failure_is_preserved() {
@@ -641,7 +670,7 @@ test_tauri_build_failure_is_preserved() {
   assert_output_not_contains 'Architecture:'
   assert_output_not_contains 'App:'
   assert_output_not_contains 'DMG:'
-  assert_no_build_markers
+  assert_no_build_temporary_files
 }
 
 test_non_darwin_fails_before_npm() {
@@ -754,7 +783,7 @@ test_stale_app_and_dmgs_do_not_satisfy_build() {
   assert_output_contains 'Error:'
   assert_output_contains 'fresh RapidRAW.app was not produced'
   assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
-  assert_no_build_markers
+  assert_no_build_temporary_files
 }
 
 test_stale_dmgs_do_not_satisfy_build() {
@@ -764,7 +793,7 @@ test_stale_dmgs_do_not_satisfy_build() {
   assert_output_contains 'Error:'
   assert_output_contains 'no fresh .dmg was produced'
   assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
-  assert_no_build_markers
+  assert_no_build_temporary_files
 }
 
 test_stale_dmgs_are_excluded_from_success_output() {
@@ -778,7 +807,19 @@ test_stale_dmgs_are_excluded_from_success_output() {
   assert_output_not_contains "DMG: $fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-stale-extra.dmg"
   assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-stale.dmg"
   assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-stale-extra.dmg"
-  assert_no_build_markers
+  assert_no_build_temporary_files
+}
+
+test_find_failure_after_results_fails_build() {
+  TEST_FIND_MODE=fail_after_output run_fixture --target arm64
+  assert_status 1
+  assert_output_contains 'fixture find failure after emitting results'
+  assert_output_contains 'find exited with status 47'
+  assert_output_not_contains 'App:'
+  assert_output_not_contains 'DMG:'
+  assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-test.dmg"
+  assert_file_exists "$fixture_repo/src-tauri/target/aarch64-apple-darwin/release/bundle/dmg/RapidRAW-z-test.dmg"
+  assert_no_build_temporary_files
 }
 
 test_missing_dmg_fails_after_build() {
@@ -787,7 +828,7 @@ test_missing_dmg_fails_after_build() {
   assert_output_contains 'Error:'
   assert_output_contains 'no fresh .dmg was produced'
   assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
-  assert_no_build_markers
+  assert_no_build_temporary_files
 }
 
 test_missing_app_fails_after_build() {
@@ -796,7 +837,7 @@ test_missing_app_fails_after_build() {
   assert_output_contains 'Error:'
   assert_output_contains 'fresh RapidRAW.app was not produced'
   assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
-  assert_no_build_markers
+  assert_no_build_temporary_files
 }
 
 run_test 'help documents supported targets' test_help
@@ -835,6 +876,7 @@ run_test 'malformed and valid toolchain channels fail before npm' test_malformed
 run_test 'stale app and DMGs do not satisfy a successful build' test_stale_app_and_dmgs_do_not_satisfy_build
 run_test 'stale DMGs do not satisfy a build that refreshes only the app' test_stale_dmgs_do_not_satisfy_build
 run_test 'successful builds report fresh DMGs and exclude stale DMGs' test_stale_dmgs_are_excluded_from_success_output
+run_test 'find failure after emitting DMGs fails the build' test_find_failure_after_results_fails_build
 run_test 'missing DMG fails after the build' test_missing_dmg_fails_after_build
 run_test 'missing app fails after the build' test_missing_app_fails_after_build
 

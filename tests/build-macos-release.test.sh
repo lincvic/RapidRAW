@@ -51,6 +51,8 @@ test_help() {
   run_script --help
   assert_status 0
   assert_output_contains '--target arm64|x86_64'
+  assert_output_contains 'RapidRAW.app'
+  assert_output_contains '.dmg'
 }
 
 test_target_requires_value() {

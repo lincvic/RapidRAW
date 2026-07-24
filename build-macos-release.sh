@@ -196,23 +196,25 @@ fi
 
 cd "$repo_root"
 npm install
+build_marker="$(mktemp "${TMPDIR:-/tmp}/rapidraw-macos-build.XXXXXX")"
+trap 'rm -f "$build_marker"' EXIT
 npm run tauri -- build --verbose --target "$target_triple" --bundles app,dmg --no-sign
 
 bundle_dir="$tauri_dir/target/$target_triple/release/bundle"
 app_path="$bundle_dir/macos/RapidRAW.app"
-if [[ ! -d "$app_path" ]]; then
-  die "app artifact not found: $app_path"
+if [[ ! -d "$app_path" ]] || [[ ! "$app_path" -nt "$build_marker" ]]; then
+  die "fresh RapidRAW.app was not produced at $app_path"
 fi
 
 dmg_paths=()
-for candidate in "$bundle_dir"/dmg/*.dmg; do
-  if [[ -f "$candidate" ]]; then
+if [[ -d "$bundle_dir/dmg" ]]; then
+  while IFS= read -r -d '' candidate; do
     dmg_paths[${#dmg_paths[@]}]="$candidate"
-  fi
-done
+  done < <(find "$bundle_dir/dmg" -type f -name '*.dmg' -newer "$build_marker" -print0)
+fi
 
 if [[ "${#dmg_paths[@]}" -eq 0 ]]; then
-  die "DMG artifact not found in $bundle_dir/dmg"
+  die "no fresh .dmg was produced in $bundle_dir/dmg"
 fi
 
 printf 'Architecture: %s\n' "$architecture"

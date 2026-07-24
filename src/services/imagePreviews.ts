@@ -8,21 +8,35 @@ export interface JsonObject {
   [key: string]: JsonValue;
 }
 
-export interface PreviewMetadataResult {
-  adjustments?: JsonObject | null;
-}
-
 export interface GeneratePreviewInvokePayload {
   [key: string]: unknown;
   request: {
     path: string;
-    jsAdjustments: JsonObject;
+    jsAdjustments?: JsonObject;
   };
 }
 
-export function generateExplicitPreviewForPath(path: string, adjustments: JsonObject): Promise<Uint8Array> {
+export type PreviewInvoke = (command: string, payload: GeneratePreviewInvokePayload) => Promise<Uint8Array>;
+
+const invokePreview: PreviewInvoke = (command, payload) => invoke<Uint8Array>(command, payload);
+
+export function generateEffectivePreviewForPath(
+  path: string,
+  invokeFn: PreviewInvoke = invokePreview,
+): Promise<Uint8Array> {
+  const payload: GeneratePreviewInvokePayload = {
+    request: { path },
+  };
+  return invokeFn(Invokes.GeneratePreviewForPath, payload);
+}
+
+export function generateExplicitPreviewForPath(
+  path: string,
+  adjustments: JsonObject,
+  invokeFn: PreviewInvoke = invokePreview,
+): Promise<Uint8Array> {
   const payload: GeneratePreviewInvokePayload = {
     request: { path, jsAdjustments: adjustments },
   };
-  return invoke<Uint8Array>(Invokes.GeneratePreviewForPath, payload);
+  return invokeFn(Invokes.GeneratePreviewForPath, payload);
 }

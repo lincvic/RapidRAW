@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef, useLayoutEffect, useMemo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import {
@@ -15,7 +14,7 @@ import {
   RectangleVertical,
   Palette,
 } from 'lucide-react';
-import { ImageFile, Invokes } from '../ui/AppProperties';
+import { ImageFile } from '../ui/AppProperties';
 import Button from '../ui/Button';
 import Slider from '../ui/Slider';
 import Switch from '../ui/Switch';
@@ -23,7 +22,7 @@ import clsx from 'clsx';
 import { LAYOUTS, type Layout, type LayoutDefinition } from '../../utils/CollageVariants';
 import Text from '../ui/Text';
 import { TextVariants } from '../../types/typography';
-import { generateExplicitPreviewForPath, type PreviewMetadataResult } from '../../services/imagePreviews';
+import { generateEffectivePreviewForPath } from '../../services/imagePreviews';
 
 interface CollageModalProps {
   isOpen: boolean;
@@ -146,12 +145,7 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
       setError(null);
       try {
         const imagePromises = sourceImages.map(async (imageFile) => {
-          const metadata = await invoke<PreviewMetadataResult>(Invokes.LoadMetadata, {
-            path: imageFile.path,
-          });
-          const adjustments = metadata.adjustments ?? {};
-
-          const imageData = await generateExplicitPreviewForPath(imageFile.path, adjustments);
+          const imageData = await generateEffectivePreviewForPath(imageFile.path);
           const blob = new Blob([new Uint8Array(imageData)], { type: 'image/jpeg' });
           const url = URL.createObjectURL(blob);
 

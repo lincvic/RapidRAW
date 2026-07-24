@@ -142,6 +142,7 @@ export default function NegativeConversionModal({
       updatePreview(DEFAULT_PARAMS, true);
 
       if (selectedImagePath) {
+        // Explicit temporary adjustments intentionally bypass sidecar and camera-default merging.
         generateExplicitPreviewForPath(selectedImagePath, {})
           .then((res) => {
             const blob = new Blob([new Uint8Array(res)], { type: 'image/jpeg' });

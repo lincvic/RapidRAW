@@ -292,6 +292,7 @@ describe('navigation save barriers', () => {
     const transitions = createEditorNavigationTransitions({
       selectedImagePathRef,
       navigationGenerationRef,
+      releaseEditorPreviews: vi.fn(),
       clearEditorSession: vi.fn(),
     });
     const switchImage = () => {
@@ -353,6 +354,7 @@ describe('navigation save barriers', () => {
     const transitions = createEditorNavigationTransitions({
       selectedImagePathRef,
       navigationGenerationRef,
+      releaseEditorPreviews: vi.fn(),
       clearEditorSession: vi.fn(),
     });
     let editorPath = '/a.raf';
@@ -418,6 +420,7 @@ describe('navigation save barriers', () => {
       const transitions = createEditorNavigationTransitions({
         selectedImagePathRef,
         navigationGenerationRef,
+        releaseEditorPreviews: vi.fn(),
         clearEditorSession: () => {
           editorPath = null;
         },

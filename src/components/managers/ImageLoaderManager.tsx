@@ -1,7 +1,8 @@
 import { useImageLoader } from '../../hooks/useImageLoader';
+import type { ImageCacheEntry } from '../../utils/ImageLRUCache';
 
 interface Props {
-  cachedEditStateRef: React.RefObject<any>;
+  cachedEditStateRef: React.RefObject<ImageCacheEntry | null>;
   handleImageLoadFailure: () => void;
 }
 

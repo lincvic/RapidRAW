@@ -85,9 +85,37 @@ test_duplicate_target() {
   assert_output_contains '--target may only be specified once'
 }
 
+test_help_rejects_trailing_unknown_option() {
+  run_script --help --bad
+  assert_status 2
+  assert_output_contains 'unknown option: --bad'
+}
+
+test_help_rejects_trailing_positional_argument() {
+  run_script --help output.dmg
+  assert_status 2
+  assert_output_contains 'unexpected argument: output.dmg'
+}
+
+test_help_rejects_duplicate_target() {
+  run_script --help --target arm64 --target x86_64
+  assert_status 2
+  assert_output_contains '--target may only be specified once'
+}
+
+test_help_accepts_valid_target() {
+  run_script --help --target arm64
+  assert_status 0
+  assert_output_contains 'Usage: build-macos-release.sh'
+}
+
 run_test 'help documents supported targets' test_help
 run_test 'target requires a value' test_target_requires_value
 run_test 'unsupported target is rejected' test_unsupported_target
 run_test 'unknown option is rejected' test_unknown_option
 run_test 'positional argument is rejected' test_unexpected_positional_argument
 run_test 'target may only be specified once' test_duplicate_target
+run_test 'help rejects a trailing unknown option' test_help_rejects_trailing_unknown_option
+run_test 'help rejects a trailing positional argument' test_help_rejects_trailing_positional_argument
+run_test 'help rejects a duplicate target' test_help_rejects_duplicate_target
+run_test 'help accepts a valid target' test_help_accepts_valid_target

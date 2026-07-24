@@ -26,6 +26,34 @@ export class ResetTargetLoadingError extends Error {
   }
 }
 
+interface AutoAdjustmentEditorSession {
+  adjustmentSessionGeneration: number;
+  selectedImage: Pick<SelectedImage, 'isReady' | 'path'> | null;
+}
+
+export async function runAutoAdjustmentsForCurrentSession<T>(
+  getSession: () => AutoAdjustmentEditorSession,
+  calculate: () => Promise<T>,
+  apply: (adjustments: T) => void,
+): Promise<boolean> {
+  const requestedSession = getSession();
+  const requestedImage = requestedSession.selectedImage;
+  if (!requestedImage?.isReady) return false;
+
+  const adjustments = await calculate();
+  const currentSession = getSession();
+  if (
+    !currentSession.selectedImage?.isReady ||
+    currentSession.selectedImage.path !== requestedImage.path ||
+    currentSession.adjustmentSessionGeneration !== requestedSession.adjustmentSessionGeneration
+  ) {
+    return false;
+  }
+
+  apply(adjustments);
+  return true;
+}
+
 export async function routeResetForSelection(
   selectedImage: Pick<SelectedImage, 'isReady' | 'path'> | null,
   paths: readonly string[],
@@ -79,15 +107,24 @@ export function useEditorActions() {
   );
 
   const handleAutoAdjustments = useCallback(async () => {
-    const selectedImage = useEditorStore.getState().selectedImage;
-    if (!selectedImage?.isReady) return;
     try {
-      const autoAdjustments: Adjustments = await invoke(Invokes.CalculateAutoAdjustments);
-      setAdjustments((prev: Adjustments) => ({
-        ...prev,
-        ...autoAdjustments,
-        sectionVisibility: { ...prev.sectionVisibility, ...autoAdjustments.sectionVisibility },
-      }));
+      await runAutoAdjustmentsForCurrentSession(
+        () => {
+          const editor = useEditorStore.getState();
+          return {
+            adjustmentSessionGeneration: editor.adjustmentSessionGeneration,
+            selectedImage: editor.selectedImage,
+          };
+        },
+        () => invoke<Adjustments>(Invokes.CalculateAutoAdjustments),
+        (autoAdjustments) => {
+          setAdjustments((prev: Adjustments) => ({
+            ...prev,
+            ...autoAdjustments,
+            sectionVisibility: { ...prev.sectionVisibility, ...autoAdjustments.sectionVisibility },
+          }));
+        },
+      );
     } catch (err) {
       toast.error(`Failed to apply auto adjustments: ${err}`);
     }

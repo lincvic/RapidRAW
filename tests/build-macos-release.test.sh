@@ -47,6 +47,22 @@ assert_output_contains() {
   esac
 }
 
+assert_output_equals() {
+  local expected="$1"
+
+  if [[ "$output" != "$expected" ]]; then
+    fail "expected output to equal: $expected"
+  fi
+}
+
+assert_output_not_contains() {
+  local unexpected="$1"
+
+  case "$output" in
+    *"$unexpected"*) fail "expected output not to contain: $unexpected" ;;
+  esac
+}
+
 assert_log_contains() {
   local expected="$1"
 
@@ -137,6 +153,11 @@ printf 'brew %s\n' "$*" >> "$TEST_COMMAND_LOG"
 if [[ "$*" != '--prefix rustup' ]]; then
   printf 'unexpected brew invocation: %s\n' "$*" >&2
   exit 64
+fi
+
+if [[ "$TEST_BREW_PREFIX_STATUS" -ne 0 ]]; then
+  printf 'fixture brew prefix failure\n' >&2
+  exit "$TEST_BREW_PREFIX_STATUS"
 fi
 
 printf '%s\n' "$TEST_RUSTUP_PREFIX"
@@ -245,6 +266,10 @@ printf ' %s' "$@" >> "$TEST_COMMAND_LOG"
 printf '\n' >> "$TEST_COMMAND_LOG"
 
 if [[ "$#" -eq 1 ]] && [[ "$1" == 'install' ]]; then
+  if [[ "$TEST_NPM_INSTALL_STATUS" -ne 0 ]]; then
+    printf 'fixture npm install failure\n' >&2
+    exit "$TEST_NPM_INSTALL_STATUS"
+  fi
   exit 0
 fi
 
@@ -254,6 +279,11 @@ if [[ "$#" -ne 10 ]] || [[ "$1" != 'run' ]] || [[ "$2" != 'tauri' ]] || \
    [[ "${10}" != '--no-sign' ]]; then
   printf 'unexpected npm invocation: %s\n' "$*" >&2
   exit 64
+fi
+
+if [[ "$TEST_TAURI_BUILD_STATUS" -ne 0 ]]; then
+  printf 'fixture Tauri build failure\n' >&2
+  exit "$TEST_TAURI_BUILD_STATUS"
 fi
 
 target_triple="$7"
@@ -312,6 +342,15 @@ channel = "1.96.1"
 channel = "stable"
 EOF
       ;;
+    other_section)
+      cat > "$fixture_repo/src-tauri/rust-toolchain.toml" <<'EOF'
+[toolchain]
+profile = "minimal"
+
+[other]
+channel = "stable"
+EOF
+      ;;
     *) fail "unsupported fixture toolchain mode: ${TEST_TOOLCHAIN_MODE:-}" ;;
   esac
 
@@ -348,9 +387,12 @@ run_fixture() {
       TEST_UNAME_MACHINE="${TEST_UNAME_MACHINE:-arm64}" \
       TEST_PROC_TRANSLATED="${TEST_PROC_TRANSLATED:-0}" \
       TEST_SYSCTL_STATUS="${TEST_SYSCTL_STATUS:-0}" \
+      TEST_BREW_PREFIX_STATUS="${TEST_BREW_PREFIX_STATUS:-0}" \
       TEST_RUSTUP_PREFIX="$fixture_rustup_prefix" \
       TEST_EXPECTED_TOOLCHAIN='1.96.1' \
       TEST_PROXY_VERSION_MISMATCH="${TEST_PROXY_VERSION_MISMATCH:-0}" \
+      TEST_NPM_INSTALL_STATUS="${TEST_NPM_INSTALL_STATUS:-0}" \
+      TEST_TAURI_BUILD_STATUS="${TEST_TAURI_BUILD_STATUS:-0}" \
       TEST_ARTIFACT_MODE="${TEST_ARTIFACT_MODE:-all}" \
       "$fixture_repo/build-macos-release.sh" "$@" 2>&1
   )"
@@ -536,6 +578,24 @@ test_proxy_version_mismatch_fails_before_npm() {
   assert_log_not_contains 'npm '
 }
 
+test_npm_install_failure_is_preserved() {
+  TEST_NPM_INSTALL_STATUS=42 run_fixture --target arm64
+  assert_status 42
+  assert_output_equals 'fixture npm install failure'
+  assert_log_contains 'npm install'
+  assert_log_not_contains 'npm run tauri'
+}
+
+test_tauri_build_failure_is_preserved() {
+  TEST_TAURI_BUILD_STATUS=43 run_fixture --target arm64
+  assert_status 43
+  assert_output_equals 'fixture Tauri build failure'
+  assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
+  assert_output_not_contains 'Architecture:'
+  assert_output_not_contains 'App:'
+  assert_output_not_contains 'DMG:'
+}
+
 test_non_darwin_fails_before_npm() {
   TEST_UNAME_SYSTEM=Linux run_fixture --target arm64
   assert_status 1
@@ -560,6 +620,15 @@ test_missing_brew_fails_before_npm() {
   assert_log_not_contains 'npm '
 }
 
+test_brew_prefix_failure_is_preserved() {
+  TEST_BREW_PREFIX_STATUS=41 run_fixture --target arm64
+  assert_status 41
+  assert_output_equals 'fixture brew prefix failure'
+  assert_log_contains 'brew --prefix rustup'
+  assert_log_not_contains 'rustup env'
+  assert_log_not_contains 'npm '
+}
+
 test_missing_rustup_proxy_fails_before_npm() {
   TEST_MISSING_RUSTUP_PROXY=1 run_fixture --target arm64
   assert_status 1
@@ -580,7 +649,7 @@ test_missing_toolchain_channel_fails_before_npm() {
   TEST_TOOLCHAIN_MODE=missing run_fixture --target arm64
   assert_status 1
   assert_output_contains 'Error:'
-  assert_output_contains 'exactly one nonempty channel'
+  assert_output_contains 'pin exactly one nonempty quoted channel in [toolchain]'
   assert_log_not_contains 'toolchain install'
   assert_log_not_contains 'npm '
 }
@@ -589,7 +658,7 @@ test_empty_toolchain_channel_fails_before_npm() {
   TEST_TOOLCHAIN_MODE=empty run_fixture --target arm64
   assert_status 1
   assert_output_contains 'Error:'
-  assert_output_contains 'exactly one nonempty channel'
+  assert_output_contains 'pin exactly one nonempty quoted channel in [toolchain]'
   assert_log_not_contains 'toolchain install'
   assert_log_not_contains 'npm '
 }
@@ -598,7 +667,16 @@ test_ambiguous_toolchain_channel_fails_before_npm() {
   TEST_TOOLCHAIN_MODE=ambiguous run_fixture --target arm64
   assert_status 1
   assert_output_contains 'Error:'
-  assert_output_contains 'exactly one nonempty channel'
+  assert_output_contains 'pin exactly one nonempty quoted channel in [toolchain]'
+  assert_log_not_contains 'toolchain install'
+  assert_log_not_contains 'npm '
+}
+
+test_other_section_channel_fails_before_npm() {
+  TEST_TOOLCHAIN_MODE=other_section run_fixture --target arm64
+  assert_status 1
+  assert_output_contains 'Error:'
+  assert_output_contains 'pin exactly one nonempty quoted channel in [toolchain]'
   assert_log_not_contains 'toolchain install'
   assert_log_not_contains 'npm '
 }
@@ -638,14 +716,18 @@ run_test 'native Intel defaults to x86_64' test_native_intel_defaults_to_x86_64
 run_test 'unavailable Rosetta sysctl defaults to x86_64' test_unavailable_rosetta_sysctl_defaults_to_x86_64
 run_test 'inherited rustup toolchain is overridden' test_inherited_toolchain_is_overridden
 run_test 'proxy version mismatch fails before npm' test_proxy_version_mismatch_fails_before_npm
+run_test 'npm install failure status and diagnostic are preserved' test_npm_install_failure_is_preserved
+run_test 'Tauri build failure status and diagnostic are preserved' test_tauri_build_failure_is_preserved
 run_test 'non-Darwin hosts fail before npm' test_non_darwin_fails_before_npm
 run_test 'missing npm fails before npm' test_missing_npm_fails_before_npm
 run_test 'missing Homebrew fails before npm' test_missing_brew_fails_before_npm
+run_test 'brew prefix failure status and diagnostic are preserved' test_brew_prefix_failure_is_preserved
 run_test 'missing rustup proxy fails before npm' test_missing_rustup_proxy_fails_before_npm
 run_test 'unsupported native architecture fails before npm' test_unsupported_native_architecture_fails_before_npm
 run_test 'missing toolchain channel fails before npm' test_missing_toolchain_channel_fails_before_npm
 run_test 'empty toolchain channel fails before npm' test_empty_toolchain_channel_fails_before_npm
 run_test 'ambiguous toolchain channel fails before npm' test_ambiguous_toolchain_channel_fails_before_npm
+run_test 'channel outside toolchain section fails before npm' test_other_section_channel_fails_before_npm
 run_test 'missing DMG fails after the build' test_missing_dmg_fails_after_build
 run_test 'missing app fails after the build' test_missing_app_fails_after_build
 

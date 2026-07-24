@@ -551,6 +551,27 @@ describe('editor adjustment session transitions', () => {
     expect(useEditorStore.getState().selectedImage).toEqual(restoredState.selectedImage);
   });
 
+  it('keeps reload generations monotonic across restore and retry without duplicating suspended history', () => {
+    completeDevelopedLoad();
+    const edited = cloneAdjustments({ ...useEditorStore.getState().adjustments, exposure: 3 });
+    useEditorStore.getState().applyExplicitAdjustments(edited);
+
+    const first = useEditorStore.getState().beginAdjustmentReload('/fixtures/GFX100RF.RAF');
+    const firstGeneration = useEditorStore.getState().adjustmentSessionGeneration;
+    useEditorStore.getState().restoreAdjustmentSession(first);
+    const restoredGeneration = useEditorStore.getState().adjustmentSessionGeneration;
+    const second = useEditorStore.getState().beginAdjustmentReload('/fixtures/GFX100RF.RAF');
+    const secondGeneration = useEditorStore.getState().adjustmentSessionGeneration;
+
+    expect(restoredGeneration).toBeGreaterThan(firstGeneration);
+    expect(secondGeneration).toBeGreaterThan(restoredGeneration);
+    expect(secondGeneration).not.toBe(firstGeneration);
+
+    useEditorStore.getState().restoreAdjustmentSession(second);
+    vi.advanceTimersByTime(500);
+    expect(useEditorStore.getState().history.filter((entry) => entry.exposure === 3)).toHaveLength(1);
+  });
+
   it('does not allow the generic editor setter to replace protected adjustment state', () => {
     const assertProtectedSetterTypes = () => {
       // @ts-expect-error adjustment replacement must use a focused action

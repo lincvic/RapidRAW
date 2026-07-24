@@ -2,7 +2,12 @@ import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest';
 import * as asyncNavigation from '../utils/asyncNavigation';
 import { createEditorNavigationTransitions } from '../utils/asyncNavigation';
 import { normalizeLoadedAdjustments, type Adjustments } from '../utils/adjustments';
-import { createEditorPersistence, type EditorInvoke } from './editorPersistence';
+import {
+  createEditorPersistence,
+  EditorResetBarrierCancelledError,
+  ResetBarrierOutcome,
+  type EditorInvoke,
+} from './editorPersistence';
 
 const deferred = <T = void>() => {
   let resolve!: (value: T | PromiseLike<T>) => void;
@@ -632,6 +637,709 @@ describe('backend adjustment mutation barriers', () => {
 
     await vi.advanceTimersByTimeAsync(500);
     expect(restoredHistory).toEqual([pendingHistory]);
+  });
+});
+
+describe('authoritative reset barriers', () => {
+  beforeEach(() => vi.useFakeTimers());
+  afterEach(() => {
+    vi.clearAllTimers();
+    vi.useRealTimers();
+  });
+
+  it('buffers every save for the path and blocks flush until successful reset completion', async () => {
+    const { invoke, persistence } = createHarness();
+    const rollback = adjustment(2);
+    const newest = adjustment(3);
+    persistence.scheduleSave('/image.raf', adjustment(1));
+
+    const barrier = persistence.beginResetBarrier('/image.raf', rollback);
+    persistence.scheduleSave('/image.raf', newest);
+    let flushSettled = false;
+    const flush = persistence.flushPendingSave('/image.raf').then(() => {
+      flushSettled = true;
+    });
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(invoke).not.toHaveBeenCalled();
+    expect(flushSettled).toBe(false);
+    expect(await barrier.preflightDrain).toBeUndefined();
+
+    expect(persistence.finishResetBarrier(barrier, ResetBarrierOutcome.Success)).toBeUndefined();
+    await flush;
+    expect(flushSettled).toBe(true);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('waits only for the already-in-flight save and never pumps buffered work during reset', async () => {
+    const active = deferred();
+    const { invoke, persistence } = createHarness();
+    invoke.mockReturnValue(active.promise);
+    persistence.scheduleSave('/image.raf', adjustment(1));
+    await vi.advanceTimersByTimeAsync(300);
+
+    const barrier = persistence.beginResetBarrier('/image.raf', adjustment(2));
+    persistence.scheduleSave('/image.raf', adjustment(3));
+    let preflightSettled = false;
+    const preflight = barrier.preflightDrain.then(() => {
+      preflightSettled = true;
+    });
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(preflightSettled).toBe(false);
+
+    active.resolve();
+    await preflight;
+    expect(invoke).toHaveBeenCalledOnce();
+
+    persistence.finishResetBarrier(barrier, ResetBarrierOutcome.Success);
+    await persistence.flushPendingSave('/image.raf');
+    expect(invoke).toHaveBeenCalledOnce();
+  });
+
+  it('makes a waiting loader receive typed cancellation on recoverable failure, then requeues the newest value', async () => {
+    const { invoke, persistence } = createHarness();
+    invoke.mockResolvedValue(undefined);
+    const rollback = adjustment(4);
+    const newest = adjustment(5);
+    const barrier = persistence.beginResetBarrier('/image.raf', rollback);
+    persistence.scheduleSave('/image.raf', newest);
+    const waitingLoader = persistence.flushPendingSave('/image.raf');
+
+    const recovery = persistence.finishResetBarrier(barrier, ResetBarrierOutcome.RecoverableFailure);
+
+    await expect(waitingLoader).rejects.toMatchObject({
+      name: 'EditorResetBarrierCancelledError',
+      outcome: ResetBarrierOutcome.RecoverableFailure,
+    });
+    expect(recovery).toEqual(newest);
+    persistence.scheduleSave('/image.raf', recovery);
+    await persistence.flushPendingSave('/image.raf');
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke.mock.calls[0][1]).toEqual({ path: '/image.raf', adjustments: newest });
+  });
+
+  it('discards unsafe buffered disk work while cancelling the loader', async () => {
+    const { invoke, persistence } = createHarness();
+    const barrier = persistence.beginResetBarrier('/image.raf', adjustment(6));
+    persistence.scheduleSave('/image.raf', adjustment(7));
+    const waitingLoader = persistence.flushPendingSave('/image.raf');
+
+    const retained = persistence.finishResetBarrier(barrier, ResetBarrierOutcome.UnsafeSidecarFailure);
+
+    expect(retained).toMatchObject({ exposure: 7 });
+    await expect(waitingLoader).rejects.toBeInstanceOf(EditorResetBarrierCancelledError);
+    await persistence.flushPendingSave('/image.raf');
+    await vi.advanceTimersByTimeAsync(300);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('keeps the newest failed value retryable when the preflight save rejects', async () => {
+    const failed = deferred();
+    const retry = deferred();
+    const { invoke, persistence } = createHarness();
+    invoke.mockImplementationOnce(() => failed.promise).mockImplementationOnce(() => retry.promise);
+    persistence.scheduleSave('/image.raf', adjustment(1));
+    await vi.advanceTimersByTimeAsync(300);
+
+    const barrier = persistence.beginResetBarrier('/image.raf', adjustment(2));
+    const waitingLoader = persistence.flushPendingSave('/image.raf');
+    failed.reject(new Error('preflight disk failure'));
+    await expect(barrier.preflightDrain).rejects.toThrow('preflight disk failure');
+    persistence.finishResetBarrier(barrier, ResetBarrierOutcome.PreflightSaveFailure);
+    await expect(waitingLoader).rejects.toMatchObject({
+      outcome: ResetBarrierOutcome.PreflightSaveFailure,
+    });
+
+    const retried = persistence.flushPendingSave('/image.raf');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][1]).toMatchObject({ adjustments: { exposure: 2 } });
+    retry.resolve();
+    await retried;
+  });
+
+  it('requires the current opaque token to finish a barrier', () => {
+    const { persistence } = createHarness();
+    const barrier = persistence.beginResetBarrier('/image.raf', adjustment(1));
+    const stale = { ...barrier, generation: barrier.generation - 1 };
+
+    expect(() => persistence.finishResetBarrier(stale, ResetBarrierOutcome.Success)).toThrow(/stale reset barrier/i);
+    persistence.finishResetBarrier(barrier, ResetBarrierOutcome.Success);
+  });
+
+  it('releases a metadata loader only after reset success and success-side cache work', async () => {
+    const reset = deferred();
+    const { invoke, persistence } = createHarness();
+    const events: string[] = [];
+    const operation = persistence.runAuthoritativeReset({
+      path: '/image.raf',
+      rollbackValue: adjustment(1),
+      beginReload: () => {
+        events.push('begin_reload');
+        return { snapshot: true };
+      },
+      restoreReload: () => events.push('restore'),
+      invokeReset: () => {
+        events.push('reset');
+        return reset.promise;
+      },
+      onSuccess: () => events.push('delete_cache'),
+      beginRecoveryReload: () => events.push('fresh_reload'),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const loader = persistence.flushPendingSave('/image.raf').then(() => events.push('load_metadata'));
+    persistence.scheduleSave('/image.raf', adjustment(2));
+    await vi.advanceTimersByTimeAsync(300);
+
+    expect(events).toEqual(['begin_reload', 'reset']);
+    expect(invoke).not.toHaveBeenCalled();
+
+    reset.resolve();
+    await operation;
+    await loader;
+    expect(events).toEqual(['begin_reload', 'reset', 'delete_cache', 'load_metadata']);
+    expect(invoke).not.toHaveBeenCalled();
+  });
+
+  it('lets a transition wait behind an open reset barrier without acquiring a deadlocking save hold', async () => {
+    const reset = deferred();
+    const { persistence } = createHarness();
+    const events: string[] = [];
+    const resetOperation = persistence.runAuthoritativeReset({
+      path: '/image.raf',
+      rollbackValue: adjustment(1),
+      beginReload: () => {
+        events.push('begin_reload');
+        return { snapshot: true };
+      },
+      restoreReload: () => events.push('restore'),
+      invokeReset: async () => {
+        events.push('reset');
+        await reset.promise;
+      },
+      onSuccess: () => events.push('reset_success'),
+      beginRecoveryReload: () => events.push('fresh_reload'),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+
+    let transitionSettled = false;
+    const transition = persistence
+      .runEditorTransition('/image.raf', () => events.push('transition'))
+      .then(() => {
+        transitionSettled = true;
+      });
+    await vi.advanceTimersByTimeAsync(0);
+    expect(events).toEqual(['begin_reload', 'reset']);
+
+    reset.resolve();
+    await resetOperation;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(transitionSettled).toBe(true);
+    await transition;
+    expect(events).toEqual(['begin_reload', 'reset', 'reset_success', 'transition']);
+  });
+
+  it('waits for an existing mutation hold before invoking an authoritative reset', async () => {
+    const mutation = deferred();
+    const reset = deferred();
+    const { persistence } = createHarness();
+    const events: string[] = [];
+    const mutationOperation = persistence.runEditorMutation(
+      '/image.raf',
+      async () => {
+        events.push('mutation');
+        await mutation.promise;
+      },
+      () => events.push('mutation_commit'),
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    const invokeReset = vi.fn(async () => {
+      events.push('reset');
+      await reset.promise;
+    });
+    const resetOperation = persistence.runAuthoritativeReset({
+      path: '/image.raf',
+      rollbackValue: adjustment(2),
+      beginReload: () => {
+        events.push('begin_reload');
+        return { snapshot: true };
+      },
+      restoreReload: () => events.push('restore'),
+      invokeReset,
+      onSuccess: () => events.push('reset_success'),
+      beginRecoveryReload: () => events.push('fresh_reload'),
+    });
+    await vi.advanceTimersByTimeAsync(0);
+    const invokedBeforeMutationFinished = invokeReset.mock.calls.length;
+
+    mutation.resolve();
+    await mutationOperation;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invokeReset).toHaveBeenCalledOnce();
+    reset.resolve();
+    await resetOperation;
+
+    expect(invokedBeforeMutationFinished).toBe(0);
+    expect(events).toEqual(['mutation', 'begin_reload', 'mutation_commit', 'reset', 'reset_success']);
+  });
+
+  it('never invokes reset when a save preflight held by another mutation rejects', async () => {
+    const save = deferred();
+    const { invoke, persistence } = createHarness();
+    invoke.mockReturnValue(save.promise);
+    const mutate = vi.fn();
+    persistence.scheduleSave('/image.raf', adjustment(1));
+    const mutationOperation = persistence.runEditorMutation('/image.raf', mutate, vi.fn()).catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invoke).toHaveBeenCalledOnce();
+
+    const invokeReset = vi.fn();
+    const restoreReload = vi.fn();
+    const resetOperation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: adjustment(1),
+        beginReload: () => ({ snapshot: true }),
+        restoreReload,
+        invokeReset,
+        onSuccess: vi.fn(),
+        beginRecoveryReload: vi.fn(),
+      })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invokeReset).not.toHaveBeenCalled();
+
+    save.reject(new Error('held preflight failed'));
+    await expect(mutationOperation).resolves.toMatchObject({ message: 'held preflight failed' });
+    await expect(resetOperation).resolves.toMatchObject({ message: 'held preflight failed' });
+    expect(mutate).not.toHaveBeenCalled();
+    expect(restoreReload).toHaveBeenCalledOnce();
+    expect(invokeReset).not.toHaveBeenCalled();
+  });
+
+  it('cancels the old loader, persists the newest edit, then starts one fresh reload after recoverable failure', async () => {
+    const reset = deferred();
+    const { invoke, persistence } = createHarness();
+    const events: string[] = [];
+    const committedHistory: Adjustments[] = [];
+    const pendingHistory = adjustment(7);
+    let capturedHistory: ReturnType<typeof persistence.suspendPendingHistory> = null;
+    let retryHistory: ReturnType<typeof persistence.suspendPendingHistory> = null;
+    invoke.mockImplementation(async () => {
+      events.push('save');
+    });
+    const backendError = {
+      kind: 'write',
+      path: '/image.raf.rrdata',
+      message: 'synthetic write failure',
+      rollback_succeeded: true,
+    };
+    persistence.scheduleHistory(pendingHistory, (value) => committedHistory.push(value));
+    const operation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: adjustment(3),
+        beginReload: (historyToken) => {
+          events.push('begin_reload');
+          capturedHistory = historyToken;
+          return { historyToken };
+        },
+        restoreReload: ({ historyToken }) => {
+          events.push('restore');
+          persistence.restorePendingHistory(historyToken);
+        },
+        invokeReset: () => {
+          events.push('reset');
+          return reset.promise;
+        },
+        onSuccess: () => events.push('delete_cache'),
+        beginRecoveryReload: () => {
+          events.push('fresh_reload');
+          retryHistory = persistence.suspendPendingHistory();
+          persistence.restorePendingHistory(retryHistory);
+        },
+      })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const oldLoader = persistence.flushPendingSave('/image.raf').catch((error) => error);
+    const newest = adjustment(4);
+    persistence.scheduleSave('/image.raf', newest);
+
+    reset.reject(backendError);
+    expect(await operation).toEqual(backendError);
+    expect(await oldLoader).toMatchObject({
+      outcome: ResetBarrierOutcome.RecoverableFailure,
+    });
+    expect(events).toEqual(['begin_reload', 'reset', 'restore', 'save', 'fresh_reload']);
+    expect(invoke).toHaveBeenCalledOnce();
+    expect(invoke.mock.calls[0][1]).toEqual({ path: '/image.raf', adjustments: newest });
+    await vi.advanceTimersByTimeAsync(500);
+    expect(committedHistory).toEqual([pendingHistory]);
+    persistence.restorePendingHistory(capturedHistory);
+    persistence.restorePendingHistory(retryHistory);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(committedHistory).toEqual([pendingHistory]);
+  });
+
+  it('retries a retained recovery-save failure before a consecutive reset and aborts if the retry fails', async () => {
+    const firstRecoverySave = deferred();
+    const secondPreflightRetry = deferred();
+    const retainedRetry = deferred();
+    const { invoke, persistence } = createHarness();
+    invoke
+      .mockImplementationOnce(() => firstRecoverySave.promise)
+      .mockImplementationOnce(() => secondPreflightRetry.promise)
+      .mockImplementationOnce(() => retainedRetry.promise);
+    const backendError = {
+      kind: 'write',
+      path: '/image.raf.rrdata',
+      message: 'synthetic write failure',
+      rollback_succeeded: true,
+    };
+    const firstSaveError = new Error('first recovery save failed');
+    const firstOperation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: adjustment(1),
+        beginReload: () => ({ snapshot: 'first' }),
+        restoreReload: vi.fn(),
+        invokeReset: () => Promise.reject(backendError),
+        onSuccess: vi.fn(),
+        beginRecoveryReload: vi.fn(),
+      })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invoke).toHaveBeenCalledOnce();
+
+    firstRecoverySave.reject(firstSaveError);
+    await expect(firstOperation).resolves.toBe(firstSaveError);
+
+    const retryError = new Error('second preflight retry failed');
+    const restoreReload = vi.fn();
+    const invokeReset = vi.fn();
+    const onSuccess = vi.fn();
+    const beginRecoveryReload = vi.fn();
+    const secondOperation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: adjustment(2),
+        beginReload: () => ({ snapshot: 'second' }),
+        restoreReload,
+        invokeReset,
+        onSuccess,
+        beginRecoveryReload,
+      })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][1]).toMatchObject({ adjustments: { exposure: 1 } });
+    expect(invokeReset).not.toHaveBeenCalled();
+
+    secondPreflightRetry.reject(retryError);
+    await expect(secondOperation).resolves.toBe(retryError);
+    expect(restoreReload).toHaveBeenCalledOnce();
+    expect(invokeReset).not.toHaveBeenCalled();
+    expect(onSuccess).not.toHaveBeenCalled();
+    expect(beginRecoveryReload).not.toHaveBeenCalled();
+
+    const retainedFlush = persistence.flushPendingSave('/image.raf');
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invoke).toHaveBeenCalledTimes(3);
+    expect(invoke.mock.calls[2][1]).toMatchObject({ adjustments: { exposure: 2 } });
+    retainedRetry.resolve();
+    await retainedFlush;
+  });
+
+  it('invokes a consecutive reset only after its retained recovery-save retry succeeds', async () => {
+    const firstRecoverySave = deferred();
+    const secondPreflightRetry = deferred();
+    const reset = deferred();
+    const { invoke, persistence } = createHarness();
+    invoke
+      .mockImplementationOnce(() => firstRecoverySave.promise)
+      .mockImplementationOnce(() => secondPreflightRetry.promise);
+    const backendError = {
+      kind: 'write',
+      path: '/image.raf.rrdata',
+      message: 'synthetic write failure',
+      rollback_succeeded: true,
+    };
+    const firstSaveError = new Error('first recovery save failed');
+    const firstOperation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: adjustment(3),
+        beginReload: () => ({ snapshot: 'first' }),
+        restoreReload: vi.fn(),
+        invokeReset: () => Promise.reject(backendError),
+        onSuccess: vi.fn(),
+        beginRecoveryReload: vi.fn(),
+      })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invoke).toHaveBeenCalledOnce();
+
+    firstRecoverySave.reject(firstSaveError);
+    await expect(firstOperation).resolves.toBe(firstSaveError);
+
+    const restoreReload = vi.fn();
+    const invokeReset = vi.fn(() => reset.promise);
+    const onSuccess = vi.fn();
+    const beginRecoveryReload = vi.fn();
+    let secondOperationSettled = false;
+    const secondOperation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: adjustment(4),
+        beginReload: () => ({ snapshot: 'second' }),
+        restoreReload,
+        invokeReset,
+        onSuccess,
+        beginRecoveryReload,
+      })
+      .then(() => {
+        secondOperationSettled = true;
+      });
+    await vi.advanceTimersByTimeAsync(0);
+
+    expect(invoke).toHaveBeenCalledTimes(2);
+    expect(invoke.mock.calls[1][1]).toMatchObject({ adjustments: { exposure: 3 } });
+    expect(invokeReset).not.toHaveBeenCalled();
+    expect(secondOperationSettled).toBe(false);
+
+    secondPreflightRetry.resolve();
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invokeReset).toHaveBeenCalledOnce();
+    expect(secondOperationSettled).toBe(false);
+
+    reset.resolve();
+    await secondOperation;
+    expect(restoreReload).not.toHaveBeenCalled();
+    expect(onSuccess).toHaveBeenCalledOnce();
+    expect(beginRecoveryReload).not.toHaveBeenCalled();
+  });
+
+  it.each(['read', 'parse', 'rollback'])(
+    'restores memory but performs no save or reload for unsafe %s failure',
+    async (kind) => {
+      const reset = deferred();
+      const { invoke, persistence } = createHarness();
+      const restoreReload = vi.fn();
+      const beginRecoveryReload = vi.fn();
+      const committedHistory: Adjustments[] = [];
+      const pendingHistory = adjustment(7);
+      let capturedHistory: ReturnType<typeof persistence.suspendPendingHistory> = null;
+      const backendError = {
+        kind,
+        path: '/image.raf.rrdata',
+        message: `synthetic ${kind} failure`,
+        rollback_succeeded: false,
+      };
+      persistence.scheduleHistory(pendingHistory, (value) => committedHistory.push(value));
+      const operation = persistence
+        .runAuthoritativeReset({
+          path: '/image.raf',
+          rollbackValue: adjustment(5),
+          beginReload: (historyToken) => {
+            capturedHistory = historyToken;
+            return { historyToken };
+          },
+          restoreReload: ({ historyToken }) => {
+            restoreReload();
+            persistence.restorePendingHistory(historyToken);
+          },
+          invokeReset: () => reset.promise,
+          onSuccess: vi.fn(),
+          beginRecoveryReload,
+        })
+        .catch((error) => error);
+      await vi.advanceTimersByTimeAsync(0);
+      const oldLoader = persistence.flushPendingSave('/image.raf').catch((error) => error);
+      persistence.scheduleSave('/image.raf', adjustment(6));
+
+      reset.reject(backendError);
+      expect(await operation).toEqual(backendError);
+      expect(await oldLoader).toMatchObject({ outcome: ResetBarrierOutcome.UnsafeSidecarFailure });
+      expect(restoreReload).toHaveBeenCalledOnce();
+      expect(beginRecoveryReload).not.toHaveBeenCalled();
+      await persistence.flushPendingSave('/image.raf');
+      await vi.advanceTimersByTimeAsync(500);
+      expect(invoke).not.toHaveBeenCalled();
+      expect(committedHistory).toEqual([pendingHistory]);
+      persistence.restorePendingHistory(capturedHistory);
+      await vi.advanceTimersByTimeAsync(500);
+      expect(committedHistory).toEqual([pendingHistory]);
+    },
+  );
+
+  it('aborts before reset on preflight failure and restores the newest history token exactly once', async () => {
+    const save = deferred();
+    const { invoke, persistence } = createHarness();
+    invoke.mockReturnValue(save.promise);
+    const invokeReset = vi.fn();
+    const committedHistory: Adjustments[] = [];
+    const newest = adjustment(9);
+    let capturedHistory: ReturnType<typeof persistence.suspendPendingHistory> = null;
+    persistence.scheduleHistory(newest, (value) => committedHistory.push(value));
+    persistence.scheduleSave('/image.raf', newest);
+    await vi.advanceTimersByTimeAsync(300);
+
+    const operation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: newest,
+        beginReload: (historyToken) => {
+          capturedHistory = historyToken;
+          return { historyToken };
+        },
+        restoreReload: (snapshot) => persistence.restorePendingHistory(snapshot.historyToken),
+        invokeReset,
+        onSuccess: vi.fn(),
+        beginRecoveryReload: vi.fn(),
+      })
+      .catch((error) => error);
+    const oldLoader = persistence.flushPendingSave('/image.raf').catch((error) => error);
+    save.reject(new Error('preflight disk failure'));
+
+    await expect(operation).resolves.toMatchObject({ message: 'preflight disk failure' });
+    expect(await oldLoader).toMatchObject({ outcome: ResetBarrierOutcome.PreflightSaveFailure });
+    expect(invokeReset).not.toHaveBeenCalled();
+    await vi.advanceTimersByTimeAsync(500);
+    expect(committedHistory).toEqual([newest]);
+    persistence.restorePendingHistory(capturedHistory);
+    await vi.advanceTimersByTimeAsync(500);
+    expect(committedHistory).toEqual([newest]);
+  });
+
+  it('transfers stale navigation history ownership to a concurrent failed reset', async () => {
+    const save = deferred();
+    const { invoke, persistence } = createHarness();
+    invoke.mockReturnValue(save.promise);
+    const latest = adjustment(11);
+    const committedHistory: Adjustments[] = [];
+    const navigationCommit = vi.fn();
+    const resetError = {
+      kind: 'read',
+      path: '/image.raf.rrdata',
+      message: 'synthetic reset read failure',
+      rollback_succeeded: false,
+    };
+    let sessionGeneration = 1;
+    const editGeneration = sessionGeneration;
+    let navigationIsCurrent = true;
+
+    persistence.scheduleHistory(latest, (value) => {
+      if (sessionGeneration === editGeneration) committedHistory.push(value);
+    });
+    persistence.scheduleSave('/image.raf', latest);
+    const transition = persistence.runEditorTransition('/image.raf', navigationCommit, () => navigationIsCurrent);
+    await vi.advanceTimersByTimeAsync(0);
+    expect(invoke).toHaveBeenCalledOnce();
+    navigationIsCurrent = false;
+
+    const beginReload = vi.fn((historyToken: ReturnType<typeof persistence.suspendPendingHistory>) => {
+      sessionGeneration += 1;
+      return { historyToken };
+    });
+    const restoreReload = vi.fn((snapshot: { historyToken: ReturnType<typeof persistence.suspendPendingHistory> }) => {
+      const restoredGeneration = ++sessionGeneration;
+      persistence.restorePendingHistory(snapshot.historyToken, (value) => {
+        if (sessionGeneration === restoredGeneration) committedHistory.push(value);
+      });
+    });
+    const invokeReset = vi.fn().mockRejectedValue(resetError);
+    const resetOperation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: latest,
+        beginReload,
+        restoreReload,
+        invokeReset,
+        onSuccess: vi.fn(),
+        beginRecoveryReload: vi.fn(),
+      })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+    const reloadsBeforeNavigationReleasedHistory = beginReload.mock.calls.length;
+
+    save.resolve();
+    await transition;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await resetOperation).toEqual(resetError);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(reloadsBeforeNavigationReleasedHistory).toBe(1);
+    expect(navigationCommit).not.toHaveBeenCalled();
+    expect(invokeReset).toHaveBeenCalledOnce();
+    expect(beginReload).toHaveBeenCalledWith(expect.objectContaining({ value: latest }));
+    expect(restoreReload).toHaveBeenCalledOnce();
+    expect(committedHistory).toEqual([latest]);
+  });
+
+  it('transfers mutation-owned history to reset without committing it twice', async () => {
+    const mutation = deferred();
+    const { persistence } = createHarness();
+    const latest = adjustment(12);
+    const committedHistory: Adjustments[] = [];
+    const resetError = {
+      kind: 'parse',
+      path: '/image.raf.rrdata',
+      message: 'synthetic reset parse failure',
+      rollback_succeeded: false,
+    };
+    let sessionGeneration = 1;
+    const editGeneration = sessionGeneration;
+    let mutationHistory: ReturnType<typeof persistence.suspendPendingHistory> | undefined;
+
+    persistence.scheduleHistory(latest, (value) => {
+      if (sessionGeneration === editGeneration) committedHistory.push(value);
+    });
+    const mutationOperation = persistence.runEditorMutation(
+      '/image.raf',
+      () => mutation.promise,
+      (historyToken) => {
+        mutationHistory = historyToken;
+      },
+    );
+    await vi.advanceTimersByTimeAsync(0);
+
+    const beginReload = vi.fn((historyToken: ReturnType<typeof persistence.suspendPendingHistory>) => {
+      sessionGeneration += 1;
+      return { historyToken };
+    });
+    const restoreReload = vi.fn((snapshot: { historyToken: ReturnType<typeof persistence.suspendPendingHistory> }) => {
+      const restoredGeneration = ++sessionGeneration;
+      persistence.restorePendingHistory(snapshot.historyToken, (value) => {
+        if (sessionGeneration === restoredGeneration) committedHistory.push(value);
+      });
+    });
+    const resetOperation = persistence
+      .runAuthoritativeReset({
+        path: '/image.raf',
+        rollbackValue: latest,
+        beginReload,
+        restoreReload,
+        invokeReset: vi.fn().mockRejectedValue(resetError),
+        onSuccess: vi.fn(),
+        beginRecoveryReload: vi.fn(),
+      })
+      .catch((error) => error);
+    await vi.advanceTimersByTimeAsync(0);
+
+    mutation.resolve();
+    await mutationOperation;
+    await vi.advanceTimersByTimeAsync(0);
+    expect(await resetOperation).toEqual(resetError);
+    await vi.advanceTimersByTimeAsync(500);
+
+    expect(beginReload).toHaveBeenCalledWith(expect.objectContaining({ value: latest }));
+    expect(mutationHistory).toBeNull();
+    expect(restoreReload).toHaveBeenCalledOnce();
+    expect(committedHistory).toEqual([latest]);
   });
 });
 

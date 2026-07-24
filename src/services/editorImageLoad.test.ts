@@ -11,6 +11,8 @@ import {
 } from '../types/imageLoading';
 import type { Adjustments } from '../utils/adjustments';
 import { createCachedEditorPlaceholder, ImageLRUCache, type ImageCacheEntry } from '../utils/ImageLRUCache';
+import { adjustmentsForPersistence } from '../utils/rafCameraDefaults';
+import { createEditorPersistence } from './editorPersistence';
 import { coordinateEditorImageLoad } from './editorImageLoad';
 
 const cameraDefaults: LoadMetadataResult['cameraDefaults'] = {
@@ -75,6 +77,53 @@ const deferred = <T>() => {
   });
   return { promise, reject, resolve };
 };
+
+const coordinateStoreLoad = async (
+  path: string,
+  adjustments: PersistedAdjustments,
+  sourceKind: ImageSourceKind,
+  flushPendingSave: () => Promise<void> = async () => undefined,
+  beforeMetadata: () => void = () => undefined,
+  width = 7000,
+  height = 3000,
+) =>
+  coordinateEditorImageLoad(path, {
+    flushPendingSave: async () => flushPendingSave(),
+    loadMetadata: async () => {
+      beforeMetadata();
+      return metadataWith(adjustments);
+    },
+    loadImage: async () => imageWith(sourceKind, adjustments, width, height),
+    onMetadata: (initialized) => {
+      const store = useEditorStore.getState();
+      store.beginAdjustmentLoad(initialized.adjustments, initialized.context);
+      const active = useEditorStore.getState();
+      return {
+        adjustments: active.adjustments,
+        context: active.adjustmentLoadContext as AdjustmentLoadContext,
+      };
+    },
+    onComplete: (completed) => {
+      const store = useEditorStore.getState();
+      store.completeAdjustmentLoad(
+        completed.adjustments,
+        completed.context,
+        {
+          ...(store.selectedImage as SelectedImage),
+          exif: completed.image.exif,
+          height: completed.image.height,
+          isRaw: completed.image.is_raw,
+          metadata: completed.image.metadata,
+          sourceKind: completed.image.source_kind,
+          width: completed.image.width,
+        },
+        {
+          originalSize: { width: completed.image.width, height: completed.image.height },
+          previewSize: { width: 1400, height: 600 },
+        },
+      );
+    },
+  });
 
 afterEach(() => {
   vi.restoreAllMocks();
@@ -538,6 +587,98 @@ describe('editor image load coordinator', () => {
     expect(observed.some((entry) => entry.selectedImage?.isReady && !entry.adjustmentLoadContext?.reconciled)).toBe(
       false,
     );
+  });
+
+  it('waits for authoritative reset before reloading a null sidecar into one clean camera baseline', async () => {
+    const path = '/fixtures/reset-camera-defaults.RAF';
+    const saved: PersistedAdjustments = {
+      exposure: 1.25,
+      aspectRatio: 4 / 3,
+      crop: { unit: 'px', x: 300, y: 250, width: 6000, height: 2200 },
+    };
+    useEditorStore.getState().beginImageSelection(selectedImage({ path }));
+    await coordinateStoreLoad(path, saved, IMAGE_SOURCE_KINDS.DevelopedRaw);
+    const persistence = createEditorPersistence(vi.fn().mockResolvedValue(undefined));
+    const reset = deferred<void>();
+    const events: string[] = [];
+
+    const resetOperation = persistence.runAuthoritativeReset({
+      path,
+      rollbackValue: adjustmentsForPersistence(
+        useEditorStore.getState().adjustmentLoadContext,
+        useEditorStore.getState().adjustments,
+      ),
+      beginReload: (historyToken) => useEditorStore.getState().beginAdjustmentReload(path, historyToken),
+      restoreReload: (snapshot) => useEditorStore.getState().restoreAdjustmentSession(snapshot),
+      invokeReset: async () => {
+        events.push('reset:start');
+        await reset.promise;
+        events.push('reset:resolved');
+      },
+      onSuccess: () => events.push('cache:deleted'),
+      beginRecoveryReload: () => useEditorStore.getState().beginAdjustmentReload(path),
+    });
+    await Promise.resolve();
+    const reload = coordinateStoreLoad(
+      path,
+      null,
+      IMAGE_SOURCE_KINDS.DevelopedRaw,
+      () => persistence.flushPendingSave(path),
+      () => events.push('load_metadata'),
+    );
+    await Promise.resolve();
+    await Promise.resolve();
+    expect(events).toEqual(['reset:start']);
+
+    reset.resolve();
+    await Promise.all([resetOperation, reload]);
+
+    const state = useEditorStore.getState();
+    expect(events).toEqual(['reset:start', 'reset:resolved', 'cache:deleted', 'load_metadata']);
+    expect(state.adjustments.crop).toEqual({ unit: 'px', x: 100, y: 200, width: 6500, height: 2400 });
+    expect(state.adjustments.aspectRatio).toBe(65 / 24);
+    expect(state.adjustmentLoadContext).toMatchObject({ reconciled: true, dirty: false });
+    expect(state.history).toEqual([state.adjustments]);
+    expect(state.historyIndex).toBe(0);
+    expect(adjustmentsForPersistence(state.adjustmentLoadContext, state.adjustments)).toBeUndefined();
+  });
+
+  it('reloads null metadata through embedded preview as a full-frame fallback, never the RAF crop', async () => {
+    const path = '/fixtures/reset-embedded-fallback.RAF';
+    useEditorStore.getState().beginImageSelection(selectedImage({ path }));
+    await coordinateStoreLoad(path, { exposure: 1 }, IMAGE_SOURCE_KINDS.DevelopedRaw);
+    const persistence = createEditorPersistence(vi.fn().mockResolvedValue(undefined));
+
+    await persistence.runAuthoritativeReset({
+      path,
+      rollbackValue: undefined,
+      beginReload: (historyToken) => useEditorStore.getState().beginAdjustmentReload(path, historyToken),
+      restoreReload: (snapshot) => useEditorStore.getState().restoreAdjustmentSession(snapshot),
+      invokeReset: async () => undefined,
+      onSuccess: () => undefined,
+      beginRecoveryReload: () => useEditorStore.getState().beginAdjustmentReload(path),
+    });
+    await coordinateStoreLoad(
+      path,
+      null,
+      IMAGE_SOURCE_KINDS.EmbeddedPreview,
+      () => persistence.flushPendingSave(path),
+      () => undefined,
+      4000,
+      3000,
+    );
+
+    const state = useEditorStore.getState();
+    expect(state.adjustments.crop).toBeNull();
+    expect(state.adjustments.aspectRatio).toBe(4 / 3);
+    expect(state.adjustments.aspectRatio).not.toBe(65 / 24);
+    expect(state.history).toEqual([state.adjustments]);
+    expect(state.adjustmentLoadContext).toMatchObject({
+      reconciled: true,
+      dirty: false,
+      sourceKind: IMAGE_SOURCE_KINDS.EmbeddedPreview,
+    });
+    expect(adjustmentsForPersistence(state.adjustmentLoadContext, state.adjustments)).toBeUndefined();
   });
 
   it('does not cache reconciled state with provisional cached pixels before a fresh render', async () => {

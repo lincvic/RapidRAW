@@ -14,9 +14,33 @@ import {
   normalizeLoadedAdjustments,
 } from '../utils/adjustments';
 import { calculateCenteredCrop } from '../utils/cropUtils';
-import { Invokes } from '../components/ui/AppProperties';
+import { Invokes, type SelectedImage } from '../components/ui/AppProperties';
 import { globalImageCache } from '../utils/ImageLRUCache';
-import { runEditorMutation, type SuspendedHistoryToken } from '../services/editorPersistence';
+import { resetAdjustmentsErrorMessage, runAuthoritativeReset } from '../services/editorPersistence';
+import { adjustmentsForPersistence } from '../utils/rafCameraDefaults';
+
+export class ResetTargetLoadingError extends Error {
+  constructor(path: string) {
+    super(`Cannot reset adjustments while the selected image is loading: ${path}`);
+    this.name = 'ResetTargetLoadingError';
+  }
+}
+
+export async function routeResetForSelection(
+  selectedImage: Pick<SelectedImage, 'isReady' | 'path'> | null,
+  paths: readonly string[],
+  resetSelected: (path: string) => Promise<void>,
+  resetWithoutSelected: () => Promise<void>,
+): Promise<boolean> {
+  const selectedPath = selectedImage && paths.includes(selectedImage.path) ? selectedImage.path : null;
+  if (selectedPath && !selectedImage?.isReady) throw new ResetTargetLoadingError(selectedPath);
+  if (selectedPath) {
+    await resetSelected(selectedPath);
+  } else {
+    await resetWithoutSelected();
+  }
+  return true;
+}
 
 export function useEditorActions() {
   const setEditor = useEditorStore((s) => s.setEditor);
@@ -113,28 +137,45 @@ export function useEditorActions() {
 
   const handleResetAdjustments = useCallback(async (paths?: string[]) => {
     const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
-    const { selectedImage } = useEditorStore.getState();
+    const editor = useEditorStore.getState();
+    const { selectedImage } = editor;
     const pathsToReset = paths || multiSelectedPaths;
     if (pathsToReset.length === 0) return;
 
-    const selectedPath = selectedImage && pathsToReset.includes(selectedImage.path) ? selectedImage.path : null;
-    const finishReset = (historyToken: SuspendedHistoryToken | null) => {
+    const finishReset = () => {
       pathsToReset.forEach((path) => globalImageCache.delete(path));
       if (libraryActivePath && pathsToReset.includes(libraryActivePath)) {
         setLibrary({ libraryActiveAdjustments: { ...INITIAL_ADJUSTMENTS } });
       }
-      if (selectedPath) useEditorStore.getState().beginAdjustmentReload(selectedPath, historyToken);
     };
 
     try {
       const reset = () => invoke(Invokes.ResetAdjustmentsForPaths, { paths: pathsToReset });
-      if (selectedPath) await runEditorMutation(selectedPath, reset, finishReset);
-      else {
-        await reset();
-        finishReset(null);
-      }
+      await routeResetForSelection(
+        selectedImage,
+        pathsToReset,
+        async (selectedPath) => {
+          const rollbackValue = adjustmentsForPersistence(editor.adjustmentLoadContext, editor.adjustments);
+          await runAuthoritativeReset({
+            path: selectedPath,
+            rollbackValue,
+            beginReload: (historyToken) => useEditorStore.getState().beginAdjustmentReload(selectedPath, historyToken),
+            restoreReload: (snapshot) => useEditorStore.getState().restoreAdjustmentSession(snapshot),
+            invokeReset: reset,
+            onSuccess: finishReset,
+            beginRecoveryReload: () => {
+              globalImageCache.delete(selectedPath);
+              useEditorStore.getState().beginAdjustmentReload(selectedPath);
+            },
+          });
+        },
+        async () => {
+          await reset();
+          finishReset();
+        },
+      );
     } catch (err) {
-      toast.error(`Failed to reset adjustments: ${err}`);
+      toast.error(`Failed to reset adjustments: ${resetAdjustmentsErrorMessage(err)}`);
     }
   }, []);
 

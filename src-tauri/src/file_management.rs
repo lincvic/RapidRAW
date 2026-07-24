@@ -50,8 +50,9 @@ use crate::image_processing::{
 use crate::mask_generation::MaskDefinition;
 use crate::preset_converter;
 use crate::sidecar_io::{
-    ConditionalUpdateOutcome, FileIdentity, TargetExpectation, TargetReplacement, TargetSnapshot,
-    file_identity, inspect_target as inspect_sidecar_target,
+    AtomicUpdateError, AtomicUpdateErrorPhase, ConditionalUpdateOutcome, FileIdentity,
+    TargetExpectation, TargetReplacement, TargetSnapshot, file_identity,
+    inspect_target as inspect_sidecar_target,
 };
 use crate::tagging::COLOR_TAG_PREFIX;
 
@@ -3362,20 +3363,460 @@ pub fn move_files(
     Ok(())
 }
 
-fn write_adjustments_sidecar(
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub(crate) enum ResetAdjustmentsErrorKind {
+    Read,
+    Parse,
+    Serialize,
+    TempWrite,
+    Rename,
+    Write,
+    Conflict,
+    Rollback,
+    Join,
+}
+
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub(crate) struct ResetAdjustmentsError {
+    kind: ResetAdjustmentsErrorKind,
+    path: String,
+    message: String,
+    rollback_succeeded: bool,
+}
+
+impl ResetAdjustmentsError {
+    fn new(kind: ResetAdjustmentsErrorKind, path: &Path, message: impl Into<String>) -> Self {
+        Self {
+            kind,
+            path: path.to_string_lossy().into_owned(),
+            message: message.into(),
+            rollback_succeeded: false,
+        }
+    }
+}
+
+fn reset_error_for_atomic_update(path: &Path, error: AtomicUpdateError) -> ResetAdjustmentsError {
+    let kind = match error.phase {
+        AtomicUpdateErrorPhase::TempWrite => ResetAdjustmentsErrorKind::TempWrite,
+        AtomicUpdateErrorPhase::Rename => ResetAdjustmentsErrorKind::Rename,
+        AtomicUpdateErrorPhase::Write => ResetAdjustmentsErrorKind::Write,
+    };
+    ResetAdjustmentsError::new(
+        kind,
+        path,
+        format!(
+            "Failed to publish sidecar '{}': {}",
+            path.display(),
+            error.source
+        ),
+    )
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+enum ResetOriginalSidecar {
+    Absent,
+    Bytes(Vec<u8>),
+}
+
+#[derive(Clone, Debug)]
+struct ResetSidecarSnapshot {
+    original: ResetOriginalSidecar,
+    metadata: ImageMetadata,
+}
+
+#[derive(Clone, Debug)]
+struct ResetPhysicalTarget {
+    source_path: PathBuf,
+    sidecar_path: PathBuf,
+}
+
+#[derive(Clone, Debug)]
+struct PreparedResetSidecar {
+    source_path: PathBuf,
+    sidecar_path: PathBuf,
+    original: ResetOriginalSidecar,
+    metadata: ImageMetadata,
+    serialized_metadata: Vec<u8>,
+}
+
+#[derive(Clone, Debug)]
+struct ResetMetadataCommit {
+    requested_paths: Vec<String>,
+}
+
+fn read_reset_metadata_with<R>(
+    sidecar_path: &Path,
+    reader: R,
+) -> std::result::Result<ResetSidecarSnapshot, ResetAdjustmentsError>
+where
+    R: FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+{
+    match reader(sidecar_path) {
+        Ok(bytes) => {
+            let metadata = serde_json::from_slice(&bytes).map_err(|error| {
+                ResetAdjustmentsError::new(
+                    ResetAdjustmentsErrorKind::Parse,
+                    sidecar_path,
+                    format!(
+                        "Failed to parse sidecar '{}': {error}",
+                        sidecar_path.display()
+                    ),
+                )
+            })?;
+            Ok(ResetSidecarSnapshot {
+                original: ResetOriginalSidecar::Bytes(bytes),
+                metadata,
+            })
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::NotFound => Ok(ResetSidecarSnapshot {
+            original: ResetOriginalSidecar::Absent,
+            metadata: ImageMetadata::default(),
+        }),
+        Err(error) => Err(ResetAdjustmentsError::new(
+            ResetAdjustmentsErrorKind::Read,
+            sidecar_path,
+            format!(
+                "Failed to read sidecar '{}': {error}",
+                sidecar_path.display()
+            ),
+        )),
+    }
+}
+
+fn metadata_with_reset_adjustments(mut metadata: ImageMetadata) -> ImageMetadata {
+    metadata.adjustments = Value::Null;
+    metadata
+}
+
+fn serialize_reset_metadata(
+    sidecar_path: &Path,
+    metadata: ImageMetadata,
+) -> std::result::Result<(ImageMetadata, Vec<u8>), ResetAdjustmentsError> {
+    let metadata = metadata_with_reset_adjustments(metadata);
+    let serialized = serde_json::to_vec_pretty(&metadata).map_err(|error| {
+        ResetAdjustmentsError::new(
+            ResetAdjustmentsErrorKind::Serialize,
+            sidecar_path,
+            format!(
+                "Failed to serialize sidecar '{}': {error}",
+                sidecar_path.display()
+            ),
+        )
+    })?;
+    Ok((metadata, serialized))
+}
+
+fn write_reset_metadata_with<W>(
+    sidecar_path: &Path,
+    metadata: ImageMetadata,
+    writer: W,
+) -> std::result::Result<ImageMetadata, ResetAdjustmentsError>
+where
+    W: FnOnce(&Path, &[u8]) -> std::result::Result<(), AtomicUpdateError>,
+{
+    let (metadata, serialized) = serialize_reset_metadata(sidecar_path, metadata)?;
+    writer(sidecar_path, &serialized)
+        .map_err(|error| reset_error_for_atomic_update(sidecar_path, error))?;
+    Ok(metadata)
+}
+
+fn resolved_reset_sidecar_path(sidecar_path: &Path) -> PathBuf {
+    resolved_auto_adjustment_sidecar_path(sidecar_path)
+}
+
+fn resolve_reset_targets(
+    paths: &[String],
+) -> std::result::Result<Vec<ResetPhysicalTarget>, ResetAdjustmentsError> {
+    let mut targets = paths
+        .iter()
+        .map(|path| {
+            let (source_path, sidecar_path) = parse_virtual_path(path);
+            let sidecar_path = resolved_reset_sidecar_path(&sidecar_path);
+            let (key, sidecar_path) =
+                crate::sidecar_io::physical_path_key(&sidecar_path).map_err(|error| {
+                    ResetAdjustmentsError::new(
+                        ResetAdjustmentsErrorKind::Read,
+                        &sidecar_path,
+                        format!(
+                            "Failed to resolve physical sidecar '{}': {error}",
+                            sidecar_path.display()
+                        ),
+                    )
+                })?;
+            Ok((
+                key,
+                ResetPhysicalTarget {
+                    source_path,
+                    sidecar_path,
+                },
+            ))
+        })
+        .collect::<std::result::Result<Vec<_>, ResetAdjustmentsError>>()?;
+    targets.sort_by(|left, right| {
+        left.0
+            .cmp(&right.0)
+            .then_with(|| left.1.sidecar_path.cmp(&right.1.sidecar_path))
+            .then_with(|| left.1.source_path.cmp(&right.1.source_path))
+    });
+    targets.dedup_by(|left, right| left.0 == right.0);
+    Ok(targets.into_iter().map(|(_, target)| target).collect())
+}
+
+fn reset_original_expectation(original: &ResetOriginalSidecar) -> TargetExpectation<'_> {
+    match original {
+        ResetOriginalSidecar::Absent => TargetExpectation::Absent,
+        ResetOriginalSidecar::Bytes(bytes) => TargetExpectation::Bytes(bytes),
+    }
+}
+
+fn reset_original_replacement(original: &ResetOriginalSidecar) -> TargetReplacement<'_> {
+    match original {
+        ResetOriginalSidecar::Absent => TargetReplacement::Absent,
+        ResetOriginalSidecar::Bytes(bytes) => TargetReplacement::Bytes(bytes),
+    }
+}
+
+fn reset_snapshot_matches_original(
+    snapshot: &TargetSnapshot,
+    original: &ResetOriginalSidecar,
+) -> bool {
+    match (snapshot, original) {
+        (TargetSnapshot::Absent, ResetOriginalSidecar::Absent) => true,
+        (TargetSnapshot::Bytes(current), ResetOriginalSidecar::Bytes(original)) => {
+            current == original
+        }
+        _ => false,
+    }
+}
+
+fn rollback_reset_sidecar_with<U>(
+    attempted: &PreparedResetSidecar,
+    transition: &mut U,
+) -> std::result::Result<(), String>
+where
+    U: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+{
+    match transition(
+        &attempted.sidecar_path,
+        TargetExpectation::Bytes(&attempted.serialized_metadata),
+        reset_original_replacement(&attempted.original),
+    ) {
+        Ok(ConditionalUpdateOutcome::Applied) => Ok(()),
+        Ok(ConditionalUpdateOutcome::Conflict(observed))
+            if reset_snapshot_matches_original(&observed, &attempted.original) =>
+        {
+            Ok(())
+        }
+        Ok(ConditionalUpdateOutcome::Conflict(_)) => Err(format!(
+            "sidecar '{}' no longer contains transaction-published bytes",
+            attempted.sidecar_path.display()
+        )),
+        Err(error) => Err(format!(
+            "failed to restore sidecar '{}': {error}",
+            attempted.sidecar_path.display()
+        )),
+    }
+}
+
+fn rollback_reset_sidecars_with<U>(
+    attempted: &[PreparedResetSidecar],
+    transition: &mut U,
+) -> Vec<(PathBuf, String)>
+where
+    U: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+{
+    attempted
+        .iter()
+        .rev()
+        .filter_map(|item| {
+            rollback_reset_sidecar_with(item, transition)
+                .err()
+                .map(|error| (item.sidecar_path.clone(), error))
+        })
+        .collect()
+}
+
+fn reset_write_error_with_rollback(
+    mut error: ResetAdjustmentsError,
+    rollback_errors: Vec<(PathBuf, String)>,
+) -> ResetAdjustmentsError {
+    if rollback_errors.is_empty() {
+        error.rollback_succeeded = true;
+        return error;
+    }
+
+    let (rollback_path, _) = &rollback_errors[0];
+    ResetAdjustmentsError {
+        kind: ResetAdjustmentsErrorKind::Rollback,
+        path: rollback_path.to_string_lossy().into_owned(),
+        message: format!(
+            "{}; rollback failed: {}",
+            error.message,
+            rollback_errors
+                .into_iter()
+                .map(|(_, message)| message)
+                .collect::<Vec<_>>()
+                .join(" | ")
+        ),
+        rollback_succeeded: false,
+    }
+}
+
+fn publish_reset_sidecar(
+    path: &Path,
+    expected: TargetExpectation<'_>,
+    replacement: TargetReplacement<'_>,
+) -> std::result::Result<ConditionalUpdateOutcome, ResetAdjustmentsError> {
+    crate::sidecar_io::atomic_update_if_matches_detailed(path, expected, replacement)
+        .map_err(|error| reset_error_for_atomic_update(path, error))
+}
+
+fn reset_sidecars_transaction_with<R, P, U, X>(
+    paths: Vec<String>,
+    mut reader: R,
+    mut publisher: P,
+    mut rollback_transition: U,
+    mut sync_xmp: X,
+) -> std::result::Result<ResetMetadataCommit, ResetAdjustmentsError>
+where
+    R: FnMut(&Path) -> std::io::Result<Vec<u8>>,
+    P: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::result::Result<ConditionalUpdateOutcome, ResetAdjustmentsError>,
+    U: for<'a> FnMut(
+        &Path,
+        TargetExpectation<'a>,
+        TargetReplacement<'a>,
+    ) -> std::io::Result<ConditionalUpdateOutcome>,
+    X: FnMut(&Path, &ImageMetadata),
+{
+    let mut seen_requested_paths = HashSet::new();
+    let requested_paths = paths
+        .iter()
+        .filter(|path| seen_requested_paths.insert((*path).clone()))
+        .cloned()
+        .collect::<Vec<_>>();
+    let targets = resolve_reset_targets(&paths)?;
+    let mut prepared = Vec::with_capacity(targets.len());
+
+    for target in targets {
+        let snapshot = read_reset_metadata_with(&target.sidecar_path, &mut reader)?;
+        let (metadata, serialized_metadata) =
+            serialize_reset_metadata(&target.sidecar_path, snapshot.metadata)?;
+        prepared.push(PreparedResetSidecar {
+            source_path: target.source_path,
+            sidecar_path: target.sidecar_path,
+            original: snapshot.original,
+            metadata,
+            serialized_metadata,
+        });
+    }
+
+    for index in 0..prepared.len() {
+        let item = &prepared[index];
+        match publisher(
+            &item.sidecar_path,
+            reset_original_expectation(&item.original),
+            TargetReplacement::Bytes(&item.serialized_metadata),
+        ) {
+            Ok(ConditionalUpdateOutcome::Applied) => {}
+            Ok(ConditionalUpdateOutcome::Conflict(_)) => {
+                let rollback_errors =
+                    rollback_reset_sidecars_with(&prepared[..index], &mut rollback_transition);
+                let error = ResetAdjustmentsError::new(
+                    ResetAdjustmentsErrorKind::Conflict,
+                    &item.sidecar_path,
+                    format!(
+                        "Sidecar '{}' changed before reset publication",
+                        item.sidecar_path.display()
+                    ),
+                );
+                return Err(reset_write_error_with_rollback(error, rollback_errors));
+            }
+            Err(write_error) => {
+                let attempted = if write_error.kind == ResetAdjustmentsErrorKind::TempWrite {
+                    &prepared[..index]
+                } else {
+                    &prepared[..=index]
+                };
+                let rollback_errors =
+                    rollback_reset_sidecars_with(attempted, &mut rollback_transition);
+                return Err(reset_write_error_with_rollback(
+                    write_error,
+                    rollback_errors,
+                ));
+            }
+        }
+    }
+
+    for item in &prepared {
+        sync_xmp(&item.source_path, &item.metadata);
+    }
+
+    Ok(ResetMetadataCommit { requested_paths })
+}
+
+fn read_validated_reset_sidecar(path: &Path) -> std::io::Result<Vec<u8>> {
+    match inspect_sidecar_target(path)? {
+        crate::sidecar_io::TargetState::Absent => Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            format!("sidecar '{}' does not exist", path.display()),
+        )),
+        crate::sidecar_io::TargetState::RegularFile => fs::read(path),
+    }
+}
+
+fn write_adjustments_sidecar_with<R, W>(
     sidecar_path: &Path,
     mut adjustments: Value,
     lens_db: Option<&crate::lens_correction::LensDatabase>,
-) -> Result<ImageMetadata, String> {
+    reader: R,
+    writer: W,
+) -> Result<ImageMetadata, String>
+where
+    R: FnOnce(&Path) -> std::io::Result<Vec<u8>>,
+    W: FnOnce(&Path, &[u8]) -> std::io::Result<()>,
+{
     crate::sidecar_io::with_locked_paths(&[sidecar_path.to_path_buf()], |paths| {
-        let mut metadata = crate::exif_processing::read_sidecar_unlocked(&paths[0])?;
+        let snapshot = read_reset_metadata_with(&paths[0], reader).map_err(|error| {
+            std::io::Error::new(
+                std::io::ErrorKind::InvalidData,
+                serde_json::to_string(&error).unwrap_or(error.message),
+            )
+        })?;
+        let mut metadata = snapshot.metadata;
         resolve_lens_params_in_adjustments(&mut adjustments, &metadata.exif, lens_db);
         metadata.adjustments = adjustments;
         let json = serde_json::to_vec_pretty(&metadata).map_err(std::io::Error::other)?;
-        crate::sidecar_io::atomic_replace(&paths[0], &json)?;
+        writer(&paths[0], &json)?;
         Ok(metadata)
     })
     .map_err(|error| error.to_string())
+}
+
+fn write_adjustments_sidecar(
+    sidecar_path: &Path,
+    adjustments: Value,
+    lens_db: Option<&crate::lens_correction::LensDatabase>,
+) -> Result<ImageMetadata, String> {
+    write_adjustments_sidecar_with(
+        sidecar_path,
+        adjustments,
+        lens_db,
+        read_validated_reset_sidecar,
+        crate::sidecar_io::atomic_replace,
+    )
 }
 
 #[tauri::command]
@@ -3552,47 +3993,107 @@ pub async fn apply_adjustments_to_paths(
     Ok(())
 }
 
-#[cfg(test)]
-pub(crate) fn metadata_with_reset_adjustments(mut metadata: ImageMetadata) -> ImageMetadata {
-    metadata.adjustments = Value::Null;
-    metadata
+#[derive(Clone, Debug)]
+struct ResetMetadataPhase {
+    settings: AppSettings,
+    paths: Vec<String>,
 }
 
-#[tauri::command]
-pub async fn reset_adjustments_for_paths(
+async fn run_reset_phases_with<T, W, S>(
+    paths: Vec<String>,
+    write_phase: W,
+    start_thumbnail_phase: S,
+) -> std::result::Result<(), ResetAdjustmentsError>
+where
+    T: Send + 'static,
+    W: FnOnce() -> std::result::Result<T, ResetAdjustmentsError> + Send + 'static,
+    S: FnOnce(T) + Send + 'static,
+{
+    let error_path = paths
+        .first()
+        .map(PathBuf::from)
+        .unwrap_or_else(|| PathBuf::from("reset_adjustments"));
+    let prepared = tokio::task::spawn_blocking(write_phase)
+        .await
+        .map_err(|error| {
+            let outcome = if error.is_panic() {
+                "panicked"
+            } else {
+                "was cancelled"
+            };
+            ResetAdjustmentsError::new(
+                ResetAdjustmentsErrorKind::Join,
+                &error_path,
+                format!("Reset adjustments metadata phase {outcome}"),
+            )
+        })??;
+
+    start_thumbnail_phase(prepared);
+    Ok(())
+}
+
+fn apply_reset_metadata_phase(
     paths: Vec<String>,
     app_handle: AppHandle,
-) -> Result<(), String> {
+) -> std::result::Result<ResetMetadataPhase, ResetAdjustmentsError> {
+    let settings = load_settings(app_handle).unwrap_or_default();
+    let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
+    let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+    let sidecar_paths = resolve_reset_targets(&paths)?
+        .into_iter()
+        .map(|target| target.sidecar_path)
+        .collect::<Vec<_>>();
+    let error_path = sidecar_paths
+        .first()
+        .cloned()
+        .or_else(|| paths.first().map(PathBuf::from))
+        .unwrap_or_else(|| PathBuf::from("reset_adjustments"));
+
+    let commit = crate::sidecar_io::with_locked_paths(&sidecar_paths, |_| {
+        Ok(reset_sidecars_transaction_with(
+            paths,
+            read_validated_reset_sidecar,
+            publish_reset_sidecar,
+            crate::sidecar_io::atomic_update_if_matches,
+            |source_path, metadata| {
+                if enable_xmp_sync {
+                    log::debug!(
+                        "Running best-effort XMP sync after resetting '{}'",
+                        source_path.display()
+                    );
+                    sync_metadata_to_xmp(source_path, metadata, create_xmp_if_missing);
+                }
+            },
+        ))
+    })
+    .map_err(|error| {
+        ResetAdjustmentsError::new(
+            ResetAdjustmentsErrorKind::Read,
+            &error_path,
+            format!("Failed to lock reset sidecars: {error}"),
+        )
+    })??;
+
+    Ok(ResetMetadataPhase {
+        settings,
+        paths: commit.requested_paths,
+    })
+}
+
+fn start_reset_thumbnail_phase(phase: ResetMetadataPhase, app_handle: AppHandle) {
     let state = app_handle.state::<AppState>();
-    add_to_thumbnail_queue(&state, paths.len(), &app_handle);
+    add_to_thumbnail_queue(&state, phase.paths.len(), &app_handle);
 
     tauri::async_runtime::spawn_blocking(move || {
-        let settings = load_settings(app_handle.clone()).unwrap_or_default();
-        let enable_xmp_sync = settings.enable_xmp_sync.unwrap_or(false);
-        let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
-
-        paths.par_iter().for_each(|path| {
-            let (_, sidecar_path) = parse_virtual_path(path);
-            let updated = crate::exif_processing::update_sidecar(&sidecar_path, |metadata| {
-                metadata.adjustments = Value::Null;
-                Ok(())
-            });
-
-            if enable_xmp_sync && let Ok(metadata) = updated {
-                let source_path = parse_virtual_path(path).0;
-                sync_metadata_to_xmp(&source_path, &metadata, create_xmp_if_missing);
-            }
-        });
-
         let state = app_handle.state::<AppState>();
         let thumb_cache_dir = match resolve_thumbnail_cache_dir(&app_handle) {
             Ok(dir) => dir,
             Err(e) => {
                 log::warn!("Unable to initialize thumbnail cache directory: {}", e);
-                for path in &paths {
+                for path in &phase.paths {
                     emit_thumbnail_cache_setup_error(&app_handle, path, &e);
                 }
-                for _ in 0..paths.len() {
+                for _ in 0..phase.paths.len() {
                     increment_thumbnail_progress(&state, &app_handle);
                 }
                 return;
@@ -3601,7 +4102,7 @@ pub async fn reset_adjustments_for_paths(
 
         let gpu_context = gpu_processing::get_or_init_gpu_context(&state, &app_handle).ok();
 
-        paths.par_iter().for_each(|path_str| {
+        phase.paths.par_iter().for_each(|path_str| {
             let result = generate_single_thumbnail_and_cache(
                 path_str,
                 &thumb_cache_dir,
@@ -3609,7 +4110,7 @@ pub async fn reset_adjustments_for_paths(
                 None,
                 true,
                 &app_handle,
-                &settings,
+                &phase.settings,
             );
 
             if let Some((thumbnail_path, rating, is_edited)) = result {
@@ -3619,8 +4120,22 @@ pub async fn reset_adjustments_for_paths(
             increment_thumbnail_progress(&state, &app_handle);
         });
     });
+}
 
-    Ok(())
+#[tauri::command]
+pub async fn reset_adjustments_for_paths(
+    paths: Vec<String>,
+    app_handle: AppHandle,
+) -> std::result::Result<(), ResetAdjustmentsError> {
+    let paths_for_write = paths.clone();
+    let app_handle_for_write = app_handle.clone();
+    let app_handle_for_thumbnails = app_handle.clone();
+    run_reset_phases_with(
+        paths,
+        move || apply_reset_metadata_phase(paths_for_write, app_handle_for_write),
+        move |phase| start_reset_thumbnail_phase(phase, app_handle_for_thumbnails),
+    )
+    .await
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -9398,5 +9913,647 @@ mod tests {
         );
         let crop: Crop = serde_json::from_value(effective["crop"].clone()).unwrap();
         assert_eq!(crop.width, 4.0);
+    }
+
+    #[test]
+    fn reset_read_defaults_only_for_an_absent_sidecar() {
+        let sidecar = Path::new("/photos/absent.RAF.rrdata");
+        let snapshot = read_reset_metadata_with(sidecar, |_| {
+            Err(std::io::Error::from(std::io::ErrorKind::NotFound))
+        })
+        .unwrap();
+
+        assert_eq!(snapshot.original, ResetOriginalSidecar::Absent);
+        assert_eq!(
+            serde_json::to_value(snapshot.metadata).unwrap(),
+            serde_json::to_value(ImageMetadata::default()).unwrap()
+        );
+    }
+
+    #[test]
+    fn reset_read_rejects_an_existing_unreadable_sidecar() {
+        let sidecar = Path::new("/photos/unreadable.RAF.rrdata");
+        let error = read_reset_metadata_with(sidecar, |_| {
+            Err(std::io::Error::new(
+                std::io::ErrorKind::PermissionDenied,
+                "synthetic permission denial",
+            ))
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind, ResetAdjustmentsErrorKind::Read);
+        assert_eq!(error.path, sidecar.to_string_lossy());
+        assert!(error.message.contains("synthetic permission denial"));
+        assert!(!error.rollback_succeeded);
+    }
+
+    #[test]
+    fn reset_read_rejects_an_existing_malformed_sidecar() {
+        let sidecar = Path::new("/photos/malformed.RAF.rrdata");
+        let error = read_reset_metadata_with(sidecar, |_| Ok(b"not-json".to_vec())).unwrap_err();
+
+        assert_eq!(error.kind, ResetAdjustmentsErrorKind::Parse);
+        assert_eq!(error.path, sidecar.to_string_lossy());
+        assert!(error.message.contains("expected ident"));
+        assert!(!error.rollback_succeeded);
+    }
+
+    #[test]
+    fn reset_write_serializes_null_and_preserves_non_adjustment_metadata() {
+        let sidecar = Path::new("/photos/preserved.RAF.rrdata");
+        let metadata = ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: json!({ "exposure": 1.25 }),
+            tags: Some(vec!["keep".into()]),
+            exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+        };
+        let written = Arc::new(Mutex::new(Vec::new()));
+        let written_for_writer = Arc::clone(&written);
+
+        let reset = write_reset_metadata_with(sidecar, metadata, move |path, bytes| {
+            assert_eq!(path, sidecar);
+            *written_for_writer.lock().unwrap() = bytes.to_vec();
+            Ok(())
+        })
+        .unwrap();
+
+        let serialized = String::from_utf8(written.lock().unwrap().clone()).unwrap();
+        assert!(serialized.contains("\"adjustments\": null"));
+        assert!(reset.adjustments.is_null());
+        assert_eq!(reset.version, 7);
+        assert_eq!(reset.rating, 4);
+        assert_eq!(reset.tags, Some(vec!["keep".into()]));
+        assert_eq!(reset.exif.unwrap()["Model"], "GFX100RF");
+    }
+
+    #[test]
+    fn reset_write_propagates_the_injected_writer_error() {
+        let sidecar = Path::new("/photos/full-disk.RAF.rrdata");
+        let error = write_reset_metadata_with(sidecar, ImageMetadata::default(), |_, _| {
+            Err(AtomicUpdateError {
+                phase: AtomicUpdateErrorPhase::Write,
+                source: std::io::Error::other("synthetic disk full"),
+            })
+        })
+        .unwrap_err();
+
+        assert_eq!(error.kind, ResetAdjustmentsErrorKind::Write);
+        assert_eq!(error.path, sidecar.to_string_lossy());
+        assert!(error.message.contains("synthetic disk full"));
+        assert!(!error.rollback_succeeded);
+    }
+
+    #[test]
+    fn reset_write_preserves_injected_atomic_publication_phases() {
+        let sidecar = Path::new("/photos/phased-writer.RAF.rrdata");
+        for (phase, expected_kind) in [
+            (
+                AtomicUpdateErrorPhase::TempWrite,
+                ResetAdjustmentsErrorKind::TempWrite,
+            ),
+            (
+                AtomicUpdateErrorPhase::Rename,
+                ResetAdjustmentsErrorKind::Rename,
+            ),
+        ] {
+            let error = write_reset_metadata_with(sidecar, ImageMetadata::default(), |_, _| {
+                Err(AtomicUpdateError {
+                    phase,
+                    source: std::io::Error::other("synthetic phased failure"),
+                })
+            })
+            .unwrap_err();
+
+            assert_eq!(error.kind, expected_kind);
+            assert_eq!(error.path, sidecar.to_string_lossy());
+        }
+    }
+
+    #[test]
+    fn reset_atomic_update_errors_keep_their_publication_phase() {
+        let sidecar = Path::new("/photos/phased.RAF.rrdata");
+        for (phase, expected_kind) in [
+            (
+                crate::sidecar_io::AtomicUpdateErrorPhase::TempWrite,
+                ResetAdjustmentsErrorKind::TempWrite,
+            ),
+            (
+                crate::sidecar_io::AtomicUpdateErrorPhase::Rename,
+                ResetAdjustmentsErrorKind::Rename,
+            ),
+            (
+                crate::sidecar_io::AtomicUpdateErrorPhase::Write,
+                ResetAdjustmentsErrorKind::Write,
+            ),
+        ] {
+            let error = reset_error_for_atomic_update(
+                sidecar,
+                crate::sidecar_io::AtomicUpdateError {
+                    phase,
+                    source: std::io::Error::other("synthetic publication failure"),
+                },
+            );
+
+            assert_eq!(error.kind, expected_kind);
+            assert_eq!(error.path, sidecar.to_string_lossy());
+            assert!(error.message.contains("synthetic publication failure"));
+            assert!(!error.rollback_succeeded);
+        }
+    }
+
+    #[cfg(any(target_os = "macos", target_os = "windows", target_os = "linux"))]
+    #[test]
+    fn reset_targets_follow_parent_case_sensitivity_with_stable_representatives() {
+        let temp = tempfile::tempdir().unwrap();
+        let lower = temp.path().join("case.raf").to_string_lossy().into_owned();
+        let upper = temp.path().join("CASE.RAF").to_string_lossy().into_owned();
+        let lower_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&lower).1);
+        let upper_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&upper).1);
+        let aliases_share_key = match (
+            crate::sidecar_io::physical_path_key(&lower_sidecar),
+            crate::sidecar_io::physical_path_key(&upper_sidecar),
+        ) {
+            (Ok((lower_key, _)), Ok((upper_key, _))) => lower_key == upper_key,
+            (Err(_), Err(_)) => {
+                assert!(resolve_reset_targets(&[upper.clone(), lower.clone()]).is_err());
+                assert!(resolve_reset_targets(&[lower, upper]).is_err());
+                return;
+            }
+            (lower_result, upper_result) => panic!(
+                "case aliases produced inconsistent key results: lower={lower_result:?}, upper={upper_result:?}"
+            ),
+        };
+
+        let forward = resolve_reset_targets(&[upper.clone(), lower.clone()]).unwrap();
+        let reverse = resolve_reset_targets(&[lower, upper]).unwrap();
+
+        assert_eq!(forward.len(), if aliases_share_key { 1 } else { 2 });
+        assert_eq!(
+            forward
+                .iter()
+                .map(|target| &target.sidecar_path)
+                .collect::<Vec<_>>(),
+            reverse
+                .iter()
+                .map(|target| &target.sidecar_path)
+                .collect::<Vec<_>>()
+        );
+    }
+
+    fn reset_test_metadata(slot: &str) -> Vec<u8> {
+        serde_json::to_vec_pretty(&ImageMetadata {
+            version: 7,
+            rating: 4,
+            adjustments: json!({ "slot": slot }),
+            tags: Some(vec![format!("tag-{slot}")]),
+            exif: Some(HashMap::from([("Model".into(), "GFX100RF".into())])),
+        })
+        .unwrap()
+    }
+
+    fn reset_test_publish_transition(
+        state: &Arc<Mutex<HashMap<PathBuf, Vec<u8>>>>,
+        path: &Path,
+        expected: TargetExpectation<'_>,
+        replacement: TargetReplacement<'_>,
+    ) -> std::result::Result<ConditionalUpdateOutcome, ResetAdjustmentsError> {
+        auto_adjust_test_transition(state, path, expected, replacement).map_err(|error| {
+            ResetAdjustmentsError::new(
+                ResetAdjustmentsErrorKind::Write,
+                path,
+                format!("synthetic reset publication failed: {error}"),
+            )
+        })
+    }
+
+    #[test]
+    fn reset_transaction_prereads_deduplicates_sorts_and_rolls_back_exact_bytes() {
+        let temp = tempfile::tempdir().unwrap();
+        let nested = temp.path().join("nested");
+        fs::create_dir_all(&nested).unwrap();
+        let first_path = nested.join("a.RAF").to_string_lossy().into_owned();
+        let equivalent_first_path = nested
+            .join(".")
+            .join("a.RAF")
+            .to_string_lossy()
+            .into_owned();
+        let second_path = nested.join("b.RAF").to_string_lossy().into_owned();
+        let first_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&first_path).1);
+        let second_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&second_path).1);
+        let first_original = reset_test_metadata("first-original");
+        let second_original = reset_test_metadata("second-original");
+        let state = Arc::new(Mutex::new(HashMap::from([
+            (first_sidecar.clone(), first_original.clone()),
+            (second_sidecar.clone(), second_original.clone()),
+        ])));
+        let events = Arc::new(Mutex::new(Vec::<(String, PathBuf)>::new()));
+
+        let state_for_read = Arc::clone(&state);
+        let events_for_read = Arc::clone(&events);
+        let state_for_publish = Arc::clone(&state);
+        let events_for_publish = Arc::clone(&events);
+        let second_for_publish = second_sidecar.clone();
+        let state_for_rollback = Arc::clone(&state);
+        let events_for_rollback = Arc::clone(&events);
+        let events_for_xmp = Arc::clone(&events);
+        let error = reset_sidecars_transaction_with(
+            vec![second_path, equivalent_first_path, first_path],
+            move |path| {
+                events_for_read
+                    .lock()
+                    .unwrap()
+                    .push(("read".into(), path.to_path_buf()));
+                state_for_read
+                    .lock()
+                    .unwrap()
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            move |path, expected, replacement| {
+                events_for_publish
+                    .lock()
+                    .unwrap()
+                    .push(("write".into(), path.to_path_buf()));
+                if path == second_for_publish {
+                    return Err(ResetAdjustmentsError::new(
+                        ResetAdjustmentsErrorKind::Write,
+                        path,
+                        "synthetic second write failure",
+                    ));
+                }
+                reset_test_publish_transition(&state_for_publish, path, expected, replacement)
+            },
+            move |path, expected, replacement| {
+                events_for_rollback
+                    .lock()
+                    .unwrap()
+                    .push(("rollback".into(), path.to_path_buf()));
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+            move |source, _| {
+                events_for_xmp
+                    .lock()
+                    .unwrap()
+                    .push(("xmp".into(), source.to_path_buf()));
+            },
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, ResetAdjustmentsErrorKind::Write);
+        assert_eq!(error.path, second_sidecar.to_string_lossy());
+        assert!(error.rollback_succeeded);
+        assert_eq!(
+            state.lock().unwrap().get(&first_sidecar),
+            Some(&first_original)
+        );
+        assert_eq!(
+            state.lock().unwrap().get(&second_sidecar),
+            Some(&second_original)
+        );
+        assert_eq!(
+            *events.lock().unwrap(),
+            vec![
+                ("read".into(), first_sidecar.clone()),
+                ("read".into(), second_sidecar.clone()),
+                ("write".into(), first_sidecar.clone()),
+                ("write".into(), second_sidecar.clone()),
+                ("rollback".into(), second_sidecar),
+                ("rollback".into(), first_sidecar),
+            ]
+        );
+    }
+
+    #[test]
+    fn reset_transaction_temp_write_rolls_back_only_previously_published_targets() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("a.RAF").to_string_lossy().into_owned();
+        let second_path = temp.path().join("b.RAF").to_string_lossy().into_owned();
+        let first_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&first_path).1);
+        let second_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&second_path).1);
+        let first_original = reset_test_metadata("first-original");
+        let second_original = reset_test_metadata("second-original");
+        let state = Arc::new(Mutex::new(HashMap::from([
+            (first_sidecar.clone(), first_original.clone()),
+            (second_sidecar.clone(), second_original.clone()),
+        ])));
+        let rollback_paths = Arc::new(Mutex::new(Vec::new()));
+
+        let state_for_read = Arc::clone(&state);
+        let state_for_publish = Arc::clone(&state);
+        let second_for_publish = second_sidecar.clone();
+        let state_for_rollback = Arc::clone(&state);
+        let second_for_rollback = second_sidecar.clone();
+        let rollback_paths_for_transition = Arc::clone(&rollback_paths);
+        let error = reset_sidecars_transaction_with(
+            vec![second_path, first_path],
+            move |path| Ok(state_for_read.lock().unwrap()[path].clone()),
+            move |path, expected, replacement| {
+                if path == second_for_publish {
+                    return Err(ResetAdjustmentsError::new(
+                        ResetAdjustmentsErrorKind::TempWrite,
+                        path,
+                        "synthetic temp-write failure before publication",
+                    ));
+                }
+                reset_test_publish_transition(&state_for_publish, path, expected, replacement)
+            },
+            move |path, expected, replacement| {
+                rollback_paths_for_transition
+                    .lock()
+                    .unwrap()
+                    .push(path.to_path_buf());
+                if path == second_for_rollback {
+                    return Err(std::io::Error::other(
+                        "untouched current target must not be rolled back",
+                    ));
+                }
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+            |_, _| panic!("XMP must not start when a sidecar write fails"),
+        )
+        .unwrap_err();
+
+        assert_eq!(error.kind, ResetAdjustmentsErrorKind::TempWrite);
+        assert_eq!(error.path, second_sidecar.to_string_lossy());
+        assert!(error.rollback_succeeded);
+        assert_eq!(
+            state.lock().unwrap().get(&first_sidecar),
+            Some(&first_original)
+        );
+        assert_eq!(
+            state.lock().unwrap().get(&second_sidecar),
+            Some(&second_original)
+        );
+        assert_eq!(*rollback_paths.lock().unwrap(), vec![first_sidecar]);
+    }
+
+    #[test]
+    fn reset_transaction_rollback_restores_an_absent_sidecar_by_deleting_it() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("a.RAF").to_string_lossy().into_owned();
+        let second_path = temp.path().join("b.RAF").to_string_lossy().into_owned();
+        let first_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&first_path).1);
+        let second_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&second_path).1);
+        let second_original = reset_test_metadata("second-original");
+        let state = Arc::new(Mutex::new(HashMap::from([(
+            second_sidecar.clone(),
+            second_original.clone(),
+        )])));
+
+        let state_for_read = Arc::clone(&state);
+        let state_for_publish = Arc::clone(&state);
+        let second_for_publish = second_sidecar.clone();
+        let state_for_rollback = Arc::clone(&state);
+        let error = reset_sidecars_transaction_with(
+            vec![second_path, first_path],
+            move |path| {
+                state_for_read
+                    .lock()
+                    .unwrap()
+                    .get(path)
+                    .cloned()
+                    .ok_or_else(|| std::io::Error::from(std::io::ErrorKind::NotFound))
+            },
+            move |path, expected, replacement| {
+                if path == second_for_publish {
+                    return Err(ResetAdjustmentsError::new(
+                        ResetAdjustmentsErrorKind::Write,
+                        path,
+                        "synthetic second write failure",
+                    ));
+                }
+                reset_test_publish_transition(&state_for_publish, path, expected, replacement)
+            },
+            move |path, expected, replacement| {
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+            |_, _| panic!("XMP must not start when a sidecar write fails"),
+        )
+        .unwrap_err();
+
+        assert!(error.rollback_succeeded);
+        assert!(!state.lock().unwrap().contains_key(&first_sidecar));
+        assert_eq!(
+            state.lock().unwrap().get(&second_sidecar),
+            Some(&second_original)
+        );
+    }
+
+    #[test]
+    fn reset_transaction_runs_best_effort_xmp_only_after_every_sidecar_commit() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("a.RAF").to_string_lossy().into_owned();
+        let second_path = temp.path().join("b.RAF").to_string_lossy().into_owned();
+        let first_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&first_path).1);
+        let second_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&second_path).1);
+        let state = Arc::new(Mutex::new(HashMap::from([
+            (first_sidecar.clone(), reset_test_metadata("first")),
+            (second_sidecar.clone(), reset_test_metadata("second")),
+        ])));
+        let events = Arc::new(Mutex::new(Vec::<String>::new()));
+
+        let state_for_read = Arc::clone(&state);
+        let state_for_publish = Arc::clone(&state);
+        let events_for_publish = Arc::clone(&events);
+        let state_for_rollback = Arc::clone(&state);
+        let events_for_xmp = Arc::clone(&events);
+        let commit = reset_sidecars_transaction_with(
+            vec![second_path, first_path],
+            move |path| Ok(state_for_read.lock().unwrap()[path].clone()),
+            move |path, expected, replacement| {
+                events_for_publish
+                    .lock()
+                    .unwrap()
+                    .push(format!("write:{}", path.display()));
+                reset_test_publish_transition(&state_for_publish, path, expected, replacement)
+            },
+            move |path, expected, replacement| {
+                auto_adjust_test_transition(&state_for_rollback, path, expected, replacement)
+            },
+            move |source, _| {
+                events_for_xmp
+                    .lock()
+                    .unwrap()
+                    .push(format!("xmp:{}", source.display()));
+            },
+        )
+        .unwrap();
+
+        assert_eq!(commit.requested_paths.len(), 2);
+        let events = events.lock().unwrap();
+        assert_eq!(events.len(), 4);
+        assert_eq!(events[0], format!("write:{}", first_sidecar.display()));
+        assert_eq!(events[1], format!("write:{}", second_sidecar.display()));
+        assert!(events[2].starts_with("xmp:"));
+        assert!(events[3].starts_with("xmp:"));
+    }
+
+    #[test]
+    fn reset_error_serializes_for_the_frontend_with_rollback_status() {
+        let error = ResetAdjustmentsError {
+            kind: ResetAdjustmentsErrorKind::Rollback,
+            path: "/photos/broken.RAF.rrdata".into(),
+            message: "rollback failed".into(),
+            rollback_succeeded: false,
+        };
+
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            json!({
+                "kind": "rollback",
+                "path": "/photos/broken.RAF.rrdata",
+                "message": "rollback failed",
+                "rollback_succeeded": false,
+            })
+        );
+    }
+
+    #[test]
+    fn reset_ordinary_save_refuses_to_replace_a_malformed_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("malformed.RAF.rrdata");
+        let malformed = b"not valid metadata";
+        fs::write(&sidecar, malformed).unwrap();
+
+        let result = write_adjustments_sidecar(&sidecar, json!({ "exposure": 2.0 }), None);
+
+        assert!(result.is_err());
+        assert_eq!(fs::read(&sidecar).unwrap(), malformed);
+    }
+
+    #[test]
+    fn reset_ordinary_save_refuses_to_replace_an_unreadable_sidecar() {
+        let temp = tempfile::tempdir().unwrap();
+        let sidecar = temp.path().join("unreadable.RAF.rrdata");
+        let original = reset_test_metadata("unreadable-original");
+        fs::write(&sidecar, &original).unwrap();
+        let published = Arc::new(AtomicBool::new(false));
+        let published_for_writer = Arc::clone(&published);
+
+        let error = write_adjustments_sidecar_with(
+            &sidecar,
+            json!({ "exposure": 2.0 }),
+            None,
+            |_| {
+                Err(std::io::Error::new(
+                    std::io::ErrorKind::PermissionDenied,
+                    "synthetic permission denial",
+                ))
+            },
+            move |_, _| {
+                published_for_writer.store(true, Ordering::SeqCst);
+                Ok(())
+            },
+        )
+        .unwrap_err();
+
+        assert!(error.contains("synthetic permission denial"));
+        assert!(!published.load(Ordering::SeqCst));
+        assert_eq!(fs::read(&sidecar).unwrap(), original);
+    }
+
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn reset_command_waits_for_metadata_before_starting_thumbnails() {
+        let thumbnail_started = Arc::new(AtomicBool::new(false));
+        let thumbnail_started_for_phase = Arc::clone(&thumbnail_started);
+        let (write_started_sender, write_started_receiver) = tokio::sync::oneshot::channel();
+        let (release_write_sender, release_write_receiver) = std::sync::mpsc::channel();
+
+        let command = tokio::spawn(run_reset_phases_with(
+            vec!["gated.RAF".to_string()],
+            move || {
+                write_started_sender.send(()).unwrap();
+                release_write_receiver.recv().unwrap();
+                Ok::<_, ResetAdjustmentsError>("prepared thumbnail")
+            },
+            move |prepared| {
+                assert_eq!(prepared, "prepared thumbnail");
+                thumbnail_started_for_phase.store(true, Ordering::SeqCst);
+            },
+        ));
+
+        write_started_receiver.await.unwrap();
+        assert!(!command.is_finished());
+        assert!(!thumbnail_started.load(Ordering::SeqCst));
+
+        release_write_sender.send(()).unwrap();
+        assert_eq!(command.await.unwrap(), Ok(()));
+        assert!(thumbnail_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reset_command_propagates_metadata_error_without_starting_thumbnails() {
+        let thumbnail_started = Arc::new(AtomicBool::new(false));
+        let thumbnail_started_for_phase = Arc::clone(&thumbnail_started);
+        let expected = ResetAdjustmentsError::new(
+            ResetAdjustmentsErrorKind::Read,
+            Path::new("broken.RAF.rrdata"),
+            "synthetic read failure",
+        );
+        let expected_for_phase = expected.clone();
+
+        let result = run_reset_phases_with(
+            vec!["broken.RAF".to_string()],
+            move || Err::<(), _>(expected_for_phase),
+            move |_| thumbnail_started_for_phase.store(true, Ordering::SeqCst),
+        )
+        .await;
+
+        assert_eq!(result, Err(expected));
+        assert!(!thumbnail_started.load(Ordering::SeqCst));
+    }
+
+    #[tokio::test]
+    async fn reset_rollback_failure_reports_its_path_and_suppresses_followup_phases() {
+        let temp = tempfile::tempdir().unwrap();
+        let first_path = temp.path().join("a.RAF").to_string_lossy().into_owned();
+        let second_path = temp.path().join("b.RAF").to_string_lossy().into_owned();
+        let first_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&first_path).1);
+        let second_sidecar = resolved_reset_sidecar_path(&parse_virtual_path(&second_path).1);
+        let originals = Arc::new(Mutex::new(HashMap::from([
+            (first_sidecar, reset_test_metadata("first")),
+            (second_sidecar.clone(), reset_test_metadata("second")),
+        ])));
+        let xmp_started = Arc::new(AtomicBool::new(false));
+        let thumbnail_started = Arc::new(AtomicBool::new(false));
+        let originals_for_read = Arc::clone(&originals);
+        let second_for_publish = second_sidecar.clone();
+        let xmp_started_for_phase = Arc::clone(&xmp_started);
+        let thumbnail_started_for_phase = Arc::clone(&thumbnail_started);
+
+        let result = run_reset_phases_with(
+            vec![first_path.clone(), second_path.clone()],
+            move || {
+                reset_sidecars_transaction_with(
+                    vec![first_path, second_path],
+                    move |path| Ok(originals_for_read.lock().unwrap()[path].clone()),
+                    move |path, _, _| {
+                        if path == second_for_publish {
+                            Err(ResetAdjustmentsError::new(
+                                ResetAdjustmentsErrorKind::Write,
+                                path,
+                                "synthetic publication failure",
+                            ))
+                        } else {
+                            Ok(ConditionalUpdateOutcome::Applied)
+                        }
+                    },
+                    |_, _, _| Err(std::io::Error::other("synthetic rollback failure")),
+                    move |_, _| xmp_started_for_phase.store(true, Ordering::SeqCst),
+                )
+            },
+            move |_| thumbnail_started_for_phase.store(true, Ordering::SeqCst),
+        )
+        .await;
+
+        let error = result.unwrap_err();
+        assert_eq!(error.kind, ResetAdjustmentsErrorKind::Rollback);
+        assert_eq!(error.path, second_sidecar.to_string_lossy());
+        assert!(!error.rollback_succeeded);
+        assert!(error.message.contains("synthetic rollback failure"));
+        assert!(!xmp_started.load(Ordering::SeqCst));
+        assert!(!thumbnail_started.load(Ordering::SeqCst));
     }
 }

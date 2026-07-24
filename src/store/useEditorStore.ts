@@ -401,16 +401,21 @@ export const useEditorStore = create<EditorState>((set, get) => ({
     const state = get();
     const activeSnapshot = state.adjustmentReloadSnapshot;
     if (!activeSnapshot || activeSnapshot.reloadId !== snapshot.reloadId) return;
-    restorePendingHistory(activeSnapshot.suspendedHistory);
+    const restoredSessionGeneration =
+      Math.max(state.adjustmentSessionGeneration, activeSnapshot.adjustmentSessionGeneration) + 1;
     set({
       adjustmentLoadContext: clone(activeSnapshot.adjustmentLoadContext),
       adjustmentLoadGeneration: Math.max(state.adjustmentLoadGeneration, activeSnapshot.adjustmentLoadGeneration) + 1,
-      adjustmentSessionGeneration: activeSnapshot.adjustmentSessionGeneration,
+      adjustmentSessionGeneration: restoredSessionGeneration,
       adjustmentReloadSnapshot: null,
       adjustments: clone(activeSnapshot.adjustments),
       history: clone(activeSnapshot.history),
       historyIndex: activeSnapshot.historyIndex,
       selectedImage: clone(activeSnapshot.selectedImage),
+    });
+    restorePendingHistory(activeSnapshot.suspendedHistory, (entry) => {
+      const active = useEditorStore.getState();
+      if (active.adjustmentSessionGeneration === restoredSessionGeneration) active.pushHistory(entry);
     });
   },
 

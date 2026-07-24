@@ -25,6 +25,7 @@ export function useImageLoader(
   const originalSize = useEditorStore((s) => s.originalSize);
   const previewSize = useEditorStore((s) => s.previewSize);
   const hasRenderedFirstFrame = useEditorStore((s) => s.hasRenderedFirstFrame);
+  const adjustmentSessionGeneration = useEditorStore((s) => s.adjustmentSessionGeneration);
 
   const beginAdjustmentLoad = useEditorStore((s) => s.beginAdjustmentLoad);
   const completeAdjustmentLoad = useEditorStore((s) => s.completeAdjustmentLoad);
@@ -37,7 +38,7 @@ export function useImageLoader(
   useEffect(() => {
     if (selectedImage && !selectedImage.isReady && selectedImage.path) {
       let isEffectActive = true;
-      const requestGeneration = useEditorStore.getState().adjustmentSessionGeneration;
+      const requestGeneration = adjustmentSessionGeneration;
       const isCurrentLoad = () =>
         isCurrentEditorSession(
           selectedImage.path,
@@ -148,6 +149,7 @@ export function useImageLoader(
   }, [
     selectedImage?.path,
     selectedImage?.isReady,
+    adjustmentSessionGeneration,
     appSettings?.editorPreviewResolution,
     beginAdjustmentLoad,
     completeAdjustmentLoad,

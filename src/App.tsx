@@ -83,6 +83,7 @@ import {
 
 import ImageProcessingManager from './components/managers/ImageProcessingManager';
 import ImageLoaderManager from './components/managers/ImageLoaderManager';
+import type { ImageCacheEntry } from './utils/ImageLRUCache';
 import { isImmichAlbumId } from './components/immich/immichApi';
 import { useImmichEvents } from './components/immich/useImmichEvents';
 
@@ -249,7 +250,7 @@ function App() {
   const previewJobIdRef = useRef<number>(0);
   const latestRenderedJobIdRef = useRef<number>(0);
   const currentResRef = useRef<number>(1280);
-  const cachedEditStateRef = useRef<any | null>(null);
+  const cachedEditStateRef = useRef<ImageCacheEntry | null>(null);
 
   const [libraryViewMode, setLibraryViewMode] = useState<LibraryViewMode>(defaultLibraryViewMode);
   const [isResizing, setIsResizing] = useState(false);

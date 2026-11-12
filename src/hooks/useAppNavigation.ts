@@ -9,7 +9,7 @@ import { useUIStore } from '../store/useUIStore';
 import { useProcessStore } from '../store/useProcessStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes, LibraryViewMode, ImageFile, SelectedImage } from '../components/ui/AppProperties';
-import { globalImageCache } from '../utils/ImageLRUCache';
+import { createCachedEditorPlaceholder, globalImageCache, type ImageCacheEntry } from '../utils/ImageLRUCache';
 import { decodeImage } from '../utils/decodeImage';
 import { cancelPendingHistory, flushPendingSave, runEditorTransition } from '../services/editorPersistence';
 import { invalidatePendingPreviewJobs } from '../utils/asyncNavigation';
@@ -22,21 +22,13 @@ export interface AppNavigationProps {
   refs: {
     transformWrapperRef: React.RefObject<any>;
     preloadedDataRef: React.RefObject<any>;
-    cachedEditStateRef: React.RefObject<any>;
+    cachedEditStateRef: React.RefObject<ImageCacheEntry | null>;
     selectedImagePathRef: React.RefObject<string | null>;
     latestRenderedJobIdRef: React.RefObject<number>;
     previewJobIdRef: React.RefObject<number>;
     currentResRef: React.RefObject<number>;
   };
 }
-
-const releaseUnprotectedPreview = (url: string | null | undefined) => {
-  if (url?.startsWith('blob:') && !globalImageCache.isProtected(url)) {
-    setTimeout(() => {
-      if (!globalImageCache.isProtected(url)) URL.revokeObjectURL(url);
-    }, 250);
-  }
-};
 
 let exifLoadGeneration = 0;
 let imageSelectGeneration = 0;
@@ -140,7 +132,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
     const { setLibrary } = useLibraryStore.getState();
     const { setUI } = useUIStore.getState();
 
-    if (selectedImage?.path && cachedEditStateRef.current) {
+    if (selectedImage?.path && cachedEditStateRef.current?.selectedImage.path === selectedImage.path) {
       globalImageCache.set(selectedImage.path, cachedEditStateRef.current);
     }
     if (transformWrapperRef.current) {
@@ -190,8 +182,9 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
       const cachedThumb = useProcessStore.getState().thumbnails[path];
       const cachedMedium = useProcessStore.getState().mediumThumbnails[path] || cachedThumb;
 
+      // A read-only peek: the entry is only taken once the switch commits.
       const peekedEntry = globalImageCache.get(path);
-      const isFrontendCached = Boolean(peekedEntry?.selectedImage?.isReady);
+      const isFrontendCached = Boolean(peekedEntry);
       const canKeepWgpuLive =
         useSettingsStore.getState().appSettings?.useWgpuRenderer !== false &&
         wasEditorVisible &&
@@ -218,17 +211,20 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             const {
               selectedImage: outgoing,
               finalPreviewUrl: previousFinalPreviewUrl,
+              uncroppedAdjustedPreviewUrl: previousUncroppedPreviewUrl,
               setEditor,
             } = useEditorStore.getState();
             const { setLibrary, multiSelectedPaths } = useLibraryStore.getState();
 
-            if (outgoing?.path && cachedEditStateRef.current?.selectedImage?.path === outgoing.path) {
-              globalImageCache.set(outgoing.path, cachedEditStateRef.current);
-            }
-
             // A cache hit is only a provisional placeholder: the metadata-first loader still runs, and the
             // image becomes ready once load_metadata and load_image agree on the effective baseline.
-            const cached = isFrontendCached ? globalImageCache.get(path) : undefined;
+            const outgoingEntry = cachedEditStateRef.current;
+            const cached = globalImageCache.takeForNavigation(
+              path,
+              outgoing?.path && outgoingEntry?.selectedImage.path === outgoing.path
+                ? { key: outgoing.path, entry: outgoingEntry }
+                : undefined,
+            );
             const imageFile = useLibraryStore.getState().imageList.find((img) => img.path === path);
             const provisionalImage: SelectedImage = cached
               ? {
@@ -256,19 +252,13 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
             invalidatePendingPreviewJobs(previewJobIdRef, latestRenderedJobIdRef);
             currentResRef.current = 0;
 
-            useEditorStore.getState().beginImageSelection(provisionalImage, cached?.adjustments);
+            useEditorStore.getState().beginImageSelection(provisionalImage, cached?.effectiveAdjustments);
             setEditor((state) => {
               if (state.interactivePatch?.url) URL.revokeObjectURL(state.interactivePatch.url);
               return {
                 ...(keepWgpuLive ? {} : { wgpuPhase: 'hidden' as const }),
                 ...(cached
-                  ? {
-                      originalSize: cached.originalSize,
-                      histogram: cached.histogram,
-                      waveform: cached.waveform,
-                      finalPreviewUrl: cached.finalPreviewUrl,
-                      uncroppedAdjustedPreviewUrl: cached.uncroppedPreviewUrl,
-                    }
+                  ? createCachedEditorPlaceholder(cached)
                   : {
                       originalSize: { width: 0, height: 0 },
                       histogram: null,
@@ -288,7 +278,10 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
               };
             });
             if (previousFinalPreviewUrl !== cached?.finalPreviewUrl) {
-              releaseUnprotectedPreview(previousFinalPreviewUrl);
+              globalImageCache.revokeWhenUnprotected(previousFinalPreviewUrl);
+            }
+            if (previousUncroppedPreviewUrl !== cached?.uncroppedPreviewUrl) {
+              globalImageCache.revokeWhenUnprotected(previousUncroppedPreviewUrl);
             }
 
             setLibrary({
@@ -343,8 +336,8 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
               const { finalPreviewUrl, uncroppedAdjustedPreviewUrl, clearEditorSession } = useEditorStore.getState();
               selectedImagePathRef.current = null;
               clearEditorSession();
-              releaseUnprotectedPreview(finalPreviewUrl);
-              releaseUnprotectedPreview(uncroppedAdjustedPreviewUrl);
+              globalImageCache.revokeWhenUnprotected(finalPreviewUrl);
+              globalImageCache.revokeWhenUnprotected(uncroppedAdjustedPreviewUrl);
               didClear = true;
             },
             () => generation === imageSelectGeneration,

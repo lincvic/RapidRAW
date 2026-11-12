@@ -3,6 +3,7 @@ import { Adjustments, CopyPasteSettings } from '../../utils/adjustments';
 import { ToolType } from '../panel/right/Masks';
 import type { WhiteBalance, WhiteBalanceMode } from '../../utils/whiteBalance';
 import type { ImmichSettings } from '../immich/immichApi';
+import type { ImageSourceKind } from '../../types/imageLoading';
 
 export const GLOBAL_KEYS = [
   ' ',
@@ -457,6 +458,7 @@ export interface SelectedImage {
   metadata?: any;
   original_base64?: string;
   path: string;
+  sourceKind: ImageSourceKind | null;
   thumbnailUrl: string;
   width: number;
 }

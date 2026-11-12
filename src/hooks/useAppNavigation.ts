@@ -308,6 +308,7 @@ export function useAppNavigation({ clearThumbnailQueue, refs }: AppNavigationPro
           isReady: false,
           metadata: null,
           path,
+          sourceKind: null,
           thumbnailUrl: cachedMedium,
           width: 0,
         },

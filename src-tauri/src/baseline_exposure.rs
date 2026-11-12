@@ -30,6 +30,8 @@ pub struct RawExposure {
     pub scene_referred: bool,
     pub dng_baseline: f32,
     pub highlight_preservation: f32,
+    /// Whether `highlight_preservation` is Fujifilm Dynamic Range compensation.
+    pub fujifilm_dynamic_range: bool,
 }
 
 impl RawExposure {
@@ -44,6 +46,20 @@ impl RawExposure {
             0.0
         };
         baseline + highlight_preservation
+    }
+
+    /// Compensation for adjustments saved without the baseline exposure flag.
+    ///
+    /// Upstream keeps such legacy edits at their original 0 EV. This fork
+    /// applied Fujifilm Dynamic Range compensation to every developed RAF
+    /// whatever its sidecar, so RAF edits saved without the flag keep that
+    /// compensation instead of opening 1-2 EV darker.
+    pub fn legacy_compensation(&self, options: BaselineOptions) -> f32 {
+        if self.fujifilm_dynamic_range && options.compensate_highlight_preservation {
+            self.highlight_preservation
+        } else {
+            0.0
+        }
     }
 }
 
@@ -74,6 +90,7 @@ pub fn read(decoder: &dyn Decoder, file_bytes: &[u8], is_monochrome: bool) -> Ra
         dng_baseline: dng_baseline(decoder),
         highlight_preservation: highlight_preservation
             .clamp(HIGHLIGHT_BIAS_MIN, HIGHLIGHT_BIAS_MAX),
+        fujifilm_dynamic_range: decoder.format_hint() == FormatHint::RAF,
     }
 }
 
@@ -239,5 +256,51 @@ fn pentax(makernote: &IFD) -> f32 {
     {
         Some(Value::Undefined(data)) if data.first() == Some(&1) => 1.0,
         _ => 0.0,
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn options(baseline_exposure: Option<f32>, compensate: bool) -> BaselineOptions {
+        BaselineOptions {
+            baseline_exposure,
+            compensate_highlight_preservation: compensate,
+        }
+    }
+
+    #[test]
+    fn legacy_compensation_keeps_only_fujifilm_dynamic_range() {
+        let raf = RawExposure {
+            scene_referred: true,
+            dng_baseline: 0.5,
+            highlight_preservation: 2.0,
+            fujifilm_dynamic_range: true,
+        };
+        assert_eq!(raf.legacy_compensation(options(Some(0.7), true)), 2.0);
+        assert_eq!(raf.legacy_compensation(options(None, false)), 0.0);
+
+        let canon = RawExposure {
+            fujifilm_dynamic_range: false,
+            ..raf
+        };
+        assert_eq!(canon.legacy_compensation(options(Some(0.7), true)), 0.0);
+        assert_eq!(
+            RawExposure::default().legacy_compensation(options(None, true)),
+            0.0
+        );
+    }
+
+    #[test]
+    fn flagged_compensation_is_unchanged() {
+        let raf = RawExposure {
+            scene_referred: true,
+            dng_baseline: 0.5,
+            highlight_preservation: 1.0,
+            fujifilm_dynamic_range: true,
+        };
+        assert_eq!(raf.compensation(options(Some(0.7), true)), 0.7 + 0.5 + 1.0);
+        assert_eq!(raf.compensation(options(None, true)), 1.0);
     }
 }

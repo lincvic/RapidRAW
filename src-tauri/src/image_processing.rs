@@ -184,7 +184,7 @@ pub fn effective_baseline_exposure(
     if uses_baseline_exposure(adjustments) {
         as_shot.exposure.compensation(options)
     } else {
-        0.0
+        as_shot.exposure.legacy_compensation(options)
     }
 }
 

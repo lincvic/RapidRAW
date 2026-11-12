@@ -24,14 +24,18 @@ const deepClone = <T>(value: T): T => {
 interface ValidCameraFraming {
   crop: CameraPixelCrop;
   aspectRatio: number;
+  canvas: { width: number; height: number } | null;
 }
+
+const positiveDimension = (value: unknown): value is number =>
+  typeof value === 'number' && Number.isFinite(value) && value > 0;
 
 const validCameraFraming = (cameraDefaults: unknown): ValidCameraFraming | null => {
   if (cameraDefaults === null || typeof cameraDefaults !== 'object') {
     return null;
   }
 
-  const { crop, aspectRatio } = cameraDefaults as Partial<CameraDefaults>;
+  const { crop, aspectRatio, canvasWidth, canvasHeight } = cameraDefaults as Partial<CameraDefaults>;
 
   if (
     crop === null ||
@@ -51,8 +55,38 @@ const validCameraFraming = (cameraDefaults: unknown): ValidCameraFraming | null 
     return null;
   }
 
-  return { crop: { x: crop.x, y: crop.y, width: crop.width, height: crop.height }, aspectRatio };
+  const canvas =
+    positiveDimension(canvasWidth) && positiveDimension(canvasHeight)
+      ? { width: canvasWidth, height: canvasHeight }
+      : null;
+  return { crop: { x: crop.x, y: crop.y, width: crop.width, height: crop.height }, aspectRatio, canvas };
 };
+
+/** Relative difference between aspect ratios still treated as the same framing. */
+const CAMERA_CANVAS_ASPECT_TOLERANCE = 0.01;
+
+/**
+ * Whether developed pixels are a uniform scaling of the camera canvas, the only images camera coordinates fit.
+ *
+ * The backend applies the same rule. Another RAW engine, such as the optional Apple RAW development, may frame the
+ * image itself; its pixels then keep their own framing instead of being cropped with RAF coordinates. Without a
+ * known canvas the framing is trusted, as before canvas dimensions were reported.
+ */
+export function matchesCameraCanvas(
+  canvas: { width: number; height: number } | null,
+  image: Partial<Pick<LoadImageResult, 'width' | 'height'>>,
+): boolean {
+  if (canvas === null) {
+    return true;
+  }
+  const { width, height } = image;
+  if (!positiveDimension(width) || !positiveDimension(height)) {
+    return false;
+  }
+  const canvasAspect = canvas.width / canvas.height;
+  const imageAspect = width / height;
+  return Math.abs(imageAspect / canvasAspect - 1) <= CAMERA_CANVAS_ASPECT_TOLERANCE;
+}
 
 /**
  * Builds the provisional editor state from a load_metadata response.
@@ -84,6 +118,7 @@ export function initializeAdjustmentLoad(metadata: LoadMetadataResult): {
       effectiveBaseline: deepClone(adjustments),
       injectedCrop: cameraFraming !== null,
       injectedAspectRatio: cameraFraming !== null,
+      cameraCanvas: cameraFraming?.canvas ?? null,
       sourceKind: null,
       reconciled: false,
       dirty: false,
@@ -94,20 +129,24 @@ export function initializeAdjustmentLoad(metadata: LoadMetadataResult): {
 /**
  * Reconciles the provisional state with the authoritative load_image source kind.
  *
- * Camera framing is only valid for developed RAW pixels. For an embedded preview or non-RAW source both injected
- * fields are restored together from the no-camera baseline, whose original-ratio lock resolves against the
- * dimensions load_image reported rather than the RAF canvas. Persisted adjustment objects are never touched.
+ * Camera framing is only valid for developed RAW pixels that are a uniform scaling of the camera canvas. Otherwise,
+ * as for an embedded preview or non-RAW source, both injected fields are restored together from the no-camera
+ * baseline, whose original-ratio lock resolves against the dimensions load_image reported rather than the RAF
+ * canvas. Persisted adjustment objects are never touched.
  */
 export function reconcileAdjustmentLoad(
   provisional: Adjustments,
   context: AdjustmentLoadContext,
-  image: Pick<LoadImageResult, 'source_kind'>,
+  image: Pick<LoadImageResult, 'source_kind'> & Partial<Pick<LoadImageResult, 'width' | 'height'>>,
 ): { adjustments: Adjustments; context: AdjustmentLoadContext } {
   const noCameraBaseline = deepClone(context.noCameraBaseline);
   const isLiteralNullLoad = context.persistedAdjustments === null;
   const adjustments = deepClone(provisional);
   const hasCompleteInjection = context.injectedCrop && context.injectedAspectRatio;
-  const keepCameraFraming = image.source_kind === IMAGE_SOURCE_KINDS.DevelopedRaw && hasCompleteInjection;
+  const keepCameraFraming =
+    image.source_kind === IMAGE_SOURCE_KINDS.DevelopedRaw &&
+    hasCompleteInjection &&
+    matchesCameraCanvas(context.cameraCanvas ?? null, image);
 
   if (isLiteralNullLoad && !keepCameraFraming) {
     adjustments.crop = deepClone(noCameraBaseline.crop);

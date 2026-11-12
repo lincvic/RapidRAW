@@ -272,7 +272,7 @@ describe('authoritative-source reconciliation', () => {
     const result = reconcileAdjustmentLoad(
       initialized.adjustments,
       initialized.context,
-      imageWith(IMAGE_SOURCE_KINDS.DevelopedRaw, 6000, 4000),
+      imageWith(IMAGE_SOURCE_KINDS.DevelopedRaw, 7000, 3000),
     );
 
     expect(result.adjustments.crop).toEqual({ unit: 'px', x: 100, y: 200, width: 6500, height: 2400 });
@@ -376,6 +376,57 @@ describe('authoritative-source reconciliation', () => {
     expect(result.context.noCameraBaseline.aspectRatio).toBe(ORIGINAL_RATIO);
     expect(result.context.effectiveBaseline).toEqual(result.adjustments);
     expect(result.adjustments).toEqual(normalizeLoadedAdjustments(null));
+  });
+
+  it.each([
+    ['full resolution', 7000, 3000],
+    ['a uniformly binned development', 3500, 1500],
+    ['rounding of an odd binned edge', 3501, 1500],
+  ])('keeps camera framing for developed pixels at %s', (_label, width, height) => {
+    const initialized = initializeAdjustmentLoad(metadataWith(null));
+    const result = reconcileAdjustmentLoad(
+      initialized.adjustments,
+      initialized.context,
+      imageWith(IMAGE_SOURCE_KINDS.DevelopedRaw, width, height),
+    );
+
+    expect(result.adjustments.crop).toEqual({ unit: 'px', x: 100, y: 200, width: 6500, height: 2400 });
+    expect(result.adjustments.aspectRatio).toBeCloseTo(65 / 24);
+  });
+
+  it.each([
+    ['framed differently by another RAW engine', 6000, 4000],
+    ['without reported dimensions', undefined, undefined],
+  ])('drops camera framing for developed pixels %s', (_label, width, height) => {
+    const initialized = initializeAdjustmentLoad(metadataWith(null));
+    const result = reconcileAdjustmentLoad(initialized.adjustments, initialized.context, {
+      source_kind: IMAGE_SOURCE_KINDS.DevelopedRaw,
+      width,
+      height,
+    });
+
+    expect(result.adjustments.crop).toEqual(result.context.noCameraBaseline.crop);
+    expect(result.adjustments.aspectRatio).toBe(result.context.noCameraBaseline.aspectRatio);
+    expect(result.context.effectiveBaseline).toEqual(result.adjustments);
+  });
+
+  it('trusts camera framing without a reported camera canvas', () => {
+    const initialized = initializeAdjustmentLoad(
+      metadataWith(null, {
+        crop: { x: 100, y: 200, width: 6500, height: 2400 },
+        aspectRatio: 65 / 24,
+        canvasWidth: null,
+        canvasHeight: null,
+      }),
+    );
+    expect(initialized.context.cameraCanvas).toBeNull();
+
+    const result = reconcileAdjustmentLoad(
+      initialized.adjustments,
+      initialized.context,
+      imageWith(IMAGE_SOURCE_KINDS.DevelopedRaw, 6000, 4000),
+    );
+    expect(result.adjustments.crop).toEqual({ unit: 'px', x: 100, y: 200, width: 6500, height: 2400 });
   });
 
   it('never translates dynamic-range camera metadata into exposure', () => {

@@ -240,6 +240,8 @@ describe('Reset Crop on camera-default RAF framing', () => {
     const initialized = initializeAdjustmentLoad(metadata);
     const opened = reconcileAdjustmentLoad(initialized.adjustments, initialized.context, {
       source_kind: IMAGE_SOURCE_KINDS.DevelopedRaw,
+      width: 11648,
+      height: 8736,
     });
     expect(localCropOverlay(opened.adjustments.crop, 11648, 8736)).not.toEqual(localCropOverlay(null, 11648, 8736));
 

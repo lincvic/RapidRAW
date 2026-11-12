@@ -54,6 +54,8 @@ export interface AdjustmentLoadContext {
   effectiveBaseline: Adjustments;
   injectedCrop: boolean;
   injectedAspectRatio: boolean;
+  /** Oriented camera canvas the injected crop is expressed in, when load_metadata reported it. */
+  cameraCanvas?: { width: number; height: number } | null;
   sourceKind: ImageSourceKind | null;
   reconciled: boolean;
   dirty: boolean;

@@ -5,6 +5,11 @@ test_dir="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 repo_root="$(cd "$test_dir/.." && pwd)"
 build_script="$repo_root/build-macos-release.sh"
 toolchain_file="$repo_root/src-tauri/rust-toolchain.toml"
+expected_toolchain="$(sed -n -E 's/^[[:space:]]*channel[[:space:]]*=[[:space:]]*"([^"]+)".*$/\1/p' "$toolchain_file")"
+if [[ -z "$expected_toolchain" ]]; then
+  printf 'could not read the pinned channel from %s\n' "$toolchain_file" >&2
+  exit 1
+fi
 test_tmp_base="${TMPDIR:-/tmp}"
 test_temp_root="$(mktemp -d "${test_tmp_base%/}/rapidraw-macos-build-tests.XXXXXX")"
 
@@ -462,7 +467,7 @@ run_fixture() {
       TEST_SYSCTL_STATUS="${TEST_SYSCTL_STATUS:-0}" \
       TEST_BREW_PREFIX_STATUS="${TEST_BREW_PREFIX_STATUS:-0}" \
       TEST_RUSTUP_PREFIX="$fixture_rustup_prefix" \
-      TEST_EXPECTED_TOOLCHAIN='1.96.1' \
+      TEST_EXPECTED_TOOLCHAIN="$expected_toolchain" \
       TEST_PROXY_VERSION_MISMATCH="${TEST_PROXY_VERSION_MISMATCH:-0}" \
       TEST_NPM_INSTALL_STATUS="${TEST_NPM_INSTALL_STATUS:-0}" \
       TEST_TAURI_BUILD_STATUS="${TEST_TAURI_BUILD_STATUS:-0}" \
@@ -558,16 +563,16 @@ test_help_accepts_valid_target() {
 test_explicit_arm64_build() {
   run_fixture --target arm64
   assert_status 0
-  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 toolchain install 1.96.1 --no-self-update --profile minimal'
-  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 target add --toolchain 1.96.1 aarch64-apple-darwin'
-  assert_log_contains 'proxy cargo RUSTUP_TOOLCHAIN=1.96.1 --version'
-  assert_log_contains 'proxy rustc RUSTUP_TOOLCHAIN=1.96.1 --version'
-  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 run 1.96.1 cargo --version'
-  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 run 1.96.1 rustc --version'
+  assert_log_contains "rustup env RUSTUP_TOOLCHAIN=${expected_toolchain} toolchain install ${expected_toolchain} --no-self-update --profile minimal"
+  assert_log_contains "rustup env RUSTUP_TOOLCHAIN=${expected_toolchain} target add --toolchain ${expected_toolchain} aarch64-apple-darwin"
+  assert_log_contains "proxy cargo RUSTUP_TOOLCHAIN=${expected_toolchain} --version"
+  assert_log_contains "proxy rustc RUSTUP_TOOLCHAIN=${expected_toolchain} --version"
+  assert_log_contains "rustup env RUSTUP_TOOLCHAIN=${expected_toolchain} run ${expected_toolchain} cargo --version"
+  assert_log_contains "rustup env RUSTUP_TOOLCHAIN=${expected_toolchain} run ${expected_toolchain} rustc --version"
   assert_log_not_contains 'standalone cargo'
   assert_log_not_contains 'standalone rustc'
   assert_log_contains 'npm install'
-  assert_log_contains 'npm env RUSTUP_TOOLCHAIN=1.96.1'
+  assert_log_contains "npm env RUSTUP_TOOLCHAIN=${expected_toolchain}"
   assert_log_contains 'npm run tauri -- build --verbose --target aarch64-apple-darwin --bundles app,dmg --no-sign'
   assert_output_contains 'Architecture: arm64'
   assert_output_contains 'Target: aarch64-apple-darwin'
@@ -585,7 +590,7 @@ test_explicit_arm64_build() {
 test_explicit_x86_64_build() {
   run_fixture --target x86_64
   assert_status 0
-  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 target add --toolchain 1.96.1 x86_64-apple-darwin'
+  assert_log_contains "rustup env RUSTUP_TOOLCHAIN=${expected_toolchain} target add --toolchain ${expected_toolchain} x86_64-apple-darwin"
   assert_log_contains 'npm run tauri -- build --verbose --target x86_64-apple-darwin --bundles app,dmg --no-sign'
   assert_output_contains 'Architecture: x86_64'
   assert_output_contains 'Target: x86_64-apple-darwin'
@@ -635,11 +640,11 @@ test_unavailable_rosetta_sysctl_defaults_to_x86_64() {
 test_inherited_toolchain_is_overridden() {
   TEST_INHERITED_TOOLCHAIN=stable run_fixture --target arm64
   assert_status 0
-  assert_log_contains 'proxy cargo RUSTUP_TOOLCHAIN=1.96.1 --version'
-  assert_log_contains 'proxy rustc RUSTUP_TOOLCHAIN=1.96.1 --version'
-  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 toolchain install 1.96.1 --no-self-update --profile minimal'
-  assert_log_contains 'rustup env RUSTUP_TOOLCHAIN=1.96.1 target add --toolchain 1.96.1 aarch64-apple-darwin'
-  assert_log_contains 'npm env RUSTUP_TOOLCHAIN=1.96.1'
+  assert_log_contains "proxy cargo RUSTUP_TOOLCHAIN=${expected_toolchain} --version"
+  assert_log_contains "proxy rustc RUSTUP_TOOLCHAIN=${expected_toolchain} --version"
+  assert_log_contains "rustup env RUSTUP_TOOLCHAIN=${expected_toolchain} toolchain install ${expected_toolchain} --no-self-update --profile minimal"
+  assert_log_contains "rustup env RUSTUP_TOOLCHAIN=${expected_toolchain} target add --toolchain ${expected_toolchain} aarch64-apple-darwin"
+  assert_log_contains "npm env RUSTUP_TOOLCHAIN=${expected_toolchain}"
   assert_log_not_contains 'RUSTUP_TOOLCHAIN=stable'
 }
 
@@ -649,7 +654,7 @@ test_proxy_version_mismatch_fails_before_npm() {
   assert_output_contains 'Error:'
   assert_output_contains 'Cargo version mismatch'
   assert_output_contains 'rustup proxy'
-  assert_log_contains 'proxy cargo RUSTUP_TOOLCHAIN=1.96.1 --version'
+  assert_log_contains "proxy cargo RUSTUP_TOOLCHAIN=${expected_toolchain} --version"
   assert_log_not_contains 'npm '
 }
 

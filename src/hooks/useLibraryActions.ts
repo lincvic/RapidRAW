@@ -2,7 +2,7 @@ import { createElement, useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
 import { toast } from 'react-toastify';
 import { useLibraryStore } from '../store/useLibraryStore';
-import { canvasToolState, useEditorStore } from '../store/useEditorStore';
+import { useEditorStore } from '../store/useEditorStore';
 import { useUIStore } from '../store/useUIStore';
 import {
   Invokes,
@@ -47,19 +47,8 @@ export const clearLibrarySelection = () => {
     selectionAnchorPath: null,
   });
 
-  useEditorStore.getState().setEditor({
-    selectedImage: null,
-    finalPreviewUrl: null,
-    uncroppedAdjustedPreviewUrl: null,
-    histogram: null,
-    waveform: null,
-    activeMaskId: null,
-    activeMaskContainerId: null,
-    activeAiPatchContainerId: null,
-    activeAiSubMaskId: null,
-    ...canvasToolState(),
-    activeRelightLightId: null,
-  });
+  // Closes the editor session as a whole, so no adjustment state or pending history outlives its image.
+  useEditorStore.getState().clearEditorSession();
 };
 
 interface MetadataSnapshot {
@@ -209,7 +198,7 @@ const applyWithAutoAdvance = (changedPaths: string[], undoable: boolean, applyCh
   }
 };
 
-export function useLibraryActions(handleImageSelect?: (path: string, openInEditor?: boolean) => void) {
+export function useLibraryActions(handleImageSelect?: (path: string, openInEditor?: boolean) => Promise<boolean>) {
   const handleRate = useCallback((newRating: number, paths?: string[]) => {
     const { imageRatings, imageList, setLibrary } = useLibraryStore.getState();
 
@@ -348,7 +337,7 @@ export function useLibraryActions(handleImageSelect?: (path: string, openInEdito
       await invoke(Invokes.UpdateExifFields, { paths: physicalPathsArray, updates });
 
       setEditor((state) => {
-        if (!state.selectedImage || !physicalPathsSet.has(state.selectedImage.path.split('?vc=')[0])) return state;
+        if (!state.selectedImage || !physicalPathsSet.has(state.selectedImage.path.split('?vc=')[0])) return {};
         return { selectedImage: { ...state.selectedImage, exif: { ...(state.selectedImage.exif || {}), ...updates } } };
       });
 
@@ -465,7 +454,7 @@ export function useLibraryActions(handleImageSelect?: (path: string, openInEdito
             setLibrary({ multiSelectedPaths: [p], libraryActivePath: p, selectionAnchorPath: p });
           }
           if (handleImageSelect) {
-            handleImageSelect(p, false);
+            void handleImageSelect(p, false);
           }
         },
       });
@@ -484,11 +473,18 @@ export function useLibraryActions(handleImageSelect?: (path: string, openInEdito
         updateLibraryActivePath: !inEditor,
         visibleImagePaths,
         onSimpleClick: (p: string, isAlreadySelected: boolean) => {
-          if (!isAlreadySelected) {
-            setLibrary({ multiSelectedPaths: [p] });
+          const commitSelection = () => {
+            if (!isAlreadySelected) setLibrary({ multiSelectedPaths: [p] });
+            setLibrary({ selectionAnchorPath: p });
+          };
+          // The selection only moves once the editor actually switched (its previous image saved).
+          if (handleImageSelect) {
+            void handleImageSelect(p).then((selected) => {
+              if (selected) commitSelection();
+            });
+          } else {
+            commitSelection();
           }
-          if (handleImageSelect) handleImageSelect(p);
-          setLibrary({ selectionAnchorPath: p });
         },
       });
     },
@@ -550,11 +546,14 @@ export function useLibraryActions(handleImageSelect?: (path: string, openInEdito
     handleSettingsChange({ ...appSettings, pinnedFolders: newPins });
 
     try {
-      const trees = await invoke(Invokes.GetPinnedFolderTrees, {
-        paths: newPins,
-        expandedFolders: Array.from(expandedFolders),
-        showImageCounts: appSettings.enableFolderImageCounts ?? false,
-      });
+      const trees = await invoke<ReturnType<typeof useLibraryStore.getState>['pinnedFolderTrees']>(
+        Invokes.GetPinnedFolderTrees,
+        {
+          paths: newPins,
+          expandedFolders: Array.from(expandedFolders),
+          showImageCounts: appSettings.enableFolderImageCounts ?? false,
+        },
+      );
       setLibrary({ pinnedFolderTrees: trees });
     } catch (err) {
       toast.error(`Failed to refresh pinned folders: ${err}`);

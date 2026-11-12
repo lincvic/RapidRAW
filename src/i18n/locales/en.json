@@ -715,6 +715,12 @@
     },
     "externalEdit": {
       "done": "Done",
+      "errors": {
+        "cancelFailed": "Failed to cancel the previous external edit export.",
+        "notReady": "The external edit source is not ready.",
+        "openFailed": "Could not open the external edit source.",
+        "saveFailed": "Failed to save changes before exit."
+      },
       "exporting": "Exporting…",
       "savesTo": "External edit — saves to"
     },
@@ -930,6 +936,9 @@
         "style": "Style",
         "tool": "Tool"
       }
+    },
+    "saveErrors": {
+      "discarded": "Changes to {{name}} could not be saved and were discarded: {{error}}"
     },
     "speedEdit": {
       "copied": "Copied <0>{{label}}</0> <1>{{value}}</1>",

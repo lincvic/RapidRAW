@@ -46,7 +46,8 @@ import { hasAiSubMasks, mergeAiMaskResults, stripAiMaskResults } from '../../../
 import { Invokes, OPTION_SEPARATOR, Panel, Preset, SelectedImage } from '../../ui/AppProperties';
 import { useEditorStore } from '../../../store/useEditorStore';
 import { useUIStore } from '../../../store/useUIStore';
-import { debouncedSave, useEditorActions } from '../../../hooks/useEditorActions';
+import { useEditorActions } from '../../../hooks/useEditorActions';
+import { flushPendingSave } from '../../../services/editorPersistence';
 
 interface DroppableFolderItemProps {
   children: any;
@@ -888,27 +889,23 @@ export default function PresetsPanel({ onNavigateToCommunity }: PresetsPanelProp
     expandedFolders,
   ]);
 
-  const resolvePresetAiMasks = useCallback(
-    (presetMasks: Array<MaskContainer>) => {
-      const path = useEditorStore.getState().selectedImage?.path;
-      if (!path) return;
+  const resolvePresetAiMasks = useCallback((presetMasks: Array<MaskContainer>) => {
+    const path = useEditorStore.getState().selectedImage?.path;
+    if (!path) return;
 
-      debouncedSave.flush();
-      invoke(Invokes.ApplyAdjustmentsToPaths, { paths: [path], adjustments: { masks: presetMasks } })
-        .then(() => invoke<any>(Invokes.LoadMetadata, { path }))
-        .then((meta) => {
-          if (!meta?.adjustments?.masks || useEditorStore.getState().selectedImage?.path !== path) return;
-          setEditor((state) => ({
-            adjustments: {
-              ...state.adjustments,
-              masks: mergeAiMaskResults(state.adjustments.masks || [], meta.adjustments.masks),
-            },
-          }));
-        })
-        .catch((err) => console.error('Failed to resolve preset AI masks:', err));
-    },
-    [setEditor],
-  );
+    // The preset's own save lands before the backend resolves its AI masks into the sidecar.
+    flushPendingSave(path)
+      .then(() => invoke(Invokes.ApplyAdjustmentsToPaths, { paths: [path], adjustments: { masks: presetMasks } }))
+      .then(() => invoke<any>(Invokes.LoadMetadata, { path }))
+      .then((meta) => {
+        if (!meta?.adjustments?.masks) return;
+        useEditorStore.getState().applyAsyncAdjustments(path, (current) => ({
+          ...current,
+          masks: mergeAiMaskResults(current.masks || [], meta.adjustments.masks),
+        }));
+      })
+      .catch((err) => console.error('Failed to resolve preset AI masks:', err));
+  }, []);
 
   const handleApplyPreset = (preset: Preset) => {
     hiddenPresetMasks.current = null;

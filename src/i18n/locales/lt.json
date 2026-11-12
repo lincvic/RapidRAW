@@ -787,6 +787,12 @@
     },
     "externalEdit": {
       "done": "Atlikta",
+      "errors": {
+        "cancelFailed": "Nepavyko atšaukti ankstesnio išorinio redagavimo eksporto.",
+        "notReady": "Išorinio redagavimo šaltinis neparuoštas.",
+        "openFailed": "Nepavyko atidaryti išorinio redagavimo šaltinio.",
+        "saveFailed": "Nepavyko išsaugoti pakeitimų prieš išeinant."
+      },
       "exporting": "Eksportuojama…",
       "savesTo": "Išsaugoma į: {{path}}"
     },
@@ -1019,6 +1025,9 @@
         "style": "Stilius",
         "tool": "Įrankis"
       }
+    },
+    "saveErrors": {
+      "discarded": "Nepavyko išsaugoti {{name}} pakeitimų, jie atmesti: {{error}}"
     },
     "speedEdit": {
       "copied": "Nukopijuota <0>{{label}}</0> <1>{{value}}</1>",

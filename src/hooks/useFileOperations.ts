@@ -10,6 +10,7 @@ import { JobKind, useProcessStore } from '../store/useProcessStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { ImageFlag, Invokes } from '../components/ui/AppProperties';
 import { Status } from '../components/ui/ExportImportProperties';
+import { discardPendingSave, flushPendingSave } from '../services/editorPersistence';
 
 export const transferFiles = (kind: JobKind.Copy | JobKind.Move, sourcePaths: string[], destinationFolder: string) =>
   useProcessStore
@@ -21,7 +22,7 @@ export const transferFiles = (kind: JobKind.Copy | JobKind.Move, sourcePaths: st
 export function useFileOperations(
   refreshImageList: () => Promise<void>,
   refreshAllFolderTrees: () => Promise<void>,
-  handleImageSelect: (path: string, openInEditor?: boolean) => void,
+  handleImageSelect: (path: string, openInEditor?: boolean) => Promise<boolean>,
   handleBackToLibrary: () => void,
   sortedImageList: any[],
 ) {
@@ -76,8 +77,15 @@ export function useFileOperations(
       }
 
       try {
+        // Unsaved edits of a deleted image are moot; dropping them keeps a late save from recreating its sidecar.
+        const editedPath = selectedImage?.path;
+        const isEditedImageDeleted =
+          editedPath !== undefined && pathsToDelete.some((p) => p === editedPath || p === editedPath.split('?vc=')[0]);
+        if (isEditedImageDeleted) await discardPendingSave(editedPath);
+
         const command = options.includeAssociated ? 'delete_files_with_associated' : 'delete_files_from_disk';
         await invoke(command, { paths: pathsToDelete });
+        if (isEditedImageDeleted) await discardPendingSave(editedPath);
         await refreshImageList();
 
         if (selectedImage && activeView === 'editor') {
@@ -86,7 +94,7 @@ export function useFileOperations(
 
           if (isFileBeingEditedDeleted) {
             if (nextImagePath) {
-              handleImageSelect(nextImagePath);
+              await handleImageSelect(nextImagePath);
             } else {
               handleBackToLibrary();
             }
@@ -101,7 +109,7 @@ export function useFileOperations(
           if (selectedImage) {
             const physicalPath = selectedImage.path.split('?vc=')[0];
             if (pathsToDelete.some((p) => p === selectedImage.path || p === physicalPath)) {
-              useEditorStore.getState().setEditor({ selectedImage: null });
+              useEditorStore.getState().clearEditorSession();
             }
           }
         }
@@ -271,17 +279,26 @@ export function useFileOperations(
 
       if (renameTargetPaths.length > 0 && nameTemplate) {
         try {
+          // The edited image's sidecar must be complete before it moves with the renamed file.
+          if (selectedImage && renameTargetPaths.includes(selectedImage.path)) {
+            await flushPendingSave(selectedImage.path);
+          }
+
           const newPaths: Array<string> = await invoke(Invokes.RenameFiles, {
             nameTemplate,
             paths: renameTargetPaths,
           });
+          // A save queued during the rename would target the old path, which no longer has an image.
+          if (selectedImage && renameTargetPaths.includes(selectedImage.path)) {
+            await discardPendingSave(selectedImage.path);
+          }
 
           await refreshImageList();
 
           if (selectedImage && renameTargetPaths.includes(selectedImage.path)) {
             const oldPathIndex = renameTargetPaths.indexOf(selectedImage.path);
             if (newPaths[oldPathIndex]) {
-              handleImageSelect(newPaths[oldPathIndex], activeView === 'editor');
+              await handleImageSelect(newPaths[oldPathIndex], activeView === 'editor');
             } else if (activeView === 'editor') {
               handleBackToLibrary();
             }

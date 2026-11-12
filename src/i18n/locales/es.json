@@ -739,6 +739,12 @@
     },
     "externalEdit": {
       "done": "Listo",
+      "errors": {
+        "cancelFailed": "No se pudo cancelar la exportación anterior de la edición externa.",
+        "notReady": "El origen de la edición externa no está listo.",
+        "openFailed": "No se pudo abrir el origen de la edición externa.",
+        "saveFailed": "No se pudieron guardar los cambios antes de salir."
+      },
       "exporting": "Exportando…",
       "savesTo": "Edición externa: se guarda en"
     },
@@ -955,6 +961,9 @@
         "style": "Estilo",
         "tool": "Herramienta"
       }
+    },
+    "saveErrors": {
+      "discarded": "Los cambios en {{name}} no se pudieron guardar y se descartaron: {{error}}"
     },
     "speedEdit": {
       "copied": "<0>{{label}}</0> <1>{{value}}</1> copiado",

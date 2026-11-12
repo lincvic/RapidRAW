@@ -72,23 +72,12 @@ import {
   AlbumGroup,
   EditInApp,
 } from '../components/ui/AppProperties';
-import {
-  AutoAdjustMode,
-  Color,
-  COLOR_LABELS,
-  getAiDenoiseEnablePatch,
-  INITIAL_ADJUSTMENTS,
-} from '../utils/adjustments';
+import { AutoAdjustMode, Color, COLOR_LABELS, getAiDenoiseEnablePatch } from '../utils/adjustments';
 import TaggingSubMenu from '../context/TaggingSubMenu';
-import {
-  buildAutoAdjustModeOptions,
-  debouncedSave,
-  reloadAdjustmentsForPaths,
-  useEditorActions,
-} from './useEditorActions';
+import { applyBackendAdjustmentMutation, buildAutoAdjustModeOptions, useEditorActions } from './useEditorActions';
 import { useLibraryActions } from './useLibraryActions';
 import { transferFiles } from './useFileOperations';
-import { globalImageCache } from '../utils/ImageLRUCache';
+import { discardPendingSave, flushPendingSave } from '../services/editorPersistence';
 import {
   immichAlbumOf,
   isImmichAlbumId,
@@ -98,7 +87,7 @@ import {
 import { useImmichStore } from '../components/immich/useImmichStore';
 
 export interface UseAppContextMenusProps {
-  handleImageSelect: (path: string) => void;
+  handleImageSelect: (path: string) => Promise<boolean>;
   handleBackToLibrary: () => void;
   handleRenameFiles: (paths: string[]) => void;
   handleImportClick: (path: string) => void;
@@ -245,7 +234,9 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
       const sessionId = crypto.randomUUID();
       let running = true;
       let cancelled = false;
-      debouncedSave.flush();
+      if (selectedImage) {
+        await flushPendingSave(selectedImage.path).catch((err) => toast.error(`Failed to save changes: ${err}`));
+      }
       const toastId = toast.info(t('contextMenus.toasts.editInWaiting', { app: app.name }), {
         autoClose: false,
         closeOnClick: false,
@@ -266,7 +257,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
         toast.dismiss(toastId);
         await props.refreshImageList();
         if (newPath) {
-          props.handleImageSelect(newPath);
+          void props.handleImageSelect(newPath);
         } else if (!cancelled) {
           toast.info(t('contextMenus.toasts.editInNoOutput', { app: app.name }));
         }
@@ -300,17 +291,8 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
       event.preventDefault();
       event.stopPropagation();
 
-      const {
-        selectedImage,
-        adjustments,
-        history,
-        historyIndex,
-        undo,
-        redo,
-        resetHistory,
-        copiedAdjustments,
-        setEditor,
-      } = useEditorStore.getState();
+      const { selectedImage, adjustments, history, historyIndex, undo, redo, copiedAdjustments } =
+        useEditorStore.getState();
       const { appSettings, osPlatform } = useSettingsStore.getState();
       const { setPanel, setUI, isViewerOpen, toggleViewerWindow } = useUIStore.getState();
 
@@ -462,7 +444,9 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
           submenu: [
             { label: t('contextMenus.editor.noLabel'), onClick: () => handleSetColorLabel(null) },
             ...COLOR_LABELS.map((label: Color) => ({
-              label: t(`contextMenus.colors.${label.name}`),
+              label: t(`contextMenus.colors.${label.name}`, {
+                defaultValue: label.name.charAt(0).toUpperCase() + label.name.slice(1),
+              }),
               color: label.color,
               onClick: () => handleSetColorLabel(label.name),
             })),
@@ -493,13 +477,8 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               label: t('contextMenus.editor.confirmReset'),
               icon: Check,
               isDestructive: true,
-              onClick: () => {
-                resetHistory({
-                  ...INITIAL_ADJUSTMENTS,
-                  aiPatches: [],
-                });
-                setEditor({ adjustments: { ...INITIAL_ADJUSTMENTS, aiPatches: [] } });
-              },
+              // The backend writes null adjustments, then the editor reloads a fresh camera-default baseline.
+              onClick: () => handleResetAdjustments([selectedImage.path]),
             },
           ],
         },
@@ -511,6 +490,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
       handleCopyAdjustments,
       handlePasteAdjustments,
       handleAutoAdjustments,
+      handleResetAdjustments,
       handleRate,
       buildFlagMenu,
       handleSetColorLabel,
@@ -650,20 +630,20 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
           handleAutoAdjustments(mode);
         }
         if (batchPaths.length === 0) return;
-        batchPaths.forEach((p) => globalImageCache.delete(p));
 
-        invoke(Invokes.ApplyAutoAdjustmentsToPaths, { paths: batchPaths, mode })
-          .then(() => reloadAdjustmentsForPaths(batchPaths))
-          .catch((err) => {
-            console.error('Failed to apply auto adjustments to paths:', err);
-            toast.error(t('contextMenus.toasts.failedApplyAuto', { err }));
-          });
+        // The backend resolves after every sidecar write and materializes camera framing for null RAW sidecars.
+        applyBackendAdjustmentMutation(batchPaths, () =>
+          invoke(Invokes.ApplyAutoAdjustmentsToPaths, { paths: batchPaths, mode }),
+        ).catch((err) => {
+          console.error('Failed to apply auto adjustments to paths:', err);
+          toast.error(t('contextMenus.toasts.failedApplyAuto', { err }));
+        });
       };
 
-      const onExportClick = () => {
+      const onExportClick = async () => {
         setLibrary({ multiSelectedPaths: finalSelection });
         if (activeView === 'editor' && selectedImage && selectedImage.path !== path) {
-          props.handleImageSelect(path);
+          if (!(await props.handleImageSelect(path))) return;
         }
         setPanel(Panel.Export);
       };
@@ -732,7 +712,7 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
                 disabled: !isSingleSelection,
                 icon: Edit,
                 label: t('contextMenus.editor.editImage'),
-                onClick: () => props.handleImageSelect(finalSelection[0]),
+                onClick: () => void props.handleImageSelect(finalSelection[0]),
               },
               { icon: FileInput, label: exportLabel, onClick: onExportClick },
             ]
@@ -990,7 +970,9 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
           submenu: [
             { label: t('contextMenus.editor.noLabel'), onClick: () => handleSetColorLabel(null, finalSelection) },
             ...COLOR_LABELS.map((label: Color) => ({
-              label: t(`contextMenus.colors.${label.name}`),
+              label: t(`contextMenus.colors.${label.name}`, {
+                defaultValue: label.name.charAt(0).toUpperCase() + label.name.slice(1),
+              }),
               color: label.color,
               onClick: () => handleSetColorLabel(label.name, finalSelection),
             })),
@@ -1277,7 +1259,14 @@ export function useAppContextMenus(latestProps: UseAppContextMenusProps) {
               isDestructive: true,
               onClick: async () => {
                 try {
+                  // Unsaved edits inside a deleted folder are moot; a late save must not recreate its sidecar.
+                  const editingPath = useEditorStore.getState().selectedImage?.path;
+                  const isEditingInFolder =
+                    editingPath !== undefined &&
+                    (editingPath.startsWith(targetPath + '/') || editingPath.startsWith(targetPath + '\\'));
+                  if (isEditingInFolder) await discardPendingSave(editingPath);
                   await invoke(Invokes.DeleteFolder, { path: targetPath });
+                  if (isEditingInFolder) await discardPendingSave(editingPath);
 
                   const isCurrentInTarget =
                     currentFolderPath === targetPath ||

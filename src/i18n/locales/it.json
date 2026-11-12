@@ -739,6 +739,12 @@
     },
     "externalEdit": {
       "done": "Fatto",
+      "errors": {
+        "cancelFailed": "Impossibile annullare l'esportazione precedente della modifica esterna.",
+        "notReady": "L'origine della modifica esterna non è pronta.",
+        "openFailed": "Impossibile aprire l'origine della modifica esterna.",
+        "saveFailed": "Impossibile salvare le modifiche prima di uscire."
+      },
       "exporting": "Esportazione…",
       "savesTo": "Modifica esterna — salva in"
     },
@@ -955,6 +961,9 @@
         "style": "Stile",
         "tool": "Strumento"
       }
+    },
+    "saveErrors": {
+      "discarded": "Non è stato possibile salvare le modifiche a {{name}}, che sono state scartate: {{error}}"
     },
     "speedEdit": {
       "copied": "<0>{{label}}</0> <1>{{value}}</1> copiato",

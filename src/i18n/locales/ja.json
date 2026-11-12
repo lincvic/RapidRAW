@@ -712,6 +712,12 @@
     },
     "externalEdit": {
       "done": "完了",
+      "errors": {
+        "cancelFailed": "前回の外部編集の書き出しをキャンセルできませんでした。",
+        "notReady": "外部編集の元画像の準備ができていません。",
+        "openFailed": "外部編集の元画像を開けませんでした。",
+        "saveFailed": "終了前に変更を保存できませんでした。"
+      },
       "exporting": "書き出し中…",
       "savesTo": "外部編集 — 保存先"
     },
@@ -927,6 +933,9 @@
         "style": "スタイル",
         "tool": "ツール"
       }
+    },
+    "saveErrors": {
+      "discarded": "{{name}} の変更を保存できなかったため、破棄しました: {{error}}"
     },
     "speedEdit": {
       "copied": "<0>{{label}}</0> <1>{{value}}</1> をコピーしました",

@@ -712,6 +712,12 @@
     },
     "externalEdit": {
       "done": "完成",
+      "errors": {
+        "cancelFailed": "无法取消上一次外部编辑导出。",
+        "notReady": "外部编辑的源图像尚未就绪。",
+        "openFailed": "无法打开外部编辑的源图像。",
+        "saveFailed": "退出前无法保存更改。"
+      },
       "exporting": "正在导出…",
       "savesTo": "外部编辑 — 保存至"
     },
@@ -927,6 +933,9 @@
         "style": "风格",
         "tool": "工具"
       }
+    },
+    "saveErrors": {
+      "discarded": "无法保存对 {{name}} 的更改，已放弃这些更改：{{error}}"
     },
     "speedEdit": {
       "copied": "已复制 <0>{{label}}</0> <1>{{value}}</1>",

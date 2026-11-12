@@ -333,11 +333,10 @@ export function useTauriListeners({
         if (!isEffectActive) return;
         useEditorStore.getState().setEditor((state) => {
           const { [event.payload]: _, ...aiDenoiseProgress } = state.aiDenoiseProgress;
-          return {
-            aiDenoiseProgress,
-            ...(state.selectedImage?.path === event.payload ? { adjustments: { ...state.adjustments } } : {}),
-          };
+          return { aiDenoiseProgress };
         });
+        // A new adjustments object re-renders with the finished result without changing what is saved.
+        useEditorStore.getState().applyAsyncAdjustments(event.payload, (current) => ({ ...current }));
       }),
       listen<{ path: string; error: string }>('ai-denoise-error', (event) => {
         if (!isEffectActive) return;
@@ -345,13 +344,9 @@ export function useTauriListeners({
         toast.error(`AI denoise failed: ${error}`);
         useEditorStore.getState().setEditor((state) => {
           const { [path]: _, ...aiDenoiseProgress } = state.aiDenoiseProgress;
-          return {
-            aiDenoiseProgress,
-            ...(state.selectedImage?.path === path
-              ? { adjustments: { ...state.adjustments, aiDenoiseEnabled: false } }
-              : {}),
-          };
+          return { aiDenoiseProgress };
         });
+        useEditorStore.getState().applyAsyncAdjustments(path, (current) => ({ ...current, aiDenoiseEnabled: false }));
       }),
       listen<{ path: string; progress: number }>('ai-upscale-progress', (event) => {
         if (!isEffectActive) return;
@@ -364,11 +359,9 @@ export function useTauriListeners({
         if (!isEffectActive) return;
         useEditorStore.getState().setEditor((state) => {
           const { [event.payload]: _, ...aiUpscaleProgress } = state.aiUpscaleProgress;
-          return {
-            aiUpscaleProgress,
-            ...(state.selectedImage?.path === event.payload ? { adjustments: { ...state.adjustments } } : {}),
-          };
+          return { aiUpscaleProgress };
         });
+        useEditorStore.getState().applyAsyncAdjustments(event.payload, (current) => ({ ...current }));
       }),
       listen<{ path: string; error: string }>('ai-upscale-error', (event) => {
         if (!isEffectActive) return;
@@ -376,13 +369,9 @@ export function useTauriListeners({
         toast.error(`RapidRes failed: ${error}`);
         useEditorStore.getState().setEditor((state) => {
           const { [path]: _, ...aiUpscaleProgress } = state.aiUpscaleProgress;
-          return {
-            aiUpscaleProgress,
-            ...(state.selectedImage?.path === path
-              ? { adjustments: { ...state.adjustments, aiUpscaleEnabled: false } }
-              : {}),
-          };
+          return { aiUpscaleProgress };
         });
+        useEditorStore.getState().applyAsyncAdjustments(path, (current) => ({ ...current, aiUpscaleEnabled: false }));
       }),
       listen<AiJobsStatus>('ai-jobs-status', (event) => {
         if (!isEffectActive) return;
@@ -415,24 +404,22 @@ export function useTauriListeners({
         'ai-job-result',
         (event) => {
           const { path, subMasks, maps, noResults } = event.payload;
-          const { selectedImage, patchesSentToBackend, setEditor } = useEditorStore.getState();
+          const { selectedImage, patchesSentToBackend, applyAsyncAdjustments } = useEditorStore.getState();
           if (!isEffectActive || selectedImage?.path !== path) return;
 
           noResults.forEach((noResult) => toast.error(`AI Mask: ${noResult}`));
           Object.keys(subMasks).forEach((id) => patchesSentToBackend.delete(id));
-          setEditor((state) => ({
-            adjustments: {
-              ...state.adjustments,
-              ...maps,
-              masks: state.adjustments.masks?.map((container: MaskContainer) => ({
-                ...container,
-                subMasks: container.subMasks.map((subMask) =>
-                  subMasks[subMask.id]
-                    ? { ...subMask, parameters: { ...subMask.parameters, ...subMasks[subMask.id] } }
-                    : subMask,
-                ),
-              })),
-            },
+          applyAsyncAdjustments(path, (current) => ({
+            ...current,
+            ...maps,
+            masks: current.masks?.map((container: MaskContainer) => ({
+              ...container,
+              subMasks: container.subMasks.map((subMask) =>
+                subMasks[subMask.id]
+                  ? { ...subMask, parameters: { ...subMask.parameters, ...subMasks[subMask.id] } }
+                  : subMask,
+              ),
+            })),
           }));
         },
       ),

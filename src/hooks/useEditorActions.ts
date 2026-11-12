@@ -1,11 +1,10 @@
 import { useCallback } from 'react';
 import { invoke } from '@tauri-apps/api/core';
-import debounce from 'lodash.debounce';
 import { toast } from 'react-toastify';
 import { useTranslation } from 'react-i18next';
 import { TFunction } from 'i18next';
 import { SignalHigh, SignalLow, SignalMedium } from 'lucide-react';
-import { useEditorStore, debouncedSetHistory } from '../store/useEditorStore';
+import { useEditorStore, type AdjustmentSessionSnapshot } from '../store/useEditorStore';
 import { useLibraryStore } from '../store/useLibraryStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { useProcessStore } from '../store/useProcessStore';
@@ -27,15 +26,115 @@ import originalAdjustmentKeys from '../utils/originalAdjustmentKeys.json';
 import { CompareMode, Invokes, Option, Panel, SelectedImage } from '../components/ui/AppProperties';
 import { globalImageCache } from '../utils/ImageLRUCache';
 import { getDevicePixelRatio } from '../utils/displayScale';
+import type { LoadMetadataResult } from '../types/imageLoading';
+import {
+  flushPendingSave,
+  resetAdjustmentsErrorMessage,
+  runAuthoritativeReset,
+  runEditorMutation,
+} from '../services/editorPersistence';
+import { adjustmentsForPersistence } from '../utils/rafCameraDefaults';
 
-export { debouncedSetHistory };
+export class AdjustmentTargetLoadingError extends Error {
+  constructor(path: string) {
+    super(`Cannot change adjustments while the selected image is loading: ${path}`);
+    this.name = 'AdjustmentTargetLoadingError';
+  }
+}
 
-export const debouncedSave = debounce((path: string, adjustmentsToSave: Adjustments) => {
-  invoke(Invokes.SaveMetadataAndUpdateThumbnail, { path, adjustments: adjustmentsToSave }).catch((err) => {
-    console.error('Auto-save failed:', err);
-    toast.error(`Failed to save changes: ${err}`);
-  });
-}, 300);
+type SelectionTarget = Pick<SelectedImage, 'isReady' | 'path'> | null;
+
+/**
+ * Resolves with the selected image once it is no longer a loading target in `paths`: it became ready, or another
+ * image (or none) is selected. A sidecar command must never race the metadata-first load of its own target.
+ */
+export async function waitForSettledSelection(
+  getSelectedImage: () => SelectionTarget,
+  paths: readonly string[],
+  waitForChange: (path: string) => Promise<unknown>,
+): Promise<SelectionTarget> {
+  let selectedImage = getSelectedImage();
+  while (selectedImage && paths.includes(selectedImage.path) && !selectedImage.isReady) {
+    await waitForChange(selectedImage.path);
+    selectedImage = getSelectedImage();
+  }
+  return selectedImage;
+}
+
+interface AutoAdjustmentEditorSession {
+  adjustmentSessionGeneration: number;
+  selectedImage: Pick<SelectedImage, 'isReady' | 'path'> | null;
+}
+
+/** Applies a calculated result only while the same ready editor session that requested it is still current. */
+export async function runAutoAdjustmentsForCurrentSession<T>(
+  getSession: () => AutoAdjustmentEditorSession,
+  calculate: () => Promise<T>,
+  apply: (adjustments: T) => void,
+): Promise<boolean> {
+  const requestedSession = getSession();
+  const requestedImage = requestedSession.selectedImage;
+  if (!requestedImage?.isReady) return false;
+
+  const adjustments = await calculate();
+  const currentSession = getSession();
+  if (
+    !currentSession.selectedImage?.isReady ||
+    currentSession.selectedImage.path !== requestedImage.path ||
+    currentSession.adjustmentSessionGeneration !== requestedSession.adjustmentSessionGeneration
+  ) {
+    return false;
+  }
+
+  apply(adjustments);
+  return true;
+}
+
+/** Routes a whole-image reset through the authoritative reset when it includes the ready editor image. */
+export async function routeResetForSelection(
+  getSelectedImage: () => SelectionTarget,
+  paths: readonly string[],
+  resetSelected: (path: string) => Promise<void>,
+  resetWithoutSelected: () => Promise<void>,
+  waitForChange: (path: string) => Promise<unknown> = waitForImageReady,
+): Promise<boolean> {
+  const selectedImage = await waitForSettledSelection(getSelectedImage, paths, waitForChange);
+  if (selectedImage && paths.includes(selectedImage.path)) {
+    await resetSelected(selectedImage.path);
+    return true;
+  }
+  await resetWithoutSelected();
+  return false;
+}
+
+/**
+ * Routes a backend sidecar mutation through the open editor image's save window when it is a target, so its
+ * pending edits land first and the editor reloads the backend-persisted result instead of overwriting it.
+ * Returns whether the editor image was a target.
+ */
+export async function routeAdjustmentMutationForSelection(
+  getSelectedImage: () => SelectionTarget,
+  paths: readonly string[],
+  runSelectedMutation: (path: string, mutate: (beforeBackend?: () => void) => Promise<void>) => Promise<void>,
+  mutate: () => Promise<unknown>,
+  waitForChange: (path: string) => Promise<unknown> = waitForImageReady,
+): Promise<boolean> {
+  const selectedImage = await waitForSettledSelection(getSelectedImage, paths, waitForChange);
+  if (selectedImage && paths.includes(selectedImage.path)) {
+    const selectedPath = selectedImage.path;
+    await runSelectedMutation(selectedPath, async (beforeBackend) => {
+      const currentImage = getSelectedImage();
+      if (!currentImage?.isReady || currentImage.path !== selectedPath) {
+        throw new AdjustmentTargetLoadingError(selectedPath);
+      }
+      beforeBackend?.();
+      await mutate();
+    });
+    return true;
+  }
+  await mutate();
+  return false;
+}
 
 const AUTO_ADJUST_MODE_ICONS: Record<AutoAdjustMode, any> = {
   [AutoAdjustMode.Subtle]: SignalLow,
@@ -50,18 +149,22 @@ export const buildAutoAdjustModeOptions = (t: TFunction, onSelect: (mode: AutoAd
     onClick: () => onSelect(mode),
   }));
 
-const waitForImageReady = (path: string) =>
-  new Promise<boolean>((resolve) => {
-    const unsubscribe = useEditorStore.subscribe((state) => {
-      if (state.selectedImage?.path !== path) {
-        unsubscribe();
-        resolve(false);
-      } else if (state.selectedImage.isReady) {
-        unsubscribe();
-        resolve(true);
-      }
-    });
+/** Resolves true once `path` is the ready editor image, or false as soon as another image (or none) is selected. */
+function waitForImageReady(path: string): Promise<boolean> {
+  return new Promise<boolean>((resolve) => {
+    let settled = false;
+    let unsubscribe: (() => void) | null = null;
+    const settle = (state: ReturnType<typeof useEditorStore.getState>) => {
+      if (settled) return;
+      if (state.selectedImage?.path === path && !state.selectedImage.isReady) return;
+      settled = true;
+      unsubscribe?.();
+      resolve(state.selectedImage?.path === path);
+    };
+    unsubscribe = useEditorStore.subscribe(settle);
+    settle(useEditorStore.getState());
   });
+}
 
 export const withRotation = (adjustments: Adjustments, image: SelectedImage | null, rotation: number): Adjustments => ({
   ...adjustments,
@@ -97,23 +200,48 @@ const getCompareState = (mode: CompareMode, adjustments: Adjustments) =>
     ? { showOriginal: true, previewOverride: getOriginalAdjustments(adjustments), compareView: 'off' as const }
     : { showOriginal: false, previewOverride: null, compareView: mode };
 
-export const reloadAdjustmentsForPaths = async (paths: string[]) => {
-  const { selectedImage, setEditor, resetHistory } = useEditorStore.getState();
+const reloadLibraryActiveAdjustments = async (paths: readonly string[]) => {
   const { libraryActivePath, setLibrary } = useLibraryStore.getState();
-  if (selectedImage && paths.includes(selectedImage.path)) {
-    const meta: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
-    if (meta.adjustments && !meta.adjustments.is_null) {
-      const normalized = normalizeLoadedAdjustments(meta.adjustments);
-      setEditor({ adjustments: normalized });
-      resetHistory(normalized);
-    }
-  }
   if (libraryActivePath && paths.includes(libraryActivePath)) {
-    const meta: any = await invoke(Invokes.LoadMetadata, { path: libraryActivePath });
-    if (meta.adjustments && !meta.adjustments.is_null) {
+    const meta = await invoke<LoadMetadataResult>(Invokes.LoadMetadata, { path: libraryActivePath });
+    if (meta.adjustments !== null) {
       setLibrary({ libraryActiveAdjustments: normalizeLoadedAdjustments(meta.adjustments) });
     }
   }
+};
+
+/**
+ * Runs a backend command that rewrites the sidecars of `paths`. When the open editor image is a target, its
+ * pending save drains first, edits made meanwhile are held, and the editor then reloads the persisted result
+ * through the metadata-first loader rather than patching adjustments in place.
+ */
+export const applyBackendAdjustmentMutation = async (paths: string[], mutate: () => Promise<unknown>) => {
+  const invalidatePreviews = () => paths.forEach((path) => globalImageCache.delete(path));
+  const editorWasTarget = await routeAdjustmentMutationForSelection(
+    () => useEditorStore.getState().selectedImage,
+    paths,
+    (selectedPath, guardedMutate) =>
+      runEditorMutation(
+        selectedPath,
+        async (historyToken) => {
+          // The backend result wins: the open image is unready while the command rewrites its sidecar and then
+          // reloads it, so no edit made against the old state can be saved over the result.
+          const reload: { snapshot: AdjustmentSessionSnapshot | null } = { snapshot: null };
+          try {
+            await guardedMutate(() => {
+              reload.snapshot = useEditorStore.getState().beginAdjustmentReload(selectedPath, historyToken);
+            });
+          } catch (error) {
+            if (reload.snapshot) useEditorStore.getState().restoreAdjustmentSession(reload.snapshot);
+            throw error;
+          }
+        },
+        invalidatePreviews,
+      ),
+    mutate,
+  );
+  if (!editorWasTarget) invalidatePreviews();
+  await reloadLibraryActiveAdjustments(paths);
 };
 
 export const applyCrop = () => {
@@ -122,7 +250,7 @@ export const applyCrop = () => {
 };
 
 export const cancelCrop = () => {
-  const { cropSessionSnapshot, selectedImage, adjustments, setEditor } = useEditorStore.getState();
+  const { cropSessionSnapshot, selectedImage, adjustments, applyExplicitAdjustments } = useEditorStore.getState();
   applyCrop();
   if (cropSessionSnapshot && cropSessionSnapshot.path === (selectedImage?.path ?? null)) {
     const { geometry } = cropSessionSnapshot;
@@ -130,14 +258,7 @@ export const cancelCrop = () => {
       (key) => JSON.stringify(adjustments[key]) !== JSON.stringify(geometry[key]),
     );
     if (hasChanged) {
-      setEditor((state) => {
-        const newAdjustments = { ...state.adjustments, ...geometry };
-        debouncedSetHistory(newAdjustments);
-        return {
-          adjustments: newAdjustments,
-          ...(state.showOriginal ? { showOriginal: false, previewOverride: null } : {}),
-        };
-      });
+      applyExplicitAdjustments({ ...useEditorStore.getState().adjustments, ...geometry });
     }
   }
 };
@@ -145,24 +266,15 @@ export const cancelCrop = () => {
 export function useEditorActions() {
   const { t } = useTranslation();
   const setEditor = useEditorStore((s) => s.setEditor);
+  const applyExplicitAdjustments = useEditorStore((s) => s.applyExplicitAdjustments);
 
   const setAdjustments = useCallback(
     (value: Partial<Adjustments> | ((prev: Adjustments) => Adjustments), label?: string) => {
-      // A labelled action gets its own history step instead of merging with pending slider edits.
-      if (label) debouncedSetHistory.flush();
-      setEditor((state) => {
-        const prev = state.adjustments;
-        const newAdjustments = typeof value === 'function' ? value(prev) : { ...prev, ...value };
-        if (newAdjustments === prev) return state;
-        debouncedSetHistory(newAdjustments, label);
-        return {
-          adjustments: newAdjustments,
-          ...(state.showOriginal ? { showOriginal: false, previewOverride: null } : {}),
-        };
-      });
-      if (label) debouncedSetHistory.flush();
+      const previous = useEditorStore.getState().adjustments;
+      const next = typeof value === 'function' ? value(previous) : { ...previous, ...value };
+      applyExplicitAdjustments(next, { label });
     },
-    [setEditor],
+    [applyExplicitAdjustments],
   );
 
   const handleRotate = useCallback(
@@ -189,20 +301,31 @@ export function useEditorActions() {
 
   const handleAutoAdjustments = useCallback(
     async (mode: AutoAdjustMode = AutoAdjustMode.Normal) => {
-      const selectedImage = useEditorStore.getState().selectedImage;
-      if (!selectedImage?.isReady) return;
       try {
-        const autoAdjustments: Adjustments = await invoke(Invokes.CalculateAutoAdjustments, {
-          jsAdjustments: useEditorStore.getState().adjustments,
-          mode,
-        });
-        setAdjustments(
-          (prev: Adjustments) => ({
-            ...prev,
-            ...autoAdjustments,
-            activeTools: mergeActiveTools(prev, autoAdjustments),
-          }),
-          t('contextMenus.editor.autoAdjust'),
+        // A result that arrives after navigation or a reload belongs to a stale session and is discarded.
+        await runAutoAdjustmentsForCurrentSession(
+          () => {
+            const editor = useEditorStore.getState();
+            return {
+              adjustmentSessionGeneration: editor.adjustmentSessionGeneration,
+              selectedImage: editor.selectedImage,
+            };
+          },
+          () =>
+            invoke<Adjustments>(Invokes.CalculateAutoAdjustments, {
+              jsAdjustments: useEditorStore.getState().adjustments,
+              mode,
+            }),
+          (autoAdjustments) => {
+            setAdjustments(
+              (prev: Adjustments) => ({
+                ...prev,
+                ...autoAdjustments,
+                activeTools: mergeActiveTools(prev, autoAdjustments),
+              }),
+              t('contextMenus.editor.autoAdjust'),
+            );
+          },
         );
       } catch (err) {
         toast.error(`Failed to apply auto adjustments: ${err}`);
@@ -297,30 +420,50 @@ export function useEditorActions() {
     [setEditor],
   );
 
-  const handleResetAdjustments = useCallback(
-    (paths?: string[]) => {
-      const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
-      const { selectedImage, resetHistory } = useEditorStore.getState();
-      const pathsToReset = paths || multiSelectedPaths;
-      if (pathsToReset.length === 0) return;
+  const handleResetAdjustments = useCallback(async (paths?: string[]) => {
+    const { multiSelectedPaths, libraryActivePath, setLibrary } = useLibraryStore.getState();
+    const pathsToReset = paths || multiSelectedPaths;
+    if (pathsToReset.length === 0) return;
 
-      pathsToReset.forEach((p) => globalImageCache.delete(p));
-      debouncedSetHistory.cancel();
+    const finishReset = () => {
+      pathsToReset.forEach((path) => globalImageCache.delete(path));
+      if (libraryActivePath && pathsToReset.includes(libraryActivePath)) {
+        setLibrary({ libraryActiveAdjustments: { ...INITIAL_ADJUSTMENTS } });
+      }
+    };
 
-      invoke(Invokes.ResetAdjustmentsForPaths, { paths: pathsToReset })
-        .then(() => {
-          if (libraryActivePath && pathsToReset.includes(libraryActivePath))
-            setLibrary({ libraryActiveAdjustments: { ...INITIAL_ADJUSTMENTS } });
-          if (selectedImage && pathsToReset.includes(selectedImage.path)) {
-            const resetData = { ...INITIAL_ADJUSTMENTS, aiPatches: [] };
-            resetHistory(resetData);
-            setEditor({ adjustments: resetData });
-          }
-        })
-        .catch((err) => toast.error(`Failed to reset adjustments: ${err}`));
-    },
-    [setEditor],
-  );
+    try {
+      // The backend resolves only after every sidecar holds literal null adjustments.
+      const reset = () => invoke(Invokes.ResetAdjustmentsForPaths, { paths: pathsToReset });
+      await routeResetForSelection(
+        () => useEditorStore.getState().selectedImage,
+        pathsToReset,
+        async (selectedPath) => {
+          // The open image reloads a fresh camera-default baseline that stays unsaved until the next edit.
+          const editor = useEditorStore.getState();
+          const rollbackValue = adjustmentsForPersistence(editor.adjustmentLoadContext, editor.adjustments);
+          await runAuthoritativeReset({
+            path: selectedPath,
+            rollbackValue,
+            beginReload: (historyToken) => useEditorStore.getState().beginAdjustmentReload(selectedPath, historyToken),
+            restoreReload: (snapshot) => useEditorStore.getState().restoreAdjustmentSession(snapshot),
+            invokeReset: reset,
+            onSuccess: finishReset,
+            beginRecoveryReload: () => {
+              globalImageCache.delete(selectedPath);
+              useEditorStore.getState().beginAdjustmentReload(selectedPath);
+            },
+          });
+        },
+        async () => {
+          await reset();
+          finishReset();
+        },
+      );
+    } catch (err) {
+      toast.error(`Failed to reset adjustments: ${resetAdjustmentsErrorMessage(err)}`);
+    }
+  }, []);
 
   const handleAutoLensCorrection = useCallback((paths?: string[]) => {
     const { multiSelectedPaths } = useLibraryStore.getState();
@@ -337,11 +480,9 @@ export function useEditorActions() {
 
     if (pathsToUpdate.length === 0) return;
 
-    pathsToUpdate.forEach((p) => globalImageCache.delete(p));
-
-    invoke('apply_auto_lens_correction_to_paths', { paths: pathsToUpdate })
-      .then(() => reloadAdjustmentsForPaths(pathsToUpdate))
-      .catch((err) => toast.error(`Failed to apply auto lens correction: ${err}`));
+    applyBackendAdjustmentMutation(pathsToUpdate, () =>
+      invoke('apply_auto_lens_correction_to_paths', { paths: pathsToUpdate }),
+    ).catch((err) => toast.error(`Failed to apply auto lens correction: ${err}`));
   }, []);
 
   const handleAutoStraightenPaths = useCallback(
@@ -353,10 +494,9 @@ export function useEditorActions() {
         handleAutoStraighten();
       }
       if (batchPaths.length === 0) return;
-      batchPaths.forEach((p) => globalImageCache.delete(p));
-      invoke(Invokes.ApplyAutoStraightenToPaths, { paths: batchPaths })
-        .then(() => reloadAdjustmentsForPaths(batchPaths))
-        .catch((err) => toast.error(t('editor.crop.autoStraightenFailed', { error: String(err) })));
+      applyBackendAdjustmentMutation(batchPaths, () =>
+        invoke(Invokes.ApplyAutoStraightenToPaths, { paths: batchPaths }),
+      ).catch((err) => toast.error(t('editor.crop.autoStraightenFailed', { error: String(err) })));
     },
     [handleAutoStraighten, t],
   );
@@ -370,10 +510,9 @@ export function useEditorActions() {
         setAdjustments((prev: Adjustments) => ({ ...prev, ...patch }));
       }
       if (batchPaths.length === 0) return;
-      batchPaths.forEach((p) => globalImageCache.delete(p));
-      invoke(Invokes.ApplyAdjustmentsToPaths, { paths: batchPaths, adjustments: patch })
-        .then(() => reloadAdjustmentsForPaths(batchPaths))
-        .catch((err) => toast.error(`Failed to apply adjustments: ${err}`));
+      applyBackendAdjustmentMutation(batchPaths, () =>
+        invoke(Invokes.ApplyAdjustmentsToPaths, { paths: batchPaths, adjustments: patch }),
+      ).catch((err) => toast.error(`Failed to apply adjustments: ${err}`));
     },
     [setAdjustments],
   );
@@ -424,9 +563,10 @@ export function useEditorActions() {
       const { appSettings } = useSettingsStore.getState();
       const { setProcess } = useProcessStore.getState();
 
-      if (!copiedAdjustments || !appSettings) return;
+      const copyPasteSettings = appSettings?.copyPasteSettings;
+      if (!copiedAdjustments || !copyPasteSettings) return;
 
-      const { mode, includedAdjustments } = appSettings.copyPasteSettings;
+      const { mode, includedAdjustments } = copyPasteSettings;
       const adjustmentsToApply: Partial<Adjustments> = {};
 
       for (const key of includedAdjustments) {
@@ -454,17 +594,24 @@ export function useEditorActions() {
       pathsToUpdate.forEach((p) => globalImageCache.delete(p));
 
       const openPath = selectedImage && pathsToUpdate.includes(selectedImage.path) ? selectedImage.path : null;
-      if (openPath) {
-        debouncedSave.flush();
-      }
+      const openSessionGeneration = useEditorStore.getState().adjustmentSessionGeneration;
 
-      invoke(Invokes.ApplyAdjustmentsToPaths, { paths: pathsToUpdate, adjustments: adjustmentsToApply })
+      // The open image's pending save lands before the backend merges the pasted keys into its sidecar.
+      (openPath ? flushPendingSave(openPath) : Promise.resolve())
+        .then(() => invoke(Invokes.ApplyAdjustmentsToPaths, { paths: pathsToUpdate, adjustments: adjustmentsToApply }))
         .then(async () => {
           if (!openPath) return;
-          const meta: any = await invoke(Invokes.LoadMetadata, { path: openPath });
-          if (!meta.adjustments || useEditorStore.getState().selectedImage?.path !== openPath) return;
+          const { adjustments: persisted } = await invoke<LoadMetadataResult>(Invokes.LoadMetadata, { path: openPath });
+          const editor = useEditorStore.getState();
+          if (
+            !persisted ||
+            editor.selectedImage?.path !== openPath ||
+            editor.adjustmentSessionGeneration !== openSessionGeneration
+          ) {
+            return;
+          }
 
-          const pasted = Object.fromEntries(Object.keys(adjustmentsToApply).map((key) => [key, meta.adjustments[key]]));
+          const pasted = Object.fromEntries(Object.keys(adjustmentsToApply).map((key) => [key, persisted[key]]));
           setAdjustments((prev: any) => ({ ...prev, ...pasted }), t('contextMenus.editor.pasteAdjustments'));
         })
         .catch((err) => toast.error(`Failed to paste adjustments: ${err}`));

@@ -739,6 +739,12 @@
     },
     "externalEdit": {
       "done": "Terminé",
+      "errors": {
+        "cancelFailed": "Impossible d'annuler l'exportation précédente de la modification externe.",
+        "notReady": "La source de la modification externe n'est pas prête.",
+        "openFailed": "Impossible d'ouvrir la source de la modification externe.",
+        "saveFailed": "Impossible d'enregistrer les modifications avant de quitter."
+      },
       "exporting": "Exportation…",
       "savesTo": "Modification externe — s'enregistre dans"
     },
@@ -955,6 +961,9 @@
         "style": "Style",
         "tool": "Outil"
       }
+    },
+    "saveErrors": {
+      "discarded": "Les modifications de {{name}} n'ont pas pu être enregistrées et ont été abandonnées : {{error}}"
     },
     "speedEdit": {
       "copied": "<0>{{label}}</0> <1>{{value}}</1> copié",

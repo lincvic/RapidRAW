@@ -246,7 +246,6 @@ function App() {
     };
   });
 
-  const isBackendReadyRef = useRef(true);
   const previewJobIdRef = useRef<number>(0);
   const latestRenderedJobIdRef = useRef<number>(0);
   const currentResRef = useRef<number>(1280);
@@ -341,11 +340,9 @@ function App() {
       preloadedDataRef,
       cachedEditStateRef,
       selectedImagePathRef,
-      isBackendReadyRef,
       latestRenderedJobIdRef,
       previewJobIdRef,
       currentResRef,
-      prevAdjustmentsRef,
     }),
     [],
   );
@@ -367,6 +364,7 @@ function App() {
 
   const {
     externalEditSession,
+    isExternalEditReady,
     isFinishing: isExternalEditFinishing,
     finishExternalEdit,
   } = useExternalEditSession(handleImageSelect);
@@ -934,7 +932,7 @@ function App() {
                 />
               )}
               <div className="relative flex-1 flex flex-col min-w-0">
-                {selectedImage && externalEditSession && (
+                {selectedImage && externalEditSession && isExternalEditReady && (
                   <ExternalEditBar
                     session={externalEditSession}
                     isFinishing={isExternalEditFinishing}

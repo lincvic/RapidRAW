@@ -5,6 +5,7 @@ import { motion, AnimatePresence } from 'framer-motion';
 import clsx from 'clsx';
 import Button from '../ui/Button';
 import Text from '../ui/Text';
+import { navigateAndRunOnSuccess } from '../../utils/asyncNavigation';
 import { TextColors, TextVariants } from '../../types/typography';
 
 interface FocusStackModalProps {
@@ -16,7 +17,7 @@ interface FocusStackModalProps {
   isProcessing: boolean;
   loadingImageUrl?: string | null;
   onClose(): void;
-  onOpenFile(path: string): void;
+  onOpenFile(path: string): Promise<boolean>;
   onSave(): Promise<string>;
   onMerge(): void;
   progressMessage: string | null;
@@ -90,10 +91,14 @@ export default function FocusStackModal({
     }
   };
 
-  const handleOpen = () => {
+  const handleOpen = async () => {
     if (savedPath) {
-      onOpenFile(savedPath);
-      handleClose();
+      // The modal only closes once the editor switched; a failed save of the current image keeps it open.
+      try {
+        await navigateAndRunOnSuccess(savedPath, onOpenFile, handleClose);
+      } catch (error) {
+        console.error('Failed to open saved focus stack:', error);
+      }
     }
   };
 

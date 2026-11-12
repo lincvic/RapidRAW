@@ -1,11 +1,11 @@
 import { RefObject } from 'react';
 import { create } from 'zustand';
-import debounce from 'lodash.debounce';
 import {
   Adjustments,
   INITIAL_ADJUSTMENTS,
   MaskContainer,
   AiPatch,
+  CROP_GEOMETRY_KEYS,
   CropGeometry,
   pickCropGeometry,
 } from '../utils/adjustments';
@@ -17,6 +17,17 @@ import { OverlayMode } from '../components/panel/right/CropPanel';
 import { describeHistoryChange } from '../utils/editHistory';
 import { HslMixerProperty } from '../utils/hslMixer';
 import type { SpeedEditTarget } from '../components/ui/Slider';
+import type { AdjustmentLoadContext } from '../types/imageLoading';
+import {
+  cancelPendingHistory,
+  flushPendingHistory,
+  restorePendingHistory,
+  scheduleHistory,
+  scheduleSave,
+  suspendPendingHistory,
+  type SuspendedHistoryToken,
+} from '../services/editorPersistence';
+import { adjustmentsForPersistence, markAdjustmentLoadDirty, structurallyEqual } from '../utils/rafCameraDefaults';
 
 export type CenterMarker = 'vignette' | 'centre';
 
@@ -37,10 +48,47 @@ interface BaseRenderSize extends ImageDimensions {
 
 export type WgpuPhase = 'hidden' | 'arming' | 'live';
 
+// Adjustment state may only change through the focused actions below, never through the generic setter.
+type ProtectedEditorKey =
+  | 'adjustments'
+  | 'history'
+  | 'historyLabels'
+  | 'historyIndex'
+  | 'adjustmentLoadContext'
+  | 'adjustmentReloadSnapshot'
+  | 'adjustmentLoadGeneration'
+  | 'adjustmentSessionGeneration';
+
+type EditorPatch = Omit<Partial<EditorState>, ProtectedEditorKey> & {
+  [Key in ProtectedEditorKey]?: never;
+};
+
+export interface AdjustmentSessionSnapshot {
+  adjustmentLoadContext: AdjustmentLoadContext | null;
+  adjustmentLoadGeneration: number;
+  adjustmentSessionGeneration: number;
+  adjustments: Adjustments;
+  history: Adjustments[];
+  historyLabels: string[];
+  historyIndex: number;
+  reloadId: number;
+  selectedImage: SelectedImage | null;
+  suspendedHistory: SuspendedHistoryToken | null;
+}
+
+export interface ExplicitAdjustmentOptions {
+  /** A labelled action gets its own history step instead of merging with pending slider edits. */
+  label?: string;
+}
+
 interface EditorState {
   // Core Image & Adjustments
   selectedImage: SelectedImage | null;
   adjustments: Adjustments;
+  adjustmentLoadContext: AdjustmentLoadContext | null;
+  adjustmentLoadGeneration: number;
+  adjustmentSessionGeneration: number;
+  adjustmentReloadSnapshot: AdjustmentSessionSnapshot | null;
   previewOverride: Adjustments | null;
 
   // History State
@@ -109,17 +157,31 @@ interface EditorState {
   copiedAdjustments: Adjustments | null;
 
   // Actions
-  setEditor: (updater: Partial<EditorState> | ((state: EditorState) => Partial<EditorState>)) => void;
+  setEditor: (updater: EditorPatch | ((state: EditorState) => EditorPatch)) => void;
   pushHistory: (newAdjustments: Adjustments, label?: string) => void;
+  /** Installs the provisional metadata-stage state of the current unready image. */
+  beginAdjustmentLoad: (adjustments: Adjustments, context: AdjustmentLoadContext) => void;
+  /** Atomically installs the reconciled state, its single-entry history, and readiness. */
+  completeAdjustmentLoad: (
+    adjustments: Adjustments,
+    context: AdjustmentLoadContext,
+    selectedImage: SelectedImage,
+    dimensions: { originalSize: ImageDimensions },
+  ) => boolean;
+  /** Applies a user edit: marks a reconciled load dirty, schedules the save, and records history. */
+  applyExplicitAdjustments: (value: Adjustments, options?: ExplicitAdjustmentOptions) => void;
+  /** Applies an asynchronous backend result for the current image without recording a history step. */
+  applyAsyncAdjustments: (path: string, update: (current: Adjustments) => Adjustments) => void;
+  /** Makes the current image unready so the loader reloads backend-persisted adjustments. */
+  beginAdjustmentReload: (path: string, suspendedHistory?: SuspendedHistoryToken | null) => AdjustmentSessionSnapshot;
+  /** Installs a new unready image; only display data and provisional adjustments may be supplied. */
+  beginImageSelection: (selectedImage: SelectedImage, provisionalAdjustments?: Adjustments) => void;
+  restoreAdjustmentSession: (snapshot: AdjustmentSessionSnapshot) => void;
+  clearEditorSession: () => void;
   undo: () => void;
   redo: () => void;
-  resetHistory: (initialState: Adjustments) => void;
   goToHistoryIndex: (index: number) => void;
 }
-
-export const debouncedSetHistory = debounce((newAdj: Adjustments, label?: string) => {
-  useEditorStore.getState().pushHistory(newAdj, label);
-}, 500);
 
 type CanvasToolState = Pick<
   EditorState,
@@ -134,13 +196,75 @@ export const canvasToolState = (activeTool: Partial<CanvasToolState> = {}): Canv
   ...activeTool,
 });
 
-export const useEditorStore = create<EditorState>((set) => ({
+const clone = <T>(value: T): T => {
+  if (Array.isArray(value)) return value.map((entry) => clone(entry)) as T;
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, entry]) => [key, clone(entry)])) as T;
+  }
+  return value;
+};
+
+const emptyAdjustments = () => clone(INITIAL_ADJUSTMENTS);
+const LOAD_GENERATION_KEY = '__rapidrawEditorLoadGeneration';
+type GenerationContext = AdjustmentLoadContext & { [LOAD_GENERATION_KEY]?: number };
+let nextReloadId = 0;
+
+const contextGeneration = (context: AdjustmentLoadContext): number | undefined =>
+  (context as GenerationContext)[LOAD_GENERATION_KEY];
+
+// Marking dirty clones the context, so an already-dirty load keeps its object during slider drags.
+const markExplicitEdit = (context: AdjustmentLoadContext | null): AdjustmentLoadContext | null =>
+  context?.reconciled && !context.dirty ? markAdjustmentLoadDirty(context) : context;
+
+// Like upstream, nothing is written while a slider drag is in progress; the settled value is saved when it ends.
+const scheduleAdjustmentPersistence = (state: EditorState) => {
+  if (!state.selectedImage?.isReady || state.isSliderDragging) return;
+  const persisted = adjustmentsForPersistence(state.adjustmentLoadContext, state.adjustments);
+  if (persisted !== undefined) scheduleSave(state.selectedImage.path, persisted);
+};
+
+const CROP_GEOMETRY_KEY_SET = new Set<string>(CROP_GEOMETRY_KEYS);
+
+/**
+ * Edits made while the image was still loading survive its authoritative baseline, as they did before camera
+ * defaults existed. Crop geometry is never carried over: it was expressed against the provisional framing.
+ */
+const carryLoadingEdits = (
+  provisional: Adjustments | undefined,
+  current: Adjustments,
+  reconciled: Adjustments,
+): Adjustments | null => {
+  if (!provisional || current === provisional) return null;
+  const carried: Record<string, unknown> = {};
+  for (const key of Object.keys(current)) {
+    if (CROP_GEOMETRY_KEY_SET.has(key) || structurallyEqual(current[key], provisional[key])) continue;
+    carried[key] = clone(current[key]);
+  }
+  return Object.keys(carried).length > 0 ? ({ ...reconciled, ...carried } as Adjustments) : null;
+};
+
+const reseedCropSession = (state: EditorState, path: string | null, adjustments: Adjustments) =>
+  state.cropSessionSnapshot ? { cropSessionSnapshot: { path, geometry: pickCropGeometry(adjustments) } } : {};
+
+const freezeGraph = <T>(value: T): T => {
+  if (value !== null && typeof value === 'object' && !Object.isFrozen(value)) {
+    Object.values(value).forEach((entry) => freezeGraph(entry));
+    Object.freeze(value);
+  }
+  return value;
+};
+
+export const useEditorStore = create<EditorState>((set, get) => ({
   selectedImage: null,
-  adjustments: INITIAL_ADJUSTMENTS,
+  adjustments: emptyAdjustments(),
+  adjustmentLoadContext: null,
+  adjustmentLoadGeneration: 0,
+  adjustmentSessionGeneration: 0,
+  adjustmentReloadSnapshot: null,
   previewOverride: null,
-  history: [INITIAL_ADJUSTMENTS],
-  historyLabels: [''],
-  historyIndex: 0,
+  history: [],
+  historyLabels: [],
+  historyIndex: -1,
 
   finalPreviewUrl: null,
   uncroppedAdjustedPreviewUrl: null,
@@ -196,13 +320,18 @@ export const useEditorStore = create<EditorState>((set) => ({
   wgpuPhase: 'hidden',
   patchesSentToBackend: new Set<string>(),
 
-  setEditor: (updater) => set((state) => (typeof updater === 'function' ? updater(state) : updater)),
+  setEditor: (updater) => {
+    const wasSliderDragging = get().isSliderDragging;
+    set((state) => (typeof updater === 'function' ? updater(state) : updater));
+    if (wasSliderDragging && !get().isSliderDragging) scheduleAdjustmentPersistence(get());
+  },
 
   pushHistory: (newAdj, label) =>
     set((state) => {
+      const previous = state.history[state.historyIndex];
       const newHistory = state.history.slice(0, state.historyIndex + 1);
       const newLabels = state.historyLabels.slice(0, state.historyIndex + 1);
-      newLabels.push(label || describeHistoryChange(state.history[state.historyIndex], newAdj));
+      newLabels.push(label || (previous ? describeHistoryChange(previous, newAdj) : ''));
       newHistory.push(newAdj);
       if (newHistory.length > 50) {
         newHistory.shift();
@@ -211,51 +340,293 @@ export const useEditorStore = create<EditorState>((set) => ({
       return { history: newHistory, historyLabels: newLabels, historyIndex: newHistory.length - 1 };
     }),
 
+  beginAdjustmentLoad: (adjustments, context) => {
+    const state = get();
+    if (!state.selectedImage || state.selectedImage.isReady) return;
+    cancelPendingHistory();
+    const nextAdjustments = clone(adjustments);
+    const generation = state.adjustmentLoadGeneration + 1;
+    const nextContext: GenerationContext = {
+      ...clone(context),
+      dirty: false,
+      reconciled: false,
+      sourceKind: null,
+      [LOAD_GENERATION_KEY]: generation,
+    };
+    set({
+      adjustments: nextAdjustments,
+      adjustmentLoadContext: nextContext,
+      adjustmentLoadGeneration: generation,
+      history: [nextAdjustments],
+      historyLabels: [''],
+      historyIndex: 0,
+    });
+  },
+
+  completeAdjustmentLoad: (adjustments, context, selectedImage, dimensions) => {
+    const current = get();
+    const currentImage = current.selectedImage;
+    if (
+      currentImage?.path !== selectedImage.path ||
+      currentImage.isReady ||
+      !context.reconciled ||
+      context.sourceKind === null ||
+      contextGeneration(context) !== current.adjustmentLoadGeneration
+    ) {
+      return false;
+    }
+
+    cancelPendingHistory();
+    const nextAdjustments = clone(adjustments);
+    let completed = false;
+    let carriedEdits = false;
+    set((state) => {
+      if (
+        state.selectedImage?.path !== selectedImage.path ||
+        state.selectedImage.isReady ||
+        contextGeneration(context) !== state.adjustmentLoadGeneration
+      ) {
+        return {};
+      }
+      completed = true;
+      const baselineContext = { ...clone(context), dirty: false };
+      const carried = carryLoadingEdits(state.history[0], state.adjustments, nextAdjustments);
+      carriedEdits = carried !== null;
+      const nextContext = carried ? markAdjustmentLoadDirty(baselineContext) : baselineContext;
+      const finalAdjustments = carried ?? nextAdjustments;
+      // Display placeholders stay visible until the first render of the reconciled state replaces them.
+      return {
+        adjustments: finalAdjustments,
+        adjustmentLoadContext: nextContext,
+        adjustmentLoadGeneration: state.adjustmentLoadGeneration + 1,
+        adjustmentReloadSnapshot: null,
+        history: carried ? [nextAdjustments, carried] : [nextAdjustments],
+        historyLabels: carried ? ['', describeHistoryChange(nextAdjustments, carried)] : [''],
+        historyIndex: carried ? 1 : 0,
+        originalSize: clone(dimensions.originalSize),
+        selectedImage: {
+          ...state.selectedImage,
+          ...clone(selectedImage),
+          isReady: true,
+          sourceKind: nextContext.sourceKind,
+        },
+        ...reseedCropSession(state, selectedImage.path, finalAdjustments),
+      };
+    });
+    if (carriedEdits) scheduleAdjustmentPersistence(get());
+    return completed;
+  },
+
+  applyExplicitAdjustments: (value, options = {}) => {
+    const state = get();
+    if (value === state.adjustments) return;
+    const { label } = options;
+    if (label) flushPendingHistory();
+    const sessionGeneration = state.adjustmentSessionGeneration;
+    set((current) => ({
+      adjustments: value,
+      adjustmentLoadContext: markExplicitEdit(current.adjustmentLoadContext),
+      ...(current.showOriginal ? { showOriginal: false, previewOverride: null } : {}),
+    }));
+    scheduleAdjustmentPersistence(get());
+    scheduleHistory(value, (entry) => {
+      const active = useEditorStore.getState();
+      if (active.adjustmentSessionGeneration === sessionGeneration) active.pushHistory(entry, label);
+    });
+    if (label) flushPendingHistory();
+  },
+
+  applyAsyncAdjustments: (path, update) => {
+    const state = get();
+    if (state.selectedImage?.path !== path) return;
+    const next = update(state.adjustments);
+    if (next === state.adjustments) return;
+    // A result that changes persisted content is saved like an edit; a pure refresh only re-renders.
+    const changesContent = !structurallyEqual(next, state.adjustments);
+    set((current) => ({
+      adjustments: next,
+      ...(changesContent ? { adjustmentLoadContext: markExplicitEdit(current.adjustmentLoadContext) } : {}),
+    }));
+    if (changesContent) scheduleAdjustmentPersistence(get());
+  },
+
+  beginAdjustmentReload: (path, providedHistory) => {
+    const state = get();
+    if (state.selectedImage?.path !== path || !state.selectedImage.isReady || state.adjustmentReloadSnapshot !== null) {
+      if (state.adjustmentReloadSnapshot) return clone(state.adjustmentReloadSnapshot);
+      return {
+        adjustmentLoadContext: clone(state.adjustmentLoadContext),
+        adjustmentLoadGeneration: state.adjustmentLoadGeneration,
+        adjustmentSessionGeneration: state.adjustmentSessionGeneration,
+        adjustments: clone(state.adjustments),
+        history: clone(state.history),
+        historyLabels: [...state.historyLabels],
+        historyIndex: state.historyIndex,
+        reloadId: 0,
+        selectedImage: clone(state.selectedImage),
+        suspendedHistory: null,
+      };
+    }
+
+    const currentHistory = suspendPendingHistory();
+    const suspendedHistory =
+      currentHistory && (!providedHistory || currentHistory.generation >= providedHistory.generation)
+        ? currentHistory
+        : (providedHistory ?? null);
+    const snapshot: AdjustmentSessionSnapshot = freezeGraph({
+      adjustmentLoadContext: clone(state.adjustmentLoadContext),
+      adjustmentLoadGeneration: state.adjustmentLoadGeneration,
+      adjustmentSessionGeneration: state.adjustmentSessionGeneration,
+      adjustments: clone(state.adjustments),
+      history: clone(state.history),
+      historyLabels: [...state.historyLabels],
+      historyIndex: state.historyIndex,
+      reloadId: ++nextReloadId,
+      selectedImage: clone(state.selectedImage),
+      suspendedHistory,
+    });
+
+    set({
+      adjustmentLoadContext: null,
+      adjustmentLoadGeneration: state.adjustmentLoadGeneration + 1,
+      adjustmentSessionGeneration: state.adjustmentSessionGeneration + 1,
+      adjustmentReloadSnapshot: snapshot,
+      history: [],
+      historyLabels: [],
+      historyIndex: -1,
+      selectedImage: {
+        ...state.selectedImage,
+        isReady: false,
+        sourceKind: null,
+      },
+    });
+    return clone(snapshot);
+  },
+
+  beginImageSelection: (selectedImage, provisionalAdjustments) => {
+    cancelPendingHistory();
+    set((state) => ({
+      adjustments: provisionalAdjustments ? clone(provisionalAdjustments) : emptyAdjustments(),
+      adjustmentLoadContext: null,
+      adjustmentLoadGeneration: state.adjustmentLoadGeneration + 1,
+      adjustmentSessionGeneration: state.adjustmentSessionGeneration + 1,
+      adjustmentReloadSnapshot: null,
+      history: [],
+      historyLabels: [],
+      historyIndex: -1,
+      selectedImage: {
+        ...clone(selectedImage),
+        isReady: false,
+        sourceKind: null,
+      },
+    }));
+  },
+
+  restoreAdjustmentSession: (snapshot) => {
+    const state = get();
+    const activeSnapshot = state.adjustmentReloadSnapshot;
+    if (!activeSnapshot || activeSnapshot.reloadId !== snapshot.reloadId) return;
+    const restoredSessionGeneration =
+      Math.max(state.adjustmentSessionGeneration, activeSnapshot.adjustmentSessionGeneration) + 1;
+    const restoredAdjustments = clone(activeSnapshot.adjustments);
+    set({
+      adjustmentLoadContext: clone(activeSnapshot.adjustmentLoadContext),
+      adjustmentLoadGeneration: Math.max(state.adjustmentLoadGeneration, activeSnapshot.adjustmentLoadGeneration) + 1,
+      adjustmentSessionGeneration: restoredSessionGeneration,
+      adjustmentReloadSnapshot: null,
+      adjustments: restoredAdjustments,
+      history: clone(activeSnapshot.history),
+      historyLabels: [...activeSnapshot.historyLabels],
+      historyIndex: activeSnapshot.historyIndex,
+      selectedImage: clone(activeSnapshot.selectedImage),
+      ...reseedCropSession(state, activeSnapshot.selectedImage?.path ?? null, restoredAdjustments),
+    });
+    restorePendingHistory(activeSnapshot.suspendedHistory, (entry) => {
+      const active = useEditorStore.getState();
+      if (active.adjustmentSessionGeneration === restoredSessionGeneration) active.pushHistory(entry);
+    });
+  },
+
+  clearEditorSession: () => {
+    cancelPendingHistory();
+    set((state) => ({
+      selectedImage: null,
+      adjustments: emptyAdjustments(),
+      adjustmentLoadContext: null,
+      adjustmentLoadGeneration: state.adjustmentLoadGeneration + 1,
+      adjustmentSessionGeneration: state.adjustmentSessionGeneration + 1,
+      adjustmentReloadSnapshot: null,
+      history: [],
+      historyLabels: [],
+      historyIndex: -1,
+      previewOverride: null,
+      finalPreviewUrl: null,
+      uncroppedAdjustedPreviewUrl: null,
+      interactivePatch: null,
+      histogram: null,
+      waveform: null,
+      activeMaskContainerId: null,
+      activeMaskId: null,
+      activeAiPatchContainerId: null,
+      activeAiSubMaskId: null,
+      ...canvasToolState(),
+      activeRelightLightId: null,
+      patchesSentToBackend: new Set<string>(),
+    }));
+  },
+
+  // Undo, redo, and history navigation are explicit user actions: a reconciled load becomes dirty, and the
+  // pending slider snapshot is committed first so it stays reachable through redo.
   undo: () => {
-    debouncedSetHistory.flush();
+    flushPendingHistory();
+    let didChange = false;
     set((state) => {
       if (state.historyIndex > 0) {
+        didChange = true;
         const newIndex = state.historyIndex - 1;
-        return { historyIndex: newIndex, adjustments: state.history[newIndex] };
+        return {
+          historyIndex: newIndex,
+          adjustments: state.history[newIndex],
+          adjustmentLoadContext: markExplicitEdit(state.adjustmentLoadContext),
+        };
       }
-      return state;
+      return {};
     });
+    if (didChange) scheduleAdjustmentPersistence(get());
   },
 
   redo: () => {
-    debouncedSetHistory.flush();
+    flushPendingHistory();
+    let didChange = false;
     set((state) => {
       if (state.historyIndex < state.history.length - 1) {
+        didChange = true;
         const newIndex = state.historyIndex + 1;
-        return { historyIndex: newIndex, adjustments: state.history[newIndex] };
+        return {
+          historyIndex: newIndex,
+          adjustments: state.history[newIndex],
+          adjustmentLoadContext: markExplicitEdit(state.adjustmentLoadContext),
+        };
       }
-      return state;
+      return {};
     });
+    if (didChange) scheduleAdjustmentPersistence(get());
   },
 
-  resetHistory: (initialState) =>
-    set((state) => ({
-      history: [initialState],
-      historyLabels: [''],
-      historyIndex: 0,
-      adjustments: initialState,
-      ...(state.cropSessionSnapshot
-        ? {
-            cropSessionSnapshot: {
-              path: state.selectedImage?.path ?? null,
-              geometry: pickCropGeometry(initialState),
-            },
-          }
-        : {}),
-    })),
-
   goToHistoryIndex: (index) => {
-    debouncedSetHistory.flush();
+    flushPendingHistory();
+    let didChange = false;
     set((state) => {
       if (index >= 0 && index < state.history.length) {
-        return { historyIndex: index, adjustments: state.history[index] };
+        didChange = true;
+        return {
+          historyIndex: index,
+          adjustments: state.history[index],
+          adjustmentLoadContext: markExplicitEdit(state.adjustmentLoadContext),
+        };
       }
-      return state;
+      return {};
     });
+    if (didChange) scheduleAdjustmentPersistence(get());
   },
 }));

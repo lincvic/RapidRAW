@@ -5,7 +5,11 @@ import { useEditorStore } from '../store/useEditorStore';
 import { useLibraryStore } from '../store/useLibraryStore';
 import { useSettingsStore } from '../store/useSettingsStore';
 import { Invokes } from '../components/ui/AppProperties';
-import { INITIAL_ADJUSTMENTS, normalizeLoadedAdjustments } from '../utils/adjustments';
+import type { LoadImageResult, LoadMetadataResult } from '../types/imageLoading';
+import { initializeAdjustmentLoad, reconcileAdjustmentLoad } from '../utils/rafCameraDefaults';
+import { isCurrentEditorSession } from '../utils/asyncNavigation';
+import { flushOrDiscardPendingSave } from '../services/editorPersistence';
+import { EditorImageLoadCancelledError } from '../services/editorImageLoad';
 
 export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const selectedImage = useEditorStore((s) => s.selectedImage);
@@ -16,9 +20,12 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   const uncroppedAdjustedPreviewUrl = useEditorStore((s) => s.uncroppedAdjustedPreviewUrl);
   const originalSize = useEditorStore((s) => s.originalSize);
   const wgpuPhase = useEditorStore((s) => s.wgpuPhase);
+  const adjustmentSessionGeneration = useEditorStore((s) => s.adjustmentSessionGeneration);
 
-  const setEditor = useEditorStore((s) => s.setEditor);
-  const resetHistory = useEditorStore((s) => s.resetHistory);
+  const beginAdjustmentLoad = useEditorStore((s) => s.beginAdjustmentLoad);
+  const completeAdjustmentLoad = useEditorStore((s) => s.completeAdjustmentLoad);
+  const restoreAdjustmentSession = useEditorStore((s) => s.restoreAdjustmentSession);
+  const clearEditorSession = useEditorStore((s) => s.clearEditorSession);
   const setLibrary = useLibraryStore((s) => s.setLibrary);
   const appSettings = useSettingsStore((s) => s.appSettings);
 
@@ -27,75 +34,69 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   useEffect(() => {
     if (selectedImage && !selectedImage.isReady && selectedImage.path) {
       let isEffectActive = true;
+      const path = selectedImage.path;
+      const requestGeneration = adjustmentSessionGeneration;
+      const isCurrentLoad = () =>
+        isCurrentEditorSession(
+          path,
+          requestGeneration,
+          () => {
+            const state = useEditorStore.getState();
+            return { generation: state.adjustmentSessionGeneration, path: state.selectedImage?.path ?? null };
+          },
+          () => isEffectActive,
+        );
 
-      const loadMetadataEarly = async () => {
+      // Metadata first: the camera-default baseline is installed before pixels load, and the image only becomes
+      // ready once load_image reports the authoritative source kind.
+      const loadAll = async () => {
         try {
           useEditorStore.getState().patchesSentToBackend.clear();
-          await invoke('clear_session_caches').catch((e) => console.warn('Cache clear failed:', e));
+          // A queued, in-flight, or reset-held save for this image lands before its sidecar is read.
+          await flushOrDiscardPendingSave(path);
+          if (!isCurrentLoad()) return;
 
-          const metadata: any = await invoke(Invokes.LoadMetadata, { path: selectedImage.path });
-          if (!isEffectActive) return;
+          const metadata = await invoke<LoadMetadataResult>(Invokes.LoadMetadata, { path });
+          if (!isCurrentLoad()) return;
+          const initialized = initializeAdjustmentLoad(metadata);
+          beginAdjustmentLoad(initialized.adjustments, initialized.context);
+          const active = useEditorStore.getState();
+          if (!isCurrentLoad() || !active.adjustmentLoadContext) return;
 
-          let initialAdjusts;
-          if (metadata.adjustments && !metadata.adjustments.is_null) {
-            initialAdjusts = normalizeLoadedAdjustments(metadata.adjustments);
-          } else {
-            initialAdjusts = { ...INITIAL_ADJUSTMENTS };
-          }
+          const image = await invoke<LoadImageResult>(Invokes.LoadImage, { path });
+          if (!isCurrentLoad()) return;
+          const reconciled = reconcileAdjustmentLoad(active.adjustments, active.adjustmentLoadContext, image);
+          const currentImage = useEditorStore.getState().selectedImage;
+          if (!isCurrentLoad() || !currentImage) return;
 
-          setEditor({ adjustments: initialAdjusts });
-          resetHistory(initialAdjusts);
+          completeAdjustmentLoad(
+            reconciled.adjustments,
+            reconciled.context,
+            {
+              ...currentImage,
+              asShotWhiteBalance: image.as_shot_white_balance,
+              exif: image.exif,
+              height: image.height,
+              isRaw: image.is_raw,
+              metadata: image.metadata,
+              sourceKind: image.source_kind,
+              width: image.width,
+            },
+            { originalSize: { width: image.width, height: image.height } },
+          );
+          if (isCurrentLoad()) setLibrary({ isViewLoading: false });
         } catch (err) {
-          console.error('Failed to load metadata early:', err);
+          if (err instanceof EditorImageLoadCancelledError || !isCurrentLoad()) return;
+          console.error('Failed to load image:', err);
+          toast.error(`Failed to load image: ${err}`);
+          setLibrary({ isViewLoading: false });
+          const reloadSnapshot = useEditorStore.getState().adjustmentReloadSnapshot;
+          if (reloadSnapshot) restoreAdjustmentSession(reloadSnapshot);
+          else clearEditorSession();
         }
       };
 
-      const loadFullImageData = async () => {
-        try {
-          const loadImageResult: any = await invoke(Invokes.LoadImage, { path: selectedImage.path });
-          if (!isEffectActive) return;
-
-          const { width, height } = loadImageResult;
-          setEditor({ originalSize: { width, height } });
-
-          setEditor((state) => {
-            if (state.selectedImage && state.selectedImage.path === selectedImage.path) {
-              return {
-                selectedImage: {
-                  ...state.selectedImage,
-                  asShotWhiteBalance: loadImageResult.as_shot_white_balance,
-                  exif: loadImageResult.exif,
-                  height: loadImageResult.height,
-                  isRaw: loadImageResult.is_raw,
-                  isReady: true,
-                  metadata: loadImageResult.metadata,
-                  width: loadImageResult.width,
-                },
-              };
-            }
-            return state;
-          });
-        } catch (err) {
-          if (isEffectActive) {
-            console.error('Failed to load image:', err);
-            toast.error(`Failed to load image: ${err}`);
-            setEditor({ selectedImage: null });
-          }
-        } finally {
-          if (isEffectActive) {
-            setLibrary({ isViewLoading: false });
-          }
-        }
-      };
-
-      const loadAll = async () => {
-        await loadMetadataEarly();
-        if (isEffectActive) {
-          await loadFullImageData();
-        }
-      };
-
-      loadAll();
+      void loadAll();
 
       return () => {
         isEffectActive = false;
@@ -104,8 +105,11 @@ export function useImageLoader(cachedEditStateRef: React.RefObject<any>) {
   }, [
     selectedImage?.path,
     selectedImage?.isReady,
-    resetHistory,
-    setEditor,
+    adjustmentSessionGeneration,
+    beginAdjustmentLoad,
+    completeAdjustmentLoad,
+    restoreAdjustmentSession,
+    clearEditorSession,
     setLibrary,
   ]);
 

@@ -730,9 +730,22 @@ export type CropGeometry = Pick<Adjustments, (typeof CROP_GEOMETRY_KEYS)[number]
 export const pickCropGeometry = (adjustments: Adjustments): CropGeometry =>
   Object.fromEntries(CROP_GEOMETRY_KEYS.map((key) => [key, structuredClone(adjustments[key])])) as CropGeometry;
 
-export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any => {
+const deepCloneAdjustmentValue = <T>(value: T): T => {
+  if (Array.isArray(value)) {
+    return value.map((item) => deepCloneAdjustmentValue(item)) as T;
+  }
+
+  if (value !== null && typeof value === 'object') {
+    return Object.fromEntries(Object.entries(value).map(([key, item]) => [key, deepCloneAdjustmentValue(item)])) as T;
+  }
+
+  return value;
+};
+
+// Always returns an independent tree, so loaded state never aliases INITIAL_ADJUSTMENTS or the transport value.
+export const normalizeLoadedAdjustments = (loadedAdjustments: Partial<Adjustments> | null | undefined): Adjustments => {
   if (!loadedAdjustments) {
-    return INITIAL_ADJUSTMENTS;
+    return deepCloneAdjustmentValue(INITIAL_ADJUSTMENTS);
   }
 
   const normalizeSubMasks = (subMasks: any[]) => {
@@ -784,7 +797,7 @@ export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any 
     subMasks: normalizeSubMasks(patch.subMasks),
   }));
 
-  return {
+  return deepCloneAdjustmentValue({
     ...INITIAL_ADJUSTMENTS,
     ...loadedAdjustments,
     guidedPerspective: {
@@ -878,7 +891,7 @@ export const normalizeLoadedAdjustments = (loadedAdjustments: Adjustments): any 
     activeTools: getActiveTools(loadedAdjustments),
     sectionVisibility: undefined,
     sharpnessThreshold: loadedAdjustments.sharpnessThreshold ?? INITIAL_ADJUSTMENTS.sharpnessThreshold,
-  };
+  } as Adjustments);
 };
 
 export const MONOCHROME_ADJUSTMENT_KEYS = [

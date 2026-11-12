@@ -763,6 +763,12 @@
     },
     "externalEdit": {
       "done": "Hotovo",
+      "errors": {
+        "cancelFailed": "Předchozí export externích úprav se nepodařilo zrušit.",
+        "notReady": "Zdroj externích úprav není připraven.",
+        "openFailed": "Zdroj externích úprav se nepodařilo otevřít.",
+        "saveFailed": "Změny se před ukončením nepodařilo uložit."
+      },
       "exporting": "Exportování…",
       "savesTo": "Externí úpravy — ukládá do"
     },
@@ -980,6 +986,9 @@
         "style": "Styl",
         "tool": "Nástroj"
       }
+    },
+    "saveErrors": {
+      "discarded": "Změny v {{name}} se nepodařilo uložit a byly zahozeny: {{error}}"
     },
     "speedEdit": {
       "copied": "Zkopírováno: <0>{{label}}</0> <1>{{value}}</1>",

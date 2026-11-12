@@ -712,6 +712,12 @@
     },
     "externalEdit": {
       "done": "完成",
+      "errors": {
+        "cancelFailed": "無法取消上一次外部編輯匯出。",
+        "notReady": "外部編輯的來源影像尚未就緒。",
+        "openFailed": "無法開啟外部編輯的來源影像。",
+        "saveFailed": "結束前無法儲存變更。"
+      },
       "exporting": "正在匯出…",
       "savesTo": "外部編輯 — 儲存至"
     },
@@ -927,6 +933,9 @@
         "style": "風格",
         "tool": "工具"
       }
+    },
+    "saveErrors": {
+      "discarded": "無法儲存對 {{name}} 的變更，已捨棄這些變更：{{error}}"
     },
     "speedEdit": {
       "copied": "已複製 <0>{{label}}</0> <1>{{value}}</1>",

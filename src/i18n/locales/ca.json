@@ -739,6 +739,12 @@
     },
     "externalEdit": {
       "done": "Fet",
+      "errors": {
+        "cancelFailed": "No s'ha pogut cancel·lar l'exportació anterior de l'edició externa.",
+        "notReady": "L'origen de l'edició externa no està a punt.",
+        "openFailed": "No s'ha pogut obrir l'origen de l'edició externa.",
+        "saveFailed": "No s'han pogut desar els canvis abans de sortir."
+      },
       "exporting": "S'està exportant…",
       "savesTo": "Edició externa — es desa a"
     },
@@ -955,6 +961,9 @@
         "style": "Estil",
         "tool": "Eina"
       }
+    },
+    "saveErrors": {
+      "discarded": "No s'han pogut desar els canvis a {{name}} i s'han descartat: {{error}}"
     },
     "speedEdit": {
       "copied": "<0>{{label}}</0> <1>{{value}}</1> copiat",

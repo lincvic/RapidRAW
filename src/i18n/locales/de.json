@@ -715,6 +715,12 @@
     },
     "externalEdit": {
       "done": "Fertig",
+      "errors": {
+        "cancelFailed": "Der vorherige Export der externen Bearbeitung konnte nicht abgebrochen werden.",
+        "notReady": "Die Quelle der externen Bearbeitung ist nicht bereit.",
+        "openFailed": "Die Quelle der externen Bearbeitung konnte nicht geöffnet werden.",
+        "saveFailed": "Änderungen konnten vor dem Beenden nicht gespeichert werden."
+      },
       "exporting": "Exportieren…",
       "savesTo": "Externe Bearbeitung — speichert in"
     },
@@ -930,6 +936,9 @@
         "style": "Stil",
         "tool": "Werkzeug"
       }
+    },
+    "saveErrors": {
+      "discarded": "Änderungen an {{name}} konnten nicht gespeichert werden und wurden verworfen: {{error}}"
     },
     "speedEdit": {
       "copied": "<0>{{label}}</0> <1>{{value}}</1> kopiert",

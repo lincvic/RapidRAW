@@ -715,6 +715,12 @@
     },
     "externalEdit": {
       "done": "Gereed",
+      "errors": {
+        "cancelFailed": "Kan de vorige export van de externe bewerking niet annuleren.",
+        "notReady": "De bron van de externe bewerking is niet gereed.",
+        "openFailed": "Kan de bron van de externe bewerking niet openen.",
+        "saveFailed": "Kan wijzigingen niet opslaan voor het afsluiten."
+      },
       "exporting": "Exporteren…",
       "savesTo": "Externe bewerking — slaat op naar"
     },
@@ -930,6 +936,9 @@
         "style": "Stijl",
         "tool": "Gereedschap"
       }
+    },
+    "saveErrors": {
+      "discarded": "Wijzigingen in {{name}} konden niet worden opgeslagen en zijn verworpen: {{error}}"
     },
     "speedEdit": {
       "copied": "<0>{{label}}</0> <1>{{value}}</1> gekopieerd",

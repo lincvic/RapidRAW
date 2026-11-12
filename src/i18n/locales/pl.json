@@ -763,6 +763,12 @@
     },
     "externalEdit": {
       "done": "Gotowe",
+      "errors": {
+        "cancelFailed": "Nie udało się anulować poprzedniego eksportu zewnętrznej edycji.",
+        "notReady": "Źródło zewnętrznej edycji nie jest gotowe.",
+        "openFailed": "Nie udało się otworzyć źródła zewnętrznej edycji.",
+        "saveFailed": "Nie udało się zapisać zmian przed zamknięciem."
+      },
       "exporting": "Eksportowanie…",
       "savesTo": "Zewnętrzna edycja — zapisuje do"
     },
@@ -980,6 +986,9 @@
         "style": "Styl",
         "tool": "Narzędzie"
       }
+    },
+    "saveErrors": {
+      "discarded": "Nie udało się zapisać zmian w {{name}}; zmiany zostały odrzucone: {{error}}"
     },
     "speedEdit": {
       "copied": "Skopiowano: <0>{{label}}</0> <1>{{value}}</1>",

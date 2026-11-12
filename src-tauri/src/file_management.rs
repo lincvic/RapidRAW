@@ -31,6 +31,7 @@ use crate::android_integration::*;
 use crate::app_settings::*;
 use crate::as_shot::as_shot;
 use crate::baseline_exposure::BaselineOptions;
+use crate::camera_defaults::ImageSourceKind;
 use crate::exif_processing;
 use crate::formats::{is_raw_file, is_supported_image_file};
 use crate::gpu_processing;
@@ -38,7 +39,7 @@ use crate::image_loader;
 use crate::image_processing::GpuContext;
 use crate::image_processing::{
     AutoAdjustMode, Crop, ImageFlag, ImageMetadata, apply_coarse_rotation,
-    apply_cpu_default_raw_processing, apply_exposure, auto_results_to_json, default_adjustments,
+    apply_cpu_default_raw_processing, apply_exposure, auto_results_to_json,
     effective_baseline_exposure, get_all_adjustments_from_json, perform_auto_analysis,
     resolve_render_options,
 };
@@ -93,7 +94,26 @@ fn compute_thumbnail_cache_hash(
     hasher.update(&img_mod_time.to_le_bytes());
     hasher.update(adjustments_bytes);
     hasher.update(render_key.as_bytes());
+    if is_unedited_raf(&source_path, adjustments_bytes) {
+        hasher.update(CAMERA_FRAMING_THUMBNAIL_SALT);
+    }
     Some(hasher.finalize().to_hex().to_string())
+}
+
+/// Invalidates unedited RAF thumbnails cached before camera framing existed.
+///
+/// Unedited thumbnails decoded from RAW pixels, which happens when the setting
+/// asks for it or the embedded preview is too small, are now framed like the
+/// camera JPEG. Thumbnails from large embedded previews already were, so they
+/// simply regenerate once.
+const CAMERA_FRAMING_THUMBNAIL_SALT: &[u8] = b"raf-camera-framing-v1";
+
+fn is_unedited_raf(source_path: &Path, adjustments_bytes: &[u8]) -> bool {
+    let unedited = adjustments_bytes.is_empty() || adjustments_bytes == b"null";
+    unedited
+        && source_path
+            .extension()
+            .is_some_and(|extension| extension.eq_ignore_ascii_case("raf"))
 }
 
 struct ImageFileMetadata {
@@ -1612,10 +1632,30 @@ fn try_load_embedded_raw_preview(source_path: &Path, target_res: u32) -> Option<
     }
 }
 
+/// An already decoded base image, with the source that produced its pixels.
+#[derive(Clone, Copy)]
+pub struct PreloadedImage<'a> {
+    pub image: &'a DynamicImage,
+    pub source_kind: ImageSourceKind,
+    /// Developed size relative to full resolution, the space persisted crops
+    /// use: 1.0 for full decodes, the demosaic factor for fast RAW decodes.
+    pub resolution_scale: f32,
+}
+
+impl<'a> PreloadedImage<'a> {
+    pub fn full_resolution(image: &'a DynamicImage, source_kind: ImageSourceKind) -> Self {
+        Self {
+            image,
+            source_kind,
+            resolution_scale: 1.0,
+        }
+    }
+}
+
 pub fn generate_thumbnail_data(
     path_str: &str,
     gpu_context: Option<&GpuContext>,
-    preloaded_image: Option<&DynamicImage>,
+    preloaded: Option<PreloadedImage<'_>>,
     app_handle: &AppHandle,
 ) -> anyhow::Result<DynamicImage> {
     let metadata = read_thumbnail_metadata(path_str, app_handle);
@@ -1623,7 +1663,7 @@ pub fn generate_thumbnail_data(
     generate_thumbnail_data_with_metadata(
         path_str,
         gpu_context,
-        preloaded_image,
+        preloaded,
         app_handle,
         metadata.as_ref(),
         &settings,
@@ -1650,11 +1690,13 @@ fn read_thumbnail_metadata(path_str: &str, app_handle: &AppHandle) -> Option<Ima
 fn generate_thumbnail_data_with_metadata(
     path_str: &str,
     gpu_context: Option<&GpuContext>,
-    preloaded_image: Option<&DynamicImage>,
+    preloaded: Option<PreloadedImage<'_>>,
     app_handle: &AppHandle,
     metadata: Option<&ImageMetadata>,
     settings: &AppSettings,
 ) -> anyhow::Result<DynamicImage> {
+    let preloaded_image = preloaded.map(|preloaded| preloaded.image);
+    let preloaded_scale = preloaded.map_or(1.0, |preloaded| preloaded.resolution_scale);
     let (source_path, _) = parse_virtual_path(path_str);
     let source_path_str = source_path.to_string_lossy().to_string();
     let is_raw = is_raw_file(&source_path_str);
@@ -1732,13 +1774,15 @@ fn generate_thumbnail_data_with_metadata(
             let _decode_reservation;
             let composite_image: Cow<DynamicImage> = if let Some(patched) = &cached_patched {
                 if let Some(img) = preloaded_image {
-                    raw_scale_factor = crate::ai_upscale::scale_between(img, patched);
+                    raw_scale_factor =
+                        crate::ai_upscale::scale_between(img, patched) * preloaded_scale;
                 }
                 Cow::Borrowed(patched)
             } else if let Some(img) = preloaded_image {
                 let prepared =
                     image_loader::prepare_base_image_cow(img, &source_path_str, adjustments)?;
-                raw_scale_factor = crate::ai_upscale::scale_between(img, &prepared);
+                raw_scale_factor =
+                    crate::ai_upscale::scale_between(img, &prepared) * preloaded_scale;
                 prepared
             } else {
                 let mmap_guard;
@@ -1933,6 +1977,7 @@ fn generate_thumbnail_data_with_metadata(
     }
 
     let _decode_reservation;
+    let mut source_kind = preloaded.map(|preloaded| preloaded.source_kind);
     let mut final_image: Cow<DynamicImage> = if let Some(patched) = &cached_patched {
         Cow::Borrowed(patched)
     } else if let Some(img) = preloaded_image {
@@ -1960,18 +2005,24 @@ fn generate_thumbnail_data_with_metadata(
         if adjustments.is_null() {
             crate::as_shot::as_shot_from_bytes(&source_path_str, file_slice);
         }
-        Cow::Owned(
-            image_loader::load_and_composite(
-                file_slice,
-                &source_path_str,
-                adjustments,
-                true,
-                settings,
-                None,
-            )?
-            .0,
-        )
+        let (image, _, loaded_kind) = image_loader::load_and_composite_with_source(
+            file_slice,
+            &source_path_str,
+            adjustments,
+            true,
+            settings,
+            None,
+        )?;
+        source_kind = Some(loaded_kind);
+        Cow::Owned(image)
     };
+
+    if adjustments.is_null()
+        && let Some(source_kind) = source_kind
+        && let Some(framed) = camera_framed_thumbnail(&source_path, &final_image, source_kind)
+    {
+        final_image = Cow::Owned(framed);
+    }
 
     if adjustments.is_null() {
         let render = resolve_render_options(settings, is_raw);
@@ -1996,6 +2047,26 @@ fn generate_thumbnail_data_with_metadata(
     Ok(apply_coarse_rotation(final_image, fallback_orientation_steps).into_owned())
 }
 
+/// Crops an unedited RAW thumbnail to its camera framing.
+///
+/// Unedited thumbnails skip the adjustment pipeline, so the camera crop is
+/// applied directly in the decoded image's own coordinates.
+pub(crate) fn camera_framed_thumbnail(
+    source_path: &Path,
+    image: &DynamicImage,
+    source_kind: ImageSourceKind,
+) -> Option<DynamicImage> {
+    if source_kind != ImageSourceKind::DevelopedRaw || !is_raw_file(source_path) {
+        return None;
+    }
+    let defaults = crate::camera_defaults::camera_defaults_for_path(source_path);
+    let crop =
+        crate::camera_defaults::scaled_camera_crop(&defaults, image.width(), image.height())?;
+    let (x, y, width, height) =
+        crate::image_processing::crop_rect(&crop, (image.width(), image.height()))?;
+    Some(image.crop_imm(x, y, width, height))
+}
+
 fn encode_thumbnail(image: &DynamicImage, target_width: u32) -> Result<Vec<u8>> {
     let downscaled =
         crate::image_processing::downscale_f32_image_if_needed(image, target_width, target_width);
@@ -2014,7 +2085,7 @@ fn generate_single_thumbnail_and_cache(
     path_str: &str,
     thumb_cache_dir: &Path,
     gpu_context: Option<&GpuContext>,
-    preloaded_image: Option<&DynamicImage>,
+    preloaded_image: Option<PreloadedImage<'_>>,
     force_regenerate: bool,
     app_handle: &AppHandle,
     settings: &AppSettings,
@@ -2750,7 +2821,7 @@ pub fn save_metadata_and_update_thumbnail(
     let loaded_image_lock = state.original_image.lock().unwrap();
     let preloaded_image_option = if let Some(loaded_image) = loaded_image_lock.as_ref() {
         if loaded_image.path == path {
-            Some(loaded_image.image.clone())
+            Some((loaded_image.image.clone(), loaded_image.source_kind))
         } else {
             None
         }
@@ -2787,7 +2858,9 @@ pub fn save_metadata_and_update_thumbnail(
             &path_clone,
             &thumb_cache_dir,
             gpu_context.as_ref(),
-            preloaded_image_option.as_deref(),
+            preloaded_image_option
+                .as_ref()
+                .map(|(image, kind)| PreloadedImage::full_resolution(image, *kind)),
             true,
             &app_handle_clone,
             &settings,
@@ -2831,7 +2904,8 @@ pub async fn apply_adjustments_to_paths(
             crate::exif_processing::fill_missing_exif(metadata, source_path);
 
             if metadata.adjustments.is_null() {
-                metadata.adjustments = default_adjustments();
+                metadata.adjustments =
+                    crate::camera_defaults::first_edit_adjustments_for_path(source_path);
             }
 
             let mut pasted = adjustments.clone();
@@ -2871,18 +2945,137 @@ pub async fn apply_adjustments_to_paths(
     .map_err(|e| e.to_string())
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ResetAdjustmentsErrorKind {
+    Write,
+    Join,
+}
+
+/// Rejection payload of [`reset_adjustments_for_paths`].
+#[derive(Clone, Debug, PartialEq, Eq, Serialize)]
+pub struct ResetAdjustmentsError {
+    kind: ResetAdjustmentsErrorKind,
+    path: String,
+    message: String,
+    /// Whether every sidecar is back to its state from before the reset.
+    rollback_succeeded: bool,
+}
+
+struct ResetSidecar {
+    path: String,
+    source_path: PathBuf,
+    sidecar_path: PathBuf,
+    metadata: ImageMetadata,
+    snapshot: Option<Vec<u8>>,
+    had_ai_work: bool,
+}
+
+/// Resets adjustments to literal `null` and resolves once every sidecar is
+/// written, so callers can reload the untouched state, including camera
+/// framing defaults. The reset is all-or-nothing: when any sidecar fails, the
+/// ones already written are restored. Thumbnails regenerate in the background.
 #[tauri::command]
 pub async fn reset_adjustments_for_paths(
     paths: Vec<String>,
     app_handle: AppHandle,
-) -> Result<(), String> {
-    tauri::async_runtime::spawn_blocking(move || {
-        update_sidecars_and_thumbnails(paths, app_handle, |_, _, metadata| {
-            metadata.adjustments = default_adjustments();
-        });
-    });
+) -> Result<(), ResetAdjustmentsError> {
+    let reset_paths = paths.clone();
+    let reset_app_handle = app_handle.clone();
+    tauri::async_runtime::spawn_blocking(move || reset_sidecars(&reset_paths, &reset_app_handle))
+        .await
+        .map_err(|error| ResetAdjustmentsError {
+            kind: ResetAdjustmentsErrorKind::Join,
+            path: String::new(),
+            message: format!("Reset adjustments task failed: {error}"),
+            rollback_succeeded: false,
+        })??;
 
+    let state = app_handle.state::<AppState>();
+    add_to_thumbnail_queue(&state, paths.len(), &app_handle);
+    let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    tauri::async_runtime::spawn_blocking(move || {
+        regenerate_thumbnails(paths.into_iter(), &app_handle, &settings, false);
+    });
     Ok(())
+}
+
+fn reset_sidecars(paths: &[String], app_handle: &AppHandle) -> Result<(), ResetAdjustmentsError> {
+    let results: Vec<Result<ResetSidecar, ResetAdjustmentsError>> = paths
+        .par_iter()
+        .map(|path| {
+            let (source_path, sidecar_path) = parse_virtual_path(path);
+            let mut had_ai_work = false;
+            crate::exif_processing::update_sidecar_with_snapshot(
+                &sidecar_path,
+                &source_path,
+                |metadata| {
+                    had_ai_work =
+                        crate::ai_jobs::needs_generation(&metadata.adjustments, &source_path);
+                    metadata.adjustments = Value::Null;
+                },
+            )
+            .map(|(metadata, snapshot)| ResetSidecar {
+                path: path.clone(),
+                source_path: source_path.clone(),
+                sidecar_path: sidecar_path.clone(),
+                metadata,
+                snapshot,
+                had_ai_work,
+            })
+            .map_err(|error| ResetAdjustmentsError {
+                kind: ResetAdjustmentsErrorKind::Write,
+                path: sidecar_path.to_string_lossy().into_owned(),
+                message: format!("Failed to reset adjustments for '{path}': {error}"),
+                rollback_succeeded: false,
+            })
+        })
+        .collect();
+
+    let (reset, failures): (Vec<_>, Vec<_>) = results.into_iter().partition(Result::is_ok);
+    let reset: Vec<ResetSidecar> = reset.into_iter().filter_map(Result::ok).collect();
+    if let Some(Err(mut error)) = failures.into_iter().next() {
+        error.rollback_succeeded = rollback_reset_sidecars(&reset);
+        return Err(error);
+    }
+
+    let settings = load_settings(app_handle.clone()).unwrap_or_default();
+    if settings.enable_xmp_sync.unwrap_or(false) {
+        let create_xmp_if_missing = settings.create_xmp_if_missing.unwrap_or(false);
+        for sidecar in &reset {
+            sync_metadata_to_xmp(
+                &sidecar.source_path,
+                &sidecar.sidecar_path,
+                &sidecar.metadata,
+                create_xmp_if_missing,
+            );
+        }
+    }
+    let resolved_ai: Vec<String> = reset
+        .iter()
+        .filter(|sidecar| sidecar.had_ai_work)
+        .map(|sidecar| sidecar.path.clone())
+        .collect();
+    crate::ai_jobs::resolve(app_handle, &resolved_ai);
+    Ok(())
+}
+
+/// Restores every reset sidecar, returning whether all restores succeeded.
+fn rollback_reset_sidecars(reset: &[ResetSidecar]) -> bool {
+    reset.iter().fold(true, |all_restored, sidecar| {
+        let restored = crate::exif_processing::restore_sidecar(
+            &sidecar.sidecar_path,
+            sidecar.snapshot.as_deref(),
+        )
+        .map_err(|error| {
+            log::error!(
+                "Failed to roll back reset sidecar '{}': {error}",
+                sidecar.sidecar_path.display()
+            )
+        })
+        .is_ok();
+        restored && all_restored
+    })
 }
 
 fn update_sidecars_and_thumbnails(
@@ -3029,7 +3222,8 @@ pub async fn apply_auto_lens_correction_to_paths(
             crate::exif_processing::fill_missing_exif(metadata, source_path);
 
             if metadata.adjustments.is_null() {
-                metadata.adjustments = default_adjustments();
+                metadata.adjustments =
+                    crate::camera_defaults::first_edit_adjustments_for_path(source_path);
             }
 
             if let Some(obj) = metadata.adjustments.as_object_mut() {
@@ -3079,55 +3273,82 @@ async fn update_sidecars_from_images(
         let gpu_context = gpu_processing::get_or_init_gpu_context(&state, &app_handle).ok();
 
         let process = |path: &String| {
-            let loaded_image: Option<DynamicImage> = (|| -> Result<DynamicImage, String> {
-                let (source_path, sidecar_path) = parse_virtual_path(path);
-                let source_path_str = source_path.to_string_lossy().to_string();
+            let loaded_image: Option<(image_loader::LoadedBaseImage, f32)> =
+                (|| -> Result<(image_loader::LoadedBaseImage, f32), String> {
+                    let (source_path, sidecar_path) = parse_virtual_path(path);
+                    let source_path_str = source_path.to_string_lossy().to_string();
 
-                let file_bytes = read_file_mapped(&source_path).map_err(|e| e.to_string())?;
-                let image = image_loader::load_base_image_from_bytes(
-                    &file_bytes,
-                    &source_path_str,
-                    fast_decode,
-                    &settings,
-                    None,
-                )
-                .map_err(|e| e.to_string())?;
+                    let file_bytes = read_file_mapped(&source_path).map_err(|e| e.to_string())?;
+                    let loaded = image_loader::load_base_image_with_source_from_bytes(
+                        &file_bytes,
+                        &source_path_str,
+                        fast_decode,
+                        &settings,
+                        None,
+                    )
+                    .map_err(|e| e.to_string())?;
+                    let resolution_scale =
+                        if fast_decode && loaded.source_kind == ImageSourceKind::DevelopedRaw {
+                            crate::raw_processing::get_fast_demosaic_scale_factor(
+                                &file_bytes,
+                                loaded.image.width(),
+                                loaded.image.height(),
+                            )
+                        } else {
+                            1.0
+                        };
 
-                let updated_metadata = crate::exif_processing::update_sidecar(
-                    &sidecar_path,
-                    &source_path,
-                    |metadata| {
-                        if metadata.adjustments.is_null() {
-                            metadata.adjustments = default_adjustments();
-                        }
-                        update(
-                            &image,
-                            &source_path_str,
-                            &settings,
-                            &mut metadata.adjustments,
-                        );
-                    },
-                )
-                .map_err(|e| e.to_string())?;
-
-                if enable_xmp_sync {
-                    sync_metadata_to_xmp(
-                        &source_path,
+                    let updated_metadata = crate::exif_processing::update_sidecar(
                         &sidecar_path,
-                        &updated_metadata,
-                        create_xmp_if_missing,
-                    );
-                }
-                Ok(image)
-            })()
-            .map_err(|e| eprintln!("Failed to apply {} to {}: {}", operation, path, e))
-            .ok();
+                        &source_path,
+                        |metadata| {
+                            if metadata.adjustments.is_null() {
+                                metadata.adjustments =
+                                    crate::camera_defaults::first_edit_adjustments(
+                                        &source_path,
+                                        loaded.source_kind,
+                                        || {
+                                            crate::camera_defaults::camera_defaults_for_bytes(
+                                                &file_bytes,
+                                                &source_path,
+                                            )
+                                        },
+                                    );
+                            }
+                            update(
+                                &loaded.image,
+                                &source_path_str,
+                                &settings,
+                                &mut metadata.adjustments,
+                            );
+                        },
+                    )
+                    .map_err(|e| e.to_string())?;
+
+                    if enable_xmp_sync {
+                        sync_metadata_to_xmp(
+                            &source_path,
+                            &sidecar_path,
+                            &updated_metadata,
+                            create_xmp_if_missing,
+                        );
+                    }
+                    Ok((loaded, resolution_scale))
+                })()
+                .map_err(|e| eprintln!("Failed to apply {} to {}: {}", operation, path, e))
+                .ok();
 
             let result = generate_single_thumbnail_and_cache(
                 path,
                 &thumb_cache_dir,
                 gpu_context.as_ref(),
-                loaded_image.as_ref(),
+                loaded_image
+                    .as_ref()
+                    .map(|(loaded, resolution_scale)| PreloadedImage {
+                        image: &loaded.image,
+                        source_kind: loaded.source_kind,
+                        resolution_scale: *resolution_scale,
+                    }),
                 true,
                 &app_handle,
                 &settings,
@@ -3308,7 +3529,10 @@ pub fn set_flag_for_paths(
 }
 
 #[tauri::command]
-pub async fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageMetadata, String> {
+pub async fn load_metadata(
+    path: String,
+    app_handle: AppHandle,
+) -> Result<crate::camera_defaults::LoadMetadataResult, String> {
     let (source_path, _) = parse_virtual_path(&path);
     crate::immich::fetch_edits(&app_handle, &source_path).await;
 
@@ -3337,7 +3561,7 @@ pub async fn load_metadata(path: String, app_handle: AppHandle) -> Result<ImageM
             );
         }
 
-        metadata
+        crate::camera_defaults::metadata_result_for_path(metadata, &source_path)
     })
     .await
     .map_err(|e| format!("Task failed: {}", e))
@@ -4526,7 +4750,8 @@ pub fn sync_metadata_from_xmp(
         {
             metadata.rating = rating;
             if !metadata.adjustments.is_object() {
-                metadata.adjustments = default_adjustments();
+                metadata.adjustments =
+                    crate::camera_defaults::first_edit_adjustments_for_path(source_path);
             }
             if let Some(obj) = metadata.adjustments.as_object_mut() {
                 obj.insert("rating".to_string(), serde_json::json!(rating));
@@ -4676,5 +4901,111 @@ pub fn sync_metadata_to_xmp(
         }
 
         let _ = fs::write(&xmp_file, content);
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    #[test]
+    fn only_unedited_raf_thumbnails_change_cache_keys() {
+        let raf = Path::new("/photos/DSCF0001.RAF");
+        assert!(is_unedited_raf(raf, b"null"));
+        assert!(is_unedited_raf(raf, b""));
+        assert!(is_unedited_raf(Path::new("/photos/dscf0001.raf"), b"null"));
+
+        assert!(!is_unedited_raf(raf, b"{}"));
+        assert!(!is_unedited_raf(raf, b"{\"crop\":null}"));
+        assert!(!is_unedited_raf(Path::new("/photos/IMG_0001.CR3"), b"null"));
+    }
+
+    #[test]
+    fn first_edits_of_files_without_camera_framing_use_upstream_defaults() {
+        let dir = tempfile::tempdir().unwrap();
+        let unreadable_raf = dir.path().join("DSCF0001.RAF");
+        fs::write(&unreadable_raf, b"not a raf").unwrap();
+        let missing_raf = dir.path().join("missing.RAF");
+        for path in [
+            unreadable_raf.as_path(),
+            missing_raf.as_path(),
+            Path::new("/photos/photo.jpg"),
+        ] {
+            assert_eq!(
+                crate::camera_defaults::first_edit_adjustments_for_path(path),
+                crate::image_processing::default_adjustments(),
+                "{}",
+                path.display()
+            );
+        }
+    }
+
+    fn reset_entry(sidecar_path: PathBuf, snapshot: Option<Vec<u8>>) -> ResetSidecar {
+        ResetSidecar {
+            path: sidecar_path.to_string_lossy().into_owned(),
+            source_path: sidecar_path.with_extension(""),
+            sidecar_path,
+            metadata: ImageMetadata::default(),
+            snapshot,
+            had_ai_work: false,
+        }
+    }
+
+    #[test]
+    fn failed_resets_restore_every_written_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let existing = dir.path().join("a.jpg.rrdata");
+        let created = dir.path().join("b.jpg.rrdata");
+        fs::write(&existing, b"{\"adjustments\":null}").unwrap();
+        fs::write(&created, b"{\"adjustments\":null}").unwrap();
+
+        let reset = [
+            reset_entry(existing.clone(), Some(b"{\"rating\":4}".to_vec())),
+            reset_entry(created.clone(), None),
+        ];
+        assert!(rollback_reset_sidecars(&reset));
+        assert_eq!(fs::read(&existing).unwrap(), b"{\"rating\":4}");
+        assert!(!created.exists());
+    }
+
+    #[test]
+    fn rollback_reports_failures_but_still_restores_the_rest() {
+        let dir = tempfile::tempdir().unwrap();
+        let blocked = dir.path().join("missing-dir").join("a.jpg.rrdata");
+        let restorable = dir.path().join("b.jpg.rrdata");
+        fs::write(&restorable, b"{}").unwrap();
+
+        let reset = [
+            reset_entry(blocked, Some(b"{}".to_vec())),
+            reset_entry(
+                restorable.clone(),
+                Some(json!({"rating": 1}).to_string().into_bytes()),
+            ),
+        ];
+        assert!(!rollback_reset_sidecars(&reset));
+        assert_eq!(
+            fs::read(&restorable).unwrap(),
+            json!({"rating": 1}).to_string().into_bytes()
+        );
+    }
+
+    #[test]
+    fn reset_errors_serialize_as_the_frontend_payload() {
+        let error = ResetAdjustmentsError {
+            kind: ResetAdjustmentsErrorKind::Write,
+            path: "/photos/a.jpg.rrdata".to_string(),
+            message: "disk full".to_string(),
+            rollback_succeeded: true,
+        };
+        assert_eq!(
+            serde_json::to_value(error).unwrap(),
+            json!({
+                "kind": "write",
+                "path": "/photos/a.jpg.rrdata",
+                "message": "disk full",
+                "rollback_succeeded": true,
+            })
+        );
     }
 }

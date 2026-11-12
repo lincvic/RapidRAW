@@ -1,4 +1,5 @@
 use crate::app_settings::AppSettings;
+use crate::camera_defaults::ImageSourceKind;
 use crate::{AppState, PreviewTarget};
 use half::f16;
 use half::slice::HalfFloatSliceExt;
@@ -526,6 +527,7 @@ struct DecodedEntry {
     fingerprint: DecodeFingerprint,
     image: CachedImage,
     exif: HashMap<String, String>,
+    source_kind: ImageSourceKind,
 }
 
 pub struct DecodedImageCache {
@@ -562,7 +564,7 @@ impl DecodedImageCache {
         &mut self,
         path: &str,
         fingerprint: &DecodeFingerprint,
-    ) -> Option<(Arc<DynamicImage>, HashMap<String, String>)> {
+    ) -> Option<(Arc<DynamicImage>, HashMap<String, String>, ImageSourceKind)> {
         let pos = self.items.iter().position(|e| e.path == path)?;
         let entry = self.items.remove(pos);
         if entry.fingerprint != *fingerprint {
@@ -570,11 +572,12 @@ impl DecodedImageCache {
         }
         let image = entry.image.expand();
         let exif = entry.exif.clone();
+        let source_kind = entry.source_kind;
         self.items.push(DecodedEntry {
             image: CachedImage::Full(Arc::clone(&image)),
             ..entry
         });
-        Some((image, exif))
+        Some((image, exif, source_kind))
     }
 
     pub fn promote(&mut self, path: &str) {
@@ -615,6 +618,7 @@ impl DecodedImageCache {
         fingerprint: DecodeFingerprint,
         image: Arc<DynamicImage>,
         exif: HashMap<String, String>,
+        source_kind: ImageSourceKind,
     ) {
         if let Some(pos) = self.items.iter().position(|e| e.path == path) {
             self.items.remove(pos);
@@ -624,6 +628,7 @@ impl DecodedImageCache {
             fingerprint,
             image: CachedImage::Full(image),
             exif,
+            source_kind,
         });
         self.evict();
     }
@@ -810,5 +815,45 @@ pub fn clear_session_caches(state: tauri::State<AppState>) {
     }
     if let Ok(mut uncropped_source_cache) = state.uncropped_source_cache.lock() {
         uncropped_source_cache.clear();
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn fingerprint() -> DecodeFingerprint {
+        DecodeFingerprint {
+            len: 1,
+            modified: None,
+            settings_hash: 0,
+        }
+    }
+
+    #[test]
+    fn decoded_cache_hits_return_the_stored_source_kind() {
+        let mut cache = DecodedImageCache::new(4);
+        for (path, kind) in [
+            ("a.RAF", ImageSourceKind::DevelopedRaw),
+            ("b.RAF", ImageSourceKind::EmbeddedPreview),
+            ("c.jpg", ImageSourceKind::NonRaw),
+        ] {
+            cache.insert(
+                path.to_string(),
+                fingerprint(),
+                Arc::new(DynamicImage::new_rgb32f(2, 2)),
+                HashMap::new(),
+                kind,
+            );
+        }
+
+        for (path, kind) in [
+            ("a.RAF", ImageSourceKind::DevelopedRaw),
+            ("b.RAF", ImageSourceKind::EmbeddedPreview),
+            ("c.jpg", ImageSourceKind::NonRaw),
+        ] {
+            let (_, _, cached_kind) = cache.get(path, &fingerprint()).unwrap();
+            assert_eq!(cached_kind, kind, "{path}");
+        }
     }
 }

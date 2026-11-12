@@ -3,6 +3,7 @@ use crate::app_settings::{AppSettings, load_settings};
 use crate::app_state::{AppState, LoadedImage, PreviewTarget};
 use crate::baseline_exposure::BaselineOptions;
 use crate::cache_utils::{DecodeFingerprint, FlightRole, clear_preview_slot};
+use crate::camera_defaults::ImageSourceKind;
 use crate::exif_processing;
 use crate::file_management::{parse_virtual_path, read_file_mapped};
 use crate::formats::is_raw_file;
@@ -44,6 +45,14 @@ pub struct LoadImageResult {
     pub exif: HashMap<String, String>,
     pub is_raw: bool,
     pub as_shot_white_balance: WhiteBalance,
+    pub source_kind: ImageSourceKind,
+}
+
+/// A decoded base image together with the source that produced its pixels.
+#[derive(Clone)]
+pub struct LoadedBaseImage {
+    pub image: DynamicImage,
+    pub source_kind: ImageSourceKind,
 }
 
 #[derive(Deserialize)]
@@ -81,8 +90,36 @@ pub fn load_and_composite(
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<(DynamicImage, f32)> {
-    let base_image =
-        load_base_image_from_bytes(base_image, path, use_fast_raw_dev, settings, cancel_token)?;
+    load_and_composite_with_source(
+        base_image,
+        path,
+        adjustments,
+        use_fast_raw_dev,
+        settings,
+        cancel_token,
+    )
+    .map(|(image, scale, _)| (image, scale))
+}
+
+/// Like [`load_and_composite`], also reporting the source of the base pixels.
+pub fn load_and_composite_with_source(
+    base_image: &[u8],
+    path: &str,
+    adjustments: &Value,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<(DynamicImage, f32, ImageSourceKind)> {
+    let LoadedBaseImage {
+        image: base_image,
+        source_kind,
+    } = load_base_image_with_source_from_bytes(
+        base_image,
+        path,
+        use_fast_raw_dev,
+        settings,
+        cancel_token,
+    )?;
     let prepared = match prepare_base_image_cow(&base_image, path, adjustments)? {
         Cow::Owned(img) => Some(img),
         Cow::Borrowed(_) => None,
@@ -90,7 +127,7 @@ pub fn load_and_composite(
     let scale = prepared.as_ref().map_or(1.0, |img| {
         crate::ai_upscale::scale_between(&base_image, img)
     });
-    Ok((prepared.unwrap_or(base_image), scale))
+    Ok((prepared.unwrap_or(base_image), scale, source_kind))
 }
 
 pub fn prepare_base_image_cow<'a>(
@@ -118,6 +155,28 @@ pub fn load_base_image_from_bytes(
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
 ) -> Result<DynamicImage> {
+    load_base_image_with_source_from_bytes(
+        bytes,
+        path_for_ext_check,
+        use_fast_raw_dev,
+        settings,
+        cancel_token,
+    )
+    .map(|loaded| loaded.image)
+}
+
+/// Loads the base image and reports which source produced its pixels.
+///
+/// The source kind is authoritative: only successfully developed RAW pixels
+/// may receive RAW-space camera defaults, while an embedded-preview fallback
+/// already carries the camera's own rendering and framing.
+pub fn load_base_image_with_source_from_bytes(
+    bytes: &[u8],
+    path_for_ext_check: &str,
+    use_fast_raw_dev: bool,
+    settings: &AppSettings,
+    cancel_token: Option<(Arc<AtomicUsize>, usize)>,
+) -> Result<LoadedBaseImage> {
     let highlight_compression = settings.raw_highlight_compression.unwrap_or(2.5);
     let linear_mode = settings.linear_raw_mode.clone();
     let color_nr_amount = settings
@@ -144,7 +203,12 @@ pub fn load_base_image_from_bytes(
         }
 
         match crate::apple_raw::develop_raw9(bytes, path_for_ext_check) {
-            Ok(image) => return Ok(image),
+            Ok(image) => {
+                return Ok(LoadedBaseImage {
+                    image,
+                    source_kind: ImageSourceKind::DevelopedRaw,
+                });
+            }
             Err(e) => log::warn!(
                 "Apple RAW 9 unavailable for '{}', falling back to rawler: {}",
                 path_for_ext_check,
@@ -154,66 +218,92 @@ pub fn load_base_image_from_bytes(
     }
 
     if is_raw_file(path_for_ext_check) {
-        match panic::catch_unwind(move || {
-            crate::raw_processing::develop_raw_image(
-                bytes,
-                use_fast_raw_dev,
-                highlight_compression,
-                linear_mode,
-                color_nr_amount,
-                sharpening_amount,
-                cancel_token,
-            )
-        }) {
-            Ok(Ok(image)) => Ok(image),
-            Ok(Err(e)) => {
-                let classified = classify_raw_develop_error(path_for_ext_check, e);
-
-                if classified.to_string().contains("Load cancelled") {
-                    return Err(classified);
-                }
-
-                log::warn!(
-                    "Error developing RAW file '{}': {}",
-                    path_for_ext_check,
-                    classified
-                );
-                if let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check) {
-                    log::warn!(
-                        "Using embedded preview fallback for '{}' ({}x{})",
-                        path_for_ext_check,
-                        preview.width(),
-                        preview.height()
-                    );
-
-                    return Ok(linearize_embedded_preview(preview));
-                }
-                Err(classified)
-            }
-            Err(_) => {
-                log::error!("Panic while processing RAW file: {}", path_for_ext_check);
-                if let Some(preview) = safe_embedded_preview_fallback(bytes, path_for_ext_check) {
-                    log::warn!(
-                        "Using embedded preview fallback for '{}' after RAW decoder panic ({}x{})",
-                        path_for_ext_check,
-                        preview.width(),
-                        preview.height()
-                    );
-
-                    return Ok(linearize_embedded_preview(preview));
-                }
-                Err(anyhow!(
-                    "Failed to process RAW file: {}",
-                    path_for_ext_check
-                ))
-            }
-        }
+        decode_raw_or_preview_with(
+            path_for_ext_check,
+            move || {
+                crate::raw_processing::develop_raw_image(
+                    bytes,
+                    use_fast_raw_dev,
+                    highlight_compression,
+                    linear_mode,
+                    color_nr_amount,
+                    sharpening_amount,
+                    cancel_token,
+                )
+            },
+            || safe_embedded_preview_fallback(bytes, path_for_ext_check),
+        )
     } else {
         let image = load_image_with_orientation(bytes, cancel_token)?;
-        if apply_to_non_raws && !use_fast_raw_dev {
-            crate::develop::enhance(image, color_nr_amount, sharpening_amount)
+        let image = if apply_to_non_raws && !use_fast_raw_dev {
+            crate::develop::enhance(image, color_nr_amount, sharpening_amount)?
         } else {
-            Ok(image)
+            image
+        };
+        Ok(LoadedBaseImage {
+            image,
+            source_kind: ImageSourceKind::NonRaw,
+        })
+    }
+}
+
+/// Develops a RAW file, falling back to its embedded preview when development
+/// fails or panics. Cancellation never falls back.
+fn decode_raw_or_preview_with(
+    path_for_ext_check: &str,
+    develop: impl FnOnce() -> Result<DynamicImage>,
+    embedded_preview: impl FnOnce() -> Option<DynamicImage>,
+) -> Result<LoadedBaseImage> {
+    let embedded = |preview: DynamicImage| LoadedBaseImage {
+        image: linearize_embedded_preview(preview),
+        source_kind: ImageSourceKind::EmbeddedPreview,
+    };
+
+    match panic::catch_unwind(panic::AssertUnwindSafe(develop)) {
+        Ok(Ok(image)) => Ok(LoadedBaseImage {
+            image,
+            source_kind: ImageSourceKind::DevelopedRaw,
+        }),
+        Ok(Err(e)) => {
+            let classified = classify_raw_develop_error(path_for_ext_check, e);
+
+            if classified.to_string().contains("Load cancelled") {
+                return Err(classified);
+            }
+
+            log::warn!(
+                "Error developing RAW file '{}': {}",
+                path_for_ext_check,
+                classified
+            );
+            if let Some(preview) = embedded_preview() {
+                log::warn!(
+                    "Using embedded preview fallback for '{}' ({}x{})",
+                    path_for_ext_check,
+                    preview.width(),
+                    preview.height()
+                );
+
+                return Ok(embedded(preview));
+            }
+            Err(classified)
+        }
+        Err(_) => {
+            log::error!("Panic while processing RAW file: {}", path_for_ext_check);
+            if let Some(preview) = embedded_preview() {
+                log::warn!(
+                    "Using embedded preview fallback for '{}' after RAW decoder panic ({}x{})",
+                    path_for_ext_check,
+                    preview.width(),
+                    preview.height()
+                );
+
+                return Ok(embedded(preview));
+            }
+            Err(anyhow!(
+                "Failed to process RAW file: {}",
+                path_for_ext_check
+            ))
         }
     }
 }
@@ -986,23 +1076,33 @@ pub fn decode_pristine(
     path_str: &str,
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
-) -> Result<(DynamicImage, HashMap<String, String>), String> {
+) -> Result<(DynamicImage, HashMap<String, String>, ImageSourceKind), String> {
     if crate::file_management::is_cloud_placeholder(source_path) {
         return Err(format!(
             "'{}' is stored in iCloud and hasn't been downloaded yet. Download it in Finder, then try again.",
             path_str
         ));
     }
-    let decode = |bytes: &[u8]| -> Result<(DynamicImage, HashMap<String, String>), String> {
-        if is_cancelled(&cancel_token) {
-            return Err("Load cancelled".to_string());
-        }
-        let image =
-            load_base_image_from_bytes(bytes, path_str, false, settings, cancel_token.clone())
-                .map_err(|e| e.to_string())?;
-        crate::as_shot::as_shot_from_bytes(path_str, bytes);
-        Ok((image, exif_processing::read_exif_data(path_str, bytes)))
-    };
+    let decode =
+        |bytes: &[u8]| -> Result<(DynamicImage, HashMap<String, String>, ImageSourceKind), String> {
+            if is_cancelled(&cancel_token) {
+                return Err("Load cancelled".to_string());
+            }
+            let loaded = load_base_image_with_source_from_bytes(
+                bytes,
+                path_str,
+                false,
+                settings,
+                cancel_token.clone(),
+            )
+            .map_err(|e| e.to_string())?;
+            crate::as_shot::as_shot_from_bytes(path_str, bytes);
+            Ok((
+                loaded.image,
+                exif_processing::read_exif_data(path_str, bytes),
+                loaded.source_kind,
+            ))
+        };
     match read_file_mapped(source_path) {
         Ok(mmap) => decode(&mmap),
         Err(e) => {
@@ -1018,13 +1118,17 @@ pub fn decode_pristine(
     }
 }
 
+/// A cached pristine image with its EXIF data and pixel source.
+pub type CachedPristine = (Arc<DynamicImage>, HashMap<String, String>, ImageSourceKind);
+
 pub fn cache_pristine(
     state: &AppState,
     path_str: String,
     fingerprint: Option<DecodeFingerprint>,
     image: DynamicImage,
     exif: HashMap<String, String>,
-) -> (Arc<DynamicImage>, HashMap<String, String>) {
+    source_kind: ImageSourceKind,
+) -> CachedPristine {
     let image = Arc::new(image);
     if let Some(fp) = fingerprint {
         state.decoded_image_cache.lock().unwrap().insert(
@@ -1032,9 +1136,10 @@ pub fn cache_pristine(
             fp,
             Arc::clone(&image),
             exif.clone(),
+            source_kind,
         );
     }
-    (image, exif)
+    (image, exif, source_kind)
 }
 
 pub fn get_or_decode_pristine(
@@ -1042,7 +1147,7 @@ pub fn get_or_decode_pristine(
     source_path: &Path,
     settings: &AppSettings,
     cancel_token: Option<(Arc<AtomicUsize>, usize)>,
-) -> Result<(Arc<DynamicImage>, HashMap<String, String>), String> {
+) -> Result<CachedPristine, String> {
     let path_str = source_path.to_string_lossy().to_string();
     let fingerprint = DecodeFingerprint::for_file(source_path, settings);
     let cached = || {
@@ -1068,8 +1173,16 @@ pub fn get_or_decode_pristine(
             return Ok(hit);
         }
 
-        let (image, exif) = decode_pristine(source_path, &path_str, settings, cancel_token)?;
-        return Ok(cache_pristine(state, path_str, fingerprint, image, exif));
+        let (image, exif, source_kind) =
+            decode_pristine(source_path, &path_str, settings, cancel_token)?;
+        return Ok(cache_pristine(
+            state,
+            path_str,
+            fingerprint,
+            image,
+            exif,
+            source_kind,
+        ));
     }
 }
 
@@ -1154,7 +1267,7 @@ pub async fn load_image(
         .unwrap()
         .promote(&source_path_str);
 
-    let (pristine_arc, exif_data) = {
+    let (pristine_arc, exif_data, source_kind) = {
         let app_handle = app_handle.clone();
         let source_path = source_path.clone();
         tokio::task::spawn_blocking(move || {
@@ -1192,6 +1305,7 @@ pub async fn load_image(
         image: pristine_arc,
         is_raw,
         as_shot,
+        source_kind,
     });
 
     crate::ai_jobs::prioritize(&app_handle, &path);
@@ -1203,5 +1317,55 @@ pub async fn load_image(
         exif: exif_data,
         is_raw,
         as_shot_white_balance: as_shot.white_balance,
+        source_kind,
     })
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn preview() -> Option<DynamicImage> {
+        Some(DynamicImage::new_rgb8(4, 3))
+    }
+
+    #[test]
+    fn successful_development_reports_developed_raw() {
+        let loaded = decode_raw_or_preview_with(
+            "DSCF0001.RAF",
+            || Ok(DynamicImage::new_rgb32f(6, 4)),
+            || panic!("a successful development must not read the preview"),
+        )
+        .unwrap();
+        assert_eq!(loaded.source_kind, ImageSourceKind::DevelopedRaw);
+        assert_eq!(loaded.image.dimensions(), (6, 4));
+    }
+
+    #[test]
+    fn failed_or_panicking_development_reports_embedded_preview() {
+        let failed =
+            decode_raw_or_preview_with("DSCF0001.RAF", || Err(anyhow!("bad data")), preview)
+                .unwrap();
+        assert_eq!(failed.source_kind, ImageSourceKind::EmbeddedPreview);
+        assert_eq!(failed.image.dimensions(), (4, 3));
+
+        let panicked = decode_raw_or_preview_with(
+            "DSCF0001.RAF",
+            || panic!("synthetic decoder panic"),
+            preview,
+        )
+        .unwrap();
+        assert_eq!(panicked.source_kind, ImageSourceKind::EmbeddedPreview);
+    }
+
+    #[test]
+    fn cancellation_and_missing_previews_are_errors() {
+        let cancelled =
+            decode_raw_or_preview_with("DSCF0001.RAF", || Err(anyhow!("Load cancelled")), preview);
+        assert!(cancelled.is_err());
+
+        let no_preview =
+            decode_raw_or_preview_with("DSCF0001.RAF", || Err(anyhow!("bad data")), || None);
+        assert!(no_preview.is_err());
+    }
 }

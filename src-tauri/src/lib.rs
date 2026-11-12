@@ -74,6 +74,8 @@ mod panorama_stitching;
 mod panorama_utils;
 mod preset_converter;
 mod preview_jpeg;
+#[cfg(test)]
+mod raf_fixture_tests;
 mod raf_framing;
 mod raw_processing;
 mod relight;
@@ -1966,22 +1968,58 @@ async fn save_collage(base64_data: String, first_path_str: String) -> Result<Str
     Ok(output_path.to_string_lossy().to_string())
 }
 
+/// Request for a standalone preview. Without `js_adjustments` the backend
+/// renders the persisted sidecar, including camera framing defaults.
+#[derive(Debug, Deserialize)]
+#[serde(rename_all = "camelCase")]
+struct GeneratePreviewRequest {
+    path: String,
+    #[serde(default)]
+    js_adjustments: Option<Value>,
+}
+
 #[tauri::command]
 async fn generate_preview_for_path(
-    path: String,
-    js_adjustments: Value,
+    request: GeneratePreviewRequest,
     app_handle: tauri::AppHandle,
 ) -> Result<Response, String> {
     tokio::task::spawn_blocking(move || {
+        let GeneratePreviewRequest {
+            path,
+            js_adjustments,
+        } = request;
         let state = app_handle.state::<AppState>();
         let context = get_or_init_gpu_context(&state, &app_handle)?;
-        let (source_path, _) = parse_virtual_path(&path);
+        let (source_path, sidecar_path) = parse_virtual_path(&path);
         let source_path_str = source_path.to_string_lossy().to_string();
         let is_raw = is_raw_file(&source_path_str);
         let settings = load_settings(app_handle.clone()).unwrap_or_default();
 
-        let (pristine, _exif) =
+        let (pristine, _exif, source_kind) =
             crate::image_loader::get_or_decode_pristine(&state, &source_path, &settings, None)?;
+        let js_adjustments = match js_adjustments {
+            Some(adjustments) => adjustments,
+            None => {
+                // Match what load_metadata hands the editor.
+                let mut persisted = exif_processing::load_sidecar(&sidecar_path).adjustments;
+                if crate::ai_jobs::has_ai_results(&persisted)
+                    && let Some(source_id) = crate::ai_jobs::source_id(&source_path)
+                {
+                    crate::ai_jobs::reconcile_ai_results(
+                        &mut persisted,
+                        &Value::Null,
+                        &source_id,
+                        true,
+                    );
+                }
+                crate::camera_defaults::persisted_render_adjustments(
+                    &source_path,
+                    &persisted,
+                    source_kind,
+                    Some(pristine.dimensions()),
+                )
+            }
+        };
         let base_image = prepare_base_image_cow(&pristine, &source_path_str, &js_adjustments)
             .map_err(|e| e.to_string())?;
         let base_scale = crate::ai_upscale::scale_between(&pristine, &base_image);
@@ -3058,4 +3096,31 @@ pub fn run() {
                 _ => {}
             }
         });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn preview_requests_distinguish_explicit_and_persisted_adjustments() {
+        let explicit: GeneratePreviewRequest = serde_json::from_value(serde_json::json!({
+            "path": "a.RAF",
+            "jsAdjustments": { "exposure": 1.0 },
+        }))
+        .unwrap();
+        assert_eq!(explicit.path, "a.RAF");
+        assert_eq!(
+            explicit.js_adjustments,
+            Some(serde_json::json!({ "exposure": 1.0 }))
+        );
+
+        for persisted in [
+            serde_json::json!({ "path": "a.RAF" }),
+            serde_json::json!({ "path": "a.RAF", "jsAdjustments": null }),
+        ] {
+            let request: GeneratePreviewRequest = serde_json::from_value(persisted).unwrap();
+            assert_eq!(request.js_adjustments, None);
+        }
+    }
 }

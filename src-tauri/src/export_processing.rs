@@ -29,7 +29,9 @@ use crate::file_management::{
     generate_filename_from_template, parse_virtual_path, read_file_mapped,
 };
 use crate::formats::is_raw_file;
-use crate::image_loader::{load_base_image_from_bytes, prepare_base_image_cow};
+use crate::image_loader::{
+    LoadedBaseImage, load_base_image_with_source_from_bytes, prepare_base_image_cow,
+};
 use crate::image_processing::{
     AllAdjustments, Crop, GpuContext, RenderOptions, RenderOutputPrecision, RenderRequest,
     get_all_adjustments_from_json, get_or_init_gpu_context, process_and_get_dynamic_image,
@@ -200,13 +202,13 @@ fn original_output_path(output_path: &Path) -> PathBuf {
     output_path.with_file_name(file_name)
 }
 
-fn load_export_source_image(path: &str, settings: &AppSettings) -> Result<DynamicImage, String> {
+fn load_export_source_image(path: &str, settings: &AppSettings) -> Result<LoadedBaseImage, String> {
     match read_file_mapped(Path::new(path)) {
-        Ok(mmap) => load_base_image_from_bytes(&mmap, path, false, settings, None)
+        Ok(mmap) => load_base_image_with_source_from_bytes(&mmap, path, false, settings, None)
             .map_err(|e| format!("Failed to load from mmap: {}", e)),
         Err(_) => {
             let bytes = fs::read(path).map_err(|e| e.to_string())?;
-            load_base_image_from_bytes(&bytes, path, false, settings, None)
+            load_base_image_with_source_from_bytes(&bytes, path, false, settings, None)
                 .map_err(|e| format!("Failed to load from bytes: {}", e))
         }
     }
@@ -1881,6 +1883,12 @@ pub(crate) async fn export_images_impl(
                 let sidecar = crate::exif_processing::load_sidecar(&sidecar_path);
                 let export_xmp = crate::exif_processing::ExportXmp::from_metadata(&sidecar);
 
+                let uses_persisted_adjustments = match &adjustments_mode {
+                    ExportAdjustmentsMode::UseSidecars {
+                        active_adjustments, ..
+                    } => !(is_current_edit && active_adjustments.is_some()),
+                    ExportAdjustmentsMode::GlobalOverride(_) => false,
+                };
                 let mut js_adjustments = match &adjustments_mode {
                     ExportAdjustmentsMode::UseSidecars {
                         active_adjustments, ..
@@ -2074,19 +2082,33 @@ pub(crate) async fn export_images_impl(
                         return Err("Export cancelled".to_string());
                     };
 
+                    let (source_image, source_image_path, source_kind) = match &loaded_image {
+                        Some(loaded_image) => (
+                            Arc::clone(&loaded_image.image),
+                            loaded_image.path.as_str(),
+                            loaded_image.source_kind,
+                        ),
+                        None => {
+                            let loaded = load_export_source_image(&source_path_str, &settings)?;
+                            (
+                                Arc::new(loaded.image),
+                                source_path_str.as_str(),
+                                loaded.source_kind,
+                            )
+                        }
+                    };
+                    if uses_persisted_adjustments {
+                        js_adjustments = crate::camera_defaults::persisted_render_adjustments(
+                            &source_path,
+                            &js_adjustments,
+                            source_kind,
+                            Some(source_image.dimensions()),
+                        );
+                    }
+
                     let cached_patched = loaded_image.as_ref().and_then(|loaded_image| {
                         crate::cached_patched_image(&state, &loaded_image.image, &js_adjustments)
                     });
-
-                    let (source_image, source_image_path) = match &loaded_image {
-                        Some(loaded_image) => {
-                            (Arc::clone(&loaded_image.image), loaded_image.path.as_str())
-                        }
-                        None => (
-                            Arc::new(load_export_source_image(&source_path_str, &settings)?),
-                            source_path_str.as_str(),
-                        ),
-                    };
                     let prepare_base = |adjustments: &Value| -> Result<Arc<DynamicImage>, String> {
                         match prepare_base_image_cow(&source_image, source_image_path, adjustments)
                             .map_err(|e| format!("Failed to composite AI patches: {}", e))?
@@ -2648,9 +2670,23 @@ pub async fn estimate_export_sizes(
             }
         };
 
-        let original_image =
-            load_base_image_from_bytes(file_data, &source_path_str, true, &settings, None)
-                .map_err(|e| e.to_string())?;
+        let LoadedBaseImage {
+            image: original_image,
+            source_kind,
+        } = load_base_image_with_source_from_bytes(
+            file_data,
+            &source_path_str,
+            true,
+            &settings,
+            None,
+        )
+        .map_err(|e| e.to_string())?;
+        js_adjustments = crate::camera_defaults::persisted_render_adjustments(
+            &source_path,
+            &js_adjustments,
+            source_kind,
+            None,
+        );
 
         let raw_scale_factor = if is_raw {
             crate::raw_processing::get_fast_demosaic_scale_factor(

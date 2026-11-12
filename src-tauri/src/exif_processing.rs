@@ -379,6 +379,44 @@ pub fn update_sidecar(
     update: impl FnOnce(&mut ImageMetadata),
 ) -> std::io::Result<ImageMetadata> {
     let _guard = lock_sidecar(sidecar_path);
+    update_sidecar_locked(sidecar_path, source_path, update)
+}
+
+/// Like [`update_sidecar`], also returning the sidecar's bytes from before the
+/// update, or `None` when it did not exist, so a failed batch can restore them
+/// with [`restore_sidecar`].
+pub fn update_sidecar_with_snapshot(
+    sidecar_path: &Path,
+    source_path: &Path,
+    update: impl FnOnce(&mut ImageMetadata),
+) -> std::io::Result<(ImageMetadata, Option<Vec<u8>>)> {
+    let _guard = lock_sidecar(sidecar_path);
+    let snapshot = match fs::read(sidecar_path) {
+        Ok(bytes) => Some(bytes),
+        Err(e) if e.kind() == std::io::ErrorKind::NotFound => None,
+        Err(e) => return Err(e),
+    };
+    let metadata = update_sidecar_locked(sidecar_path, source_path, update)?;
+    Ok((metadata, snapshot))
+}
+
+/// Restores a sidecar snapshot taken by [`update_sidecar_with_snapshot`].
+pub fn restore_sidecar(sidecar_path: &Path, snapshot: Option<&[u8]>) -> std::io::Result<()> {
+    let _guard = lock_sidecar(sidecar_path);
+    match snapshot {
+        Some(bytes) => file_management::write_file_atomic(sidecar_path, bytes),
+        None => match fs::remove_file(sidecar_path) {
+            Err(e) if e.kind() != std::io::ErrorKind::NotFound => Err(e),
+            _ => Ok(()),
+        },
+    }
+}
+
+fn update_sidecar_locked(
+    sidecar_path: &Path,
+    source_path: &Path,
+    update: impl FnOnce(&mut ImageMetadata),
+) -> std::io::Result<ImageMetadata> {
     let (mut metadata, _) = read_sidecar(sidecar_path)?;
     update(&mut metadata);
     if crate::immich::is_placeholder(source_path)
@@ -2286,4 +2324,52 @@ pub fn write_rrexif_sidecar(source_path_str: &str, target_image_path: &Path) -> 
         metadata.exif = Some(exif_data);
     })
     .map_err(|e| format!("Failed to write sidecar: {}", e))
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use serde_json::json;
+
+    fn rated(rating: u8) -> impl FnOnce(&mut ImageMetadata) {
+        move |metadata| {
+            metadata.rating = rating;
+            metadata.adjustments = json!({ "exposure": 1.0 });
+        }
+    }
+
+    #[test]
+    fn snapshot_restores_the_exact_previous_sidecar() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.jpg");
+        let sidecar = get_primary_sidecar_path(&source);
+        update_sidecar(&sidecar, &source, rated(3)).unwrap();
+        let before = fs::read(&sidecar).unwrap();
+
+        let (metadata, snapshot) = update_sidecar_with_snapshot(&sidecar, &source, |metadata| {
+            metadata.adjustments = serde_json::Value::Null;
+        })
+        .unwrap();
+        assert!(metadata.adjustments.is_null());
+        assert_eq!(snapshot.as_deref(), Some(before.as_slice()));
+        assert_ne!(fs::read(&sidecar).unwrap(), before);
+
+        restore_sidecar(&sidecar, snapshot.as_deref()).unwrap();
+        assert_eq!(fs::read(&sidecar).unwrap(), before);
+    }
+
+    #[test]
+    fn snapshot_of_a_missing_sidecar_restores_by_removing_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let source = dir.path().join("photo.jpg");
+        let sidecar = get_primary_sidecar_path(&source);
+
+        let (_, snapshot) = update_sidecar_with_snapshot(&sidecar, &source, rated(2)).unwrap();
+        assert_eq!(snapshot, None);
+        assert!(sidecar.exists());
+
+        restore_sidecar(&sidecar, None).unwrap();
+        assert!(!sidecar.exists());
+        restore_sidecar(&sidecar, None).unwrap();
+    }
 }

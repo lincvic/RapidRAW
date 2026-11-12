@@ -161,6 +161,7 @@ pub struct LoadedImage {
     pub image: Arc<DynamicImage>,
     pub is_raw: bool,
     pub as_shot: AsShot,
+    pub source_kind: crate::camera_defaults::ImageSourceKind,
 }
 
 #[derive(Clone)]

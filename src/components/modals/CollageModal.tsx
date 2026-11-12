@@ -1,5 +1,4 @@
 import { useState, useEffect, useCallback, useRef, useLayoutEffect, useMemo } from 'react';
-import { invoke } from '@tauri-apps/api/core';
 import { AnimatePresence, motion } from 'framer-motion';
 import { useTranslation } from 'react-i18next';
 import {
@@ -15,7 +14,7 @@ import {
   RectangleVertical,
   Palette,
 } from 'lucide-react';
-import { ImageFile, Invokes } from '../ui/AppProperties';
+import { ImageFile } from '../ui/AppProperties';
 import Button from '../ui/Button';
 import Slider from '../ui/Slider';
 import Switch from '../ui/Switch';
@@ -24,6 +23,7 @@ import { LAYOUTS, type Layout, type LayoutDefinition } from '../../utils/Collage
 import Text from '../ui/Text';
 import { TextVariants } from '../../types/typography';
 import { getDevicePixelRatio } from '../../utils/displayScale';
+import { generateEffectivePreviewForPath } from '../../services/imagePreviews';
 
 interface CollageModalProps {
   isOpen: boolean;
@@ -146,13 +146,8 @@ export default function CollageModal({ isOpen, onClose, onSave, sourceImages }: 
       setError(null);
       try {
         const imagePromises = sourceImages.map(async (imageFile) => {
-          const metadata: any = await invoke(Invokes.LoadMetadata, { path: imageFile.path });
-          const adjustments = metadata.adjustments && !metadata.adjustments.is_null ? metadata.adjustments : {};
-
-          const imageData: Uint8Array = await invoke(Invokes.GeneratePreviewForPath, {
-            path: imageFile.path,
-            jsAdjustments: adjustments,
-          });
+          // The backend resolves the persisted sidecar plus any camera framing defaults for each image.
+          const imageData = await generateEffectivePreviewForPath(imageFile.path);
           const blob = new Blob([new Uint8Array(imageData)], { type: 'image/jpeg' });
           const url = URL.createObjectURL(blob);
 

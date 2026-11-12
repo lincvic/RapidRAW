@@ -42,6 +42,7 @@ import CompositionOverlays from '../editor/overlays/CompositionOverlays';
 import type { OverlayMode } from '../right/CropPanel';
 import { IconAperture, IconShutter, IconIso } from '../editor/ExifIcons';
 import { useTetheringStore, CameraSetting } from '../../../store/useTetheringStore';
+import { generateExplicitPreviewForPath } from '../../../services/imagePreviews';
 
 const iconProps = {
   width: 14,
@@ -301,10 +302,8 @@ export default function TetheringPanel({ onLibraryRefresh, onImageSelect }: Teth
     let currentUrl: string | null = null;
 
     if (showGhostImage && lastCapturedPath) {
-      invoke<Uint8Array>(Invokes.GeneratePreviewForPath, {
-        path: lastCapturedPath,
-        jsAdjustments: {},
-      })
+      // The ghost overlay deliberately renders the unadjusted capture, bypassing sidecar and camera defaults.
+      generateExplicitPreviewForPath(lastCapturedPath, {})
         .then((bytes) => {
           if (active) {
             const blob = new Blob([new Uint8Array(bytes)], { type: 'image/jpeg' });

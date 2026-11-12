@@ -45,6 +45,7 @@ import {
   calculateCenteredCrop,
   getOrientedDimensions,
   ORIGINAL_RATIO,
+  resetCropAdjustments,
   resolveAspectRatio,
 } from '../../../utils/cropUtils';
 import { Crop } from 'react-image-crop';
@@ -528,33 +529,8 @@ export default function CropPanel() {
 
     setOverlay('thirds');
 
-    setAdjustments((prev: Adjustments) => ({
-      ...prev,
-      aspectRatio: INITIAL_ADJUSTMENTS.aspectRatio,
-      crop: INITIAL_ADJUSTMENTS.crop,
-      flipHorizontal: INITIAL_ADJUSTMENTS.flipHorizontal ?? false,
-      flipVertical: INITIAL_ADJUSTMENTS.flipVertical ?? false,
-      orientationSteps: INITIAL_ADJUSTMENTS.orientationSteps ?? 0,
-      rotation: INITIAL_ADJUSTMENTS.rotation ?? 0,
-      transformDistortion: INITIAL_ADJUSTMENTS.transformDistortion ?? 0,
-      transformVertical: INITIAL_ADJUSTMENTS.transformVertical ?? 0,
-      transformHorizontal: INITIAL_ADJUSTMENTS.transformHorizontal ?? 0,
-      transformRotate: INITIAL_ADJUSTMENTS.transformRotate ?? 0,
-      transformAspect: INITIAL_ADJUSTMENTS.transformAspect ?? 0,
-      transformScale: INITIAL_ADJUSTMENTS.transformScale ?? 100,
-      transformXOffset: INITIAL_ADJUSTMENTS.transformXOffset ?? 0,
-      transformYOffset: INITIAL_ADJUSTMENTS.transformYOffset ?? 0,
-      guidedPerspective: INITIAL_ADJUSTMENTS.guidedPerspective,
-      lensMaker: INITIAL_ADJUSTMENTS.lensMaker,
-      lensModel: INITIAL_ADJUSTMENTS.lensModel,
-      lensDistortionAmount: INITIAL_ADJUSTMENTS.lensDistortionAmount,
-      lensVignetteAmount: INITIAL_ADJUSTMENTS.lensVignetteAmount,
-      lensTcaAmount: INITIAL_ADJUSTMENTS.lensTcaAmount,
-      lensDistortionEnabled: INITIAL_ADJUSTMENTS.lensDistortionEnabled,
-      lensTcaEnabled: INITIAL_ADJUSTMENTS.lensTcaEnabled,
-      lensVignetteEnabled: INITIAL_ADJUSTMENTS.lensVignetteEnabled,
-      lensCorrectionMode: INITIAL_ADJUSTMENTS.lensCorrectionMode,
-    }));
+    // Reveals the full sensor: an explicit null crop locked to the image ratio, never a reconstructed camera crop.
+    setAdjustments((prev: Adjustments) => resetCropAdjustments(prev));
   };
 
   const isPresetActive = (preset: CropPreset) => preset === selectedPreset;

@@ -1,8 +1,97 @@
-import { Crop } from 'react-image-crop';
+import type { Crop, PercentCrop } from 'react-image-crop';
+import { INITIAL_ADJUSTMENTS, type Adjustments } from './adjustments';
 
 // aspectRatio 0 locks the crop to the image's own ratio, null leaves it free.
 // 0 is the default, because the image ratio differs per image and cannot be stored as one number.
 export const ORIGINAL_RATIO = 0;
+
+export interface CropSynchronizationParams {
+  /** The editor adjustment session; a newly selected or reloaded image starts a new one. */
+  session: number;
+  rotation: number;
+  aspectRatio: number | null;
+  orientationSteps: number;
+}
+
+interface CropSynchronizationSeed {
+  params: CropSynchronizationParams;
+  overlay: PercentCrop | null;
+}
+
+/**
+ * The Crop panel's Reset: the full oriented canvas with an explicit null crop, locked to the image's own ratio so
+ * the crop controls never reconstruct a camera-default ratio. Other edits are kept.
+ */
+export function resetCropAdjustments(adjustments: Adjustments): Adjustments {
+  return {
+    ...adjustments,
+    aspectRatio: ORIGINAL_RATIO,
+    crop: null,
+    flipHorizontal: INITIAL_ADJUSTMENTS.flipHorizontal ?? false,
+    flipVertical: INITIAL_ADJUSTMENTS.flipVertical ?? false,
+    orientationSteps: INITIAL_ADJUSTMENTS.orientationSteps ?? 0,
+    rotation: INITIAL_ADJUSTMENTS.rotation ?? 0,
+    transformDistortion: INITIAL_ADJUSTMENTS.transformDistortion ?? 0,
+    transformVertical: INITIAL_ADJUSTMENTS.transformVertical ?? 0,
+    transformHorizontal: INITIAL_ADJUSTMENTS.transformHorizontal ?? 0,
+    transformRotate: INITIAL_ADJUSTMENTS.transformRotate ?? 0,
+    transformAspect: INITIAL_ADJUSTMENTS.transformAspect ?? 0,
+    transformScale: INITIAL_ADJUSTMENTS.transformScale ?? 100,
+    transformXOffset: INITIAL_ADJUSTMENTS.transformXOffset ?? 0,
+    transformYOffset: INITIAL_ADJUSTMENTS.transformYOffset ?? 0,
+    guidedPerspective: INITIAL_ADJUSTMENTS.guidedPerspective,
+    lensMaker: INITIAL_ADJUSTMENTS.lensMaker,
+    lensModel: INITIAL_ADJUSTMENTS.lensModel,
+    lensDistortionAmount: INITIAL_ADJUSTMENTS.lensDistortionAmount,
+    lensVignetteAmount: INITIAL_ADJUSTMENTS.lensVignetteAmount,
+    lensTcaAmount: INITIAL_ADJUSTMENTS.lensTcaAmount,
+    lensDistortionEnabled: INITIAL_ADJUSTMENTS.lensDistortionEnabled,
+    lensTcaEnabled: INITIAL_ADJUSTMENTS.lensTcaEnabled,
+    lensVignetteEnabled: INITIAL_ADJUSTMENTS.lensVignetteEnabled,
+    lensCorrectionMode: INITIAL_ADJUSTMENTS.lensCorrectionMode,
+  };
+}
+
+/** The ReactCrop overlay for an adjustment crop; a null crop is only a local full overlay, never a pixel crop. */
+export function localCropOverlay(crop: Crop | null, canvasWidth: number, canvasHeight: number): PercentCrop | null {
+  if (!Number.isFinite(canvasWidth) || canvasWidth <= 0 || !Number.isFinite(canvasHeight) || canvasHeight <= 0) {
+    return null;
+  }
+
+  if (crop === null) {
+    return { unit: '%', x: 0, y: 0, width: 100, height: 100 };
+  }
+
+  return {
+    unit: '%',
+    x: (crop.x / canvasWidth) * 100,
+    y: (crop.y / canvasHeight) * 100,
+    width: (crop.width / canvasWidth) * 100,
+    height: (crop.height / canvasHeight) * 100,
+  };
+}
+
+/**
+ * Seeds the crop overlay when crop mode first sees a session's existing crop, so a newly loaded image (for example
+ * an untouched camera-default crop) is shown as-is instead of being re-fitted against the previous geometry.
+ * Null crops and later changes in the same session go through the regular synchronization.
+ */
+export function getCropSynchronizationSeed(
+  previous: CropSynchronizationParams | null,
+  current: CropSynchronizationParams,
+  crop: Crop | null,
+  canvasWidth: number,
+  canvasHeight: number,
+): CropSynchronizationSeed | null {
+  if (crop === null || previous?.session === current.session) {
+    return null;
+  }
+
+  return {
+    params: current,
+    overlay: localCropOverlay(crop, canvasWidth, canvasHeight),
+  };
+}
 
 export function resolveAspectRatio(
   aspectRatio: number | null,

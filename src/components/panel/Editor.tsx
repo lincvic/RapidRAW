@@ -24,6 +24,9 @@ import {
   moveCropInsideBounds,
   zoomCrop,
   normalizeCropChange,
+  getCropSynchronizationSeed,
+  localCropOverlay,
+  type CropSynchronizationParams,
 } from '../../utils/cropUtils';
 import EditorToolbar from './editor/EditorToolbar';
 import ImageCanvas, { ImageRegion, MaskOverlayImage } from './editor/ImageCanvas';
@@ -186,6 +189,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const adjustmentsHistory = useEditorStore((s) => s.history);
   const adjustmentsHistoryLabels = useEditorStore((s) => s.historyLabels);
   const adjustmentsHistoryIndex = useEditorStore((s) => s.historyIndex);
+  const adjustmentSessionGeneration = useEditorStore((s) => s.adjustmentSessionGeneration);
   const finalPreviewUrl = useEditorStore((s) => s.finalPreviewUrl);
   const uncroppedAdjustedPreviewUrl = useEditorStore((s) => s.uncroppedAdjustedPreviewUrl);
   const showOriginal = useEditorStore((s) => s.showOriginal);
@@ -225,7 +229,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
   const { setAdjustments, toggleCompare, selectCompareMode } = useEditorActions();
 
   const [crop, setCrop] = useState<Crop | null>(null);
-  const prevCropParams = useRef<any>(null);
+  const prevCropParams = useRef<CropSynchronizationParams | null>(null);
   const lastValidCropRef = useRef<PercentCrop | null>(null);
   const cropResizeStartRef = useRef<PercentCrop | null>(null);
 
@@ -2063,32 +2067,49 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
 
   useEffect(() => {
     const { aspectRatio, orientationSteps = 0, crop: currentAdjCrop, rotation = 0 } = adjustments;
+    const currentCropParams: CropSynchronizationParams = {
+      session: adjustmentSessionGeneration,
+      rotation,
+      aspectRatio,
+      orientationSteps,
+    };
 
     if (!isCropping) {
-      prevCropParams.current = { rotation, aspectRatio, orientationSteps };
+      prevCropParams.current = currentCropParams;
       return;
     }
 
-    if (!selectedImage?.width || !selectedImage?.height) {
+    // Provisional state is never re-fitted: the crop only syncs once the image's baseline is authoritative.
+    if (!selectedImage?.isReady || !selectedImage?.width || !selectedImage?.height) {
       return;
     }
 
     const effectiveRotation = liveRotation !== null && liveRotation !== undefined ? liveRotation : rotation;
+    const isDraggingRotation = liveRotation !== null && liveRotation !== undefined;
+    const { width: W, height: H } = getOrientedDimensions(selectedImage.width, selectedImage.height, orientationSteps);
+
+    // A newly loaded or reloaded image keeps its crop (e.g. an untouched camera crop) instead of being re-fitted
+    // against the previous session's geometry, which would turn initialization into an edit.
+    const synchronizationSeed = isDraggingRotation
+      ? null
+      : getCropSynchronizationSeed(prevCropParams.current, currentCropParams, currentAdjCrop, W, H);
+    if (synchronizationSeed) {
+      prevCropParams.current = synchronizationSeed.params;
+      if (synchronizationSeed.overlay) {
+        setCrop(synchronizationSeed.overlay);
+        lastValidCropRef.current = synchronizationSeed.overlay;
+      }
+      return;
+    }
 
     const geometryChanged =
       prevCropParams.current?.rotation !== rotation ||
       prevCropParams.current?.aspectRatio !== aspectRatio ||
       prevCropParams.current?.orientationSteps !== orientationSteps;
 
-    const isDraggingRotation = liveRotation !== null && liveRotation !== undefined;
     const needsRecalc = currentAdjCrop === null || geometryChanged || isDraggingRotation;
 
     if (needsRecalc) {
-      const { width: W, height: H } = getOrientedDimensions(
-        selectedImage.width,
-        selectedImage.height,
-        orientationSteps,
-      );
       const A = aspectRatio || (W > 0 && H > 0 ? W / H : 1);
 
       let nextPixelCrop: Crop | null;
@@ -2196,7 +2217,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
         lastValidCropRef.current = pc;
       }
       if (!isDraggingRotation) {
-        prevCropParams.current = { rotation, aspectRatio, orientationSteps };
+        prevCropParams.current = currentCropParams;
 
         const normalizedCrop = normalizeCropChange(
           currentAdjCrop,
@@ -2225,6 +2246,7 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
     adjustments.crop,
     adjustments.orientationSteps,
     adjustments.rotation,
+    adjustmentSessionGeneration,
     liveRotation,
     isCropping,
     selectedImage,
@@ -2248,14 +2270,9 @@ export default function Editor({ onBackToLibrary, onContextMenu, onImageSelect, 
 
     const { crop: pixelCrop } = adjustments;
 
-    if (pixelCrop) {
-      const pct: PercentCrop = {
-        unit: '%',
-        x: (pixelCrop.x / cropBaseWidth) * 100,
-        y: (pixelCrop.y / cropBaseHeight) * 100,
-        width: (pixelCrop.width / cropBaseWidth) * 100,
-        height: (pixelCrop.height / cropBaseHeight) * 100,
-      };
+    // A null crop keeps the overlay the synchronization effect fitted; it is never materialized here.
+    const pct = pixelCrop ? localCropOverlay(pixelCrop, cropBaseWidth, cropBaseHeight) : null;
+    if (pct) {
       setCrop(pct);
       lastValidCropRef.current = pct;
     }
